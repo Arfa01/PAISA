@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from paisa.config import get_paths
+from paisa.data_quality import summarize_data_quality, ticker_report_frame
 from paisa.features import FEATURE_COLUMNS
 
 paths = get_paths(data_dir=os.getenv("PAISA_DATA_DIR"), model_dir=os.getenv("PAISA_MODEL_DIR"))
@@ -33,6 +34,7 @@ def _path(name: str) -> Path:
         "model": paths.model_dir / "baseline_random_forest.joblib",
         "metrics": paths.model_dir / "baseline_metrics.json",
         "importance": paths.model_dir / "baseline_feature_importance.csv",
+        "model_comparison": paths.model_dir / "model_comparison_price_only.json",
     }
     return mapping[name]
 
@@ -115,6 +117,32 @@ def baseline_metrics() -> dict[str, Any]:
     path = _path("metrics")
     if not path.exists():
         raise HTTPException(status_code=404, detail="baseline_metrics.json not found. Run pipeline with --train.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@app.get("/quality/data")
+def data_quality() -> dict[str, Any]:
+    prices = _read_csv_or_404("prices")
+    features = pd.read_csv(_path("features")) if _path("features").exists() else None
+    dataset = pd.read_csv(_path("dataset")) if _path("dataset").exists() else None
+    return summarize_data_quality(prices=prices, features=features, dataset=dataset)
+
+
+@app.get("/quality/tickers")
+def data_quality_tickers() -> dict[str, Any]:
+    prices = _read_csv_or_404("prices")
+    features = pd.read_csv(_path("features")) if _path("features").exists() else None
+    dataset = pd.read_csv(_path("dataset")) if _path("dataset").exists() else None
+    report = summarize_data_quality(prices=prices, features=features, dataset=dataset)
+    rows = ticker_report_frame(report)
+    return {"count": int(len(rows)), "rows": _records(rows)}
+
+
+@app.get("/models/comparison")
+def model_comparison() -> dict[str, Any]:
+    path = _path("model_comparison")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="model_comparison_price_only.json not found. Run scripts/run_model_comparison.py first.")
     return json.loads(path.read_text(encoding="utf-8"))
 
 

@@ -15,151 +15,101 @@ Team:
 
 ## Main idea
 
-PAISA is an AI-based stock market analysis system for retail investors. The goal is to combine historical stock data with financial news, sentiment analysis, and event-driven reasoning so that users can view stock trends, predictions, and explanations in a simple dashboard.
+PAISA is an AI-assisted stock market analysis system for retail investors. The project combines historical stock data with financial news, sentiment analysis, event-driven reasoning, and explainable prediction outputs.
 
-The system should not directly give financial advice such as “buy” or “sell.” It should provide AI-assisted prediction and explanation for academic/research purposes.
-
-## Problem being solved
-
-Retail investors often rely on incomplete information, intuition, social media hype, or scattered online opinions. Existing retail platforms usually show charts and basic historical prices, but they do not provide a complete accessible system with:
-
-- machine-learning-based stock trend prediction
-- sentiment analysis
-- event-driven reasoning
-- relationship mapping between companies/sectors/events
-- explainable predictions for non-expert users
-
-PAISA aims to fill this gap by building one integrated platform.
+The system should not directly say “buy” or “sell.” It should show AI-assisted insight for academic and educational use.
 
 ## Proposal objectives
 
-The proposal defines these core objectives:
+The proposal defines these main objectives:
 
 1. Collect, preprocess, and structure historical stock market data from 2021 to 2026.
-2. Build a continuously updating data pipeline for financial news, economic reports, and global events.
-3. Train and compare multiple machine learning models for stock movement prediction.
-4. Compare model performance with and without sentiment-based features.
-5. Deploy the best-performing model as the prediction engine.
-6. Add event-driven reasoning to show which companies/sectors are affected by events.
-7. Build a user-facing digital platform with predictions, visualizations, explanations, and current data feeds.
+2. Build training, validation, and test splits.
+3. Build a continuously updating data pipeline for financial news, economic reports, and global events.
+4. Train and compare multiple machine learning models for stock movement prediction.
+5. Compare models with and without sentiment-based features.
+6. Deploy the best-performing model as the prediction engine.
+7. Add event-driven reasoning to show affected companies/sectors and possible propagation.
+8. Build a user-facing dashboard with predictions, visualizations, explanations, and current data feeds.
 
-## Proposed technical components
+## Proposed methodology
+
+The proposal has four technical parts:
 
 ### 1. Data collection and preprocessing
 
-Collect stock and news data from trusted APIs/open online sources. Clean and standardize it. Handle missing or inconsistent records. Synchronize timestamps between stock data and news data.
+Collect stock and news data from trusted APIs or open online sources. Clean and standardize the data, handle missing/inconsistent records, and align stock timestamps with news timestamps.
 
 ### 2. NLP and sentiment analysis
 
-Use NLP tools to extract:
+Use NLP tools to extract company names, sectors, industries, geographical signals, event signals, and positive/negative sentiment from financial news.
 
-- company names
-- industries
-- sectors
-- geographical regions
-- sentiment tone
-- event signals
-
-Suggested tools from proposal: FinBERT / HuggingFace Transformers.
+Suggested tools: FinBERT / HuggingFace Transformers.
 
 ### 3. Knowledge graph / relationship modelling
 
-Map relationships between:
+Model relationships between companies, sectors, industries, events, and affected entities. The goal is to represent how one event may affect more than one company through market, sector, or supply-chain connections.
 
-- companies
-- sectors
-- industries
-- real-world events
-- affected entities
+Suggested tools: NetworkX or Neo4j.
 
-Suggested tools from proposal: NetworkX or Neo4j.
+### 4. Prediction, evaluation, explainability, and dashboard
 
-### 4. Prediction models
+Train supervised ML models for stock trend prediction. Compare model performance using accuracy, precision, recall, and F1-score. Add explanations such as feature importance or SHAP. Serve results through an API and web dashboard.
 
-Train and compare supervised ML models for stock trend prediction.
+Suggested models: Random Forest, XGBoost, LSTM.
 
-Models mentioned in the proposal:
-
-- Random Forest
-- XGBoost
-- LSTM
-
-Metrics mentioned in the proposal:
-
-- accuracy
-- precision
-- recall
-- F1-score
-
-### 5. Explainability
-
-Predictions should include reasons. The proposal mentions explainability methods such as SHAP.
-
-### 6. Backend and dashboard
-
-The backend should retrieve data, run prediction models, and return prediction + explanation. The dashboard should allow users to view historical trends, predicted trends, and analytical summaries.
-
-Suggested stack:
-
-- Python
-- Pandas / NumPy
-- MySQL or MongoDB
-- FastAPI or Flask
-- React.js
-- Plotly
-- scikit-learn
-- SHAP
+Suggested backend/frontend: FastAPI or Flask, React.js, Plotly.
 
 ## Team responsibilities from proposal
 
 Arfa:
 
-- stock market data collection and integration
-- feature engineering from news and market data
-- dataset preparation and label generation
-- model training and performance evaluation
-- web interface design and visualization planning
-- web interface development
-- documentation and reporting
+- Stock market data collection and integration
+- Feature engineering from news and market data
+- Dataset preparation and label generation
+- Model training and performance evaluation
+- Web interface design and visualization planning
+- Web interface development
+- Documentation and reporting
 
 Waqas:
 
-- news data collection and integration
+- News data collection and integration
 - NLP processing and entity extraction from news
-- knowledge graph construction and relationship mapping
-- machine learning model development
-- backend API design and integration planning
-- backend API development and integration
-- documentation and reporting
+- Knowledge graph construction and relationship mapping
+- Machine learning model development
+- Backend API design and integration planning
+- Backend API development and integration
+- Documentation and reporting
 
 Both:
 
-- system testing
-- final improvements
-- documentation/reporting
+- System testing
+- Final improvements
+- Documentation/reporting
 
-## Current implementation status: PAISA v0
+## Current implementation status: v0
 
-v0 is the first working implementation slice. It is focused on the stock-data foundation.
+v0 is the first working implementation slice. It focuses on the stock-data foundation.
 
-Current v0 does the following:
+v0 does this:
 
 1. Fetches PSX stock data.
-2. Saves raw ticker data.
-3. Cleans stock data into a standard schema.
-4. Generates technical indicators.
-5. Generates the next-day movement label.
+2. Saves raw ticker-level data.
+3. Cleans data into a standard schema.
+4. Generates price/volume technical indicators.
+5. Generates the next-trading-day up/down label.
 6. Creates an ML-ready dataset.
-7. Splits the dataset chronologically.
+7. Splits data chronologically.
 8. Trains a baseline Random Forest model.
-9. Saves model metrics and feature importance.
-10. Serves data and predictions through FastAPI.
+9. Saves metrics and feature importance.
+10. Serves data and prediction outputs through FastAPI.
 
 ## Current data source
 
-v0 uses the `psx-dps` provider as the main PSX-first source.
+v0 uses the `psx-dps` provider as the PSX-first source.
 
-The provider currently works with the public PSX DPS time-series endpoint format:
+The provider uses the observed endpoint format:
 
 ```text
 https://dps.psx.com.pk/timeseries/eod/{SYMBOL}
@@ -171,24 +121,24 @@ Observed row format:
 [unix_timestamp, close_price, volume, open_price]
 ```
 
-Because of this, the current v0 reliably uses:
+So the current source reliably gives:
 
 - date
 - open
 - close
 - volume
 
-High and low may remain empty if the source does not provide them.
+High and low may be unavailable from this source and should be documented as a v0 limitation.
 
 ## Current successful local run
 
-The following PSX run worked locally:
+This command worked locally:
 
 ```bash
 python scripts/run_v0_pipeline.py --provider psx-dps --symbols OGDC HBL MCB --start 2021-01-01 --train
 ```
 
-Observed successful output:
+Observed result:
 
 ```text
 provider: psx_dps
@@ -201,17 +151,21 @@ date range: 2021-09-14 to 2026-09-11
 errors: {}
 ```
 
-The API endpoints also work when started with:
+The FastAPI endpoints worked when started with:
 
 ```bash
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The `/docs` endpoint shows the FastAPI UI for accessing all other endpoints.
+or:
+
+```bash
+python scripts/serve_api.py
+```
 
 ## Current generated files
 
-After running the PSX pipeline, these generated files should exist locally:
+Generated locally after running the pipeline:
 
 ```text
 data/raw/psx/
@@ -225,9 +179,77 @@ models/baseline_feature_importance.csv
 models/baseline_confusion_matrix.csv
 ```
 
-Generated data and model files are intentionally ignored by Git. Teammates should regenerate them locally after cloning.
+Generated data/model files are ignored by Git so teammates can regenerate them locally.
 
-## Current API endpoints
+## Current v0.1 branch
+
+Branch:
+
+```text
+feature/v0.1-data-quality
+```
+
+Purpose:
+
+```text
+Harden the stock-data foundation before starting news/sentiment work.
+```
+
+v0.1 adds:
+
+1. Expanded stock universe file with priority levels.
+2. Pipeline option to read symbols from CSV.
+3. Pipeline option to generate a data-quality report.
+4. Data-quality module and report generator.
+5. API endpoints for data-quality output.
+6. Price-only model-comparison workflow.
+7. API endpoint for saved model-comparison output.
+8. Tests for data quality and model comparison.
+9. Cleaner run instructions and project documentation.
+
+## v0.1 commands
+
+From a fresh clone:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
+
+Run expanded PSX pipeline:
+
+```bash
+python scripts/run_v0_pipeline.py --provider psx-dps --symbols-from-csv data/metadata/stock_universe.csv --max-priority 2 --start 2021-01-01 --train --quality-report
+```
+
+Run model comparison:
+
+```bash
+python scripts/run_model_comparison.py
+```
+
+Run tests:
+
+```bash
+pytest
+```
+
+Start API:
+
+```bash
+python scripts/serve_api.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+## v0.1 API endpoints
 
 ```text
 GET /health
@@ -236,116 +258,104 @@ GET /stocks
 GET /stocks/{ticker}/prices
 GET /stocks/{ticker}/features
 GET /stocks/{ticker}/dataset
+GET /quality/data
+GET /quality/tickers
 GET /models/baseline/metrics
+GET /models/comparison
 GET /predict/{ticker}
 GET /docs
 ```
 
-## Current model status
+## v0 model status
 
-v0 trains a baseline Random Forest model.
+The first PSX baseline model is weak but acceptable for v0 because the purpose of v0 was to prove the pipeline, not final prediction accuracy.
 
-The baseline model is only a first benchmark. It is not expected to be highly accurate yet.
-
-Observed PSX model result:
+Observed PSX baseline result:
 
 ```text
 test accuracy: about 0.517
 test F1: about 0.440
 ```
 
-This means the current model is only a weak baseline. The value of v0 is that the pipeline works end-to-end.
+This means the current baseline is mainly a benchmark to improve against.
 
-## Important limitations of v0
+## Current limitations
 
-v0 does not yet include:
+Not implemented yet:
 
-- news collection
-- sentiment analysis
-- entity extraction
-- knowledge graph
+- News collection
+- Sentiment analysis
+- Entity extraction
+- Knowledge graph
 - SHAP explanations
-- XGBoost comparison
-- LSTM model
+- XGBoost
+- LSTM
 - React dashboard
-- database integration
-- scheduled automatic updates
+- Database integration
+- Scheduled automatic updates
 
-Current PSX data begins from 2021-09-14 for the tested symbols, not January 2021. This should be documented as a current data-source limitation.
+Known data limitation:
+
+- Current PSX endpoint may start from 2021-09 for tested symbols, not January 2021.
+- Current PSX endpoint may not provide high/low values.
 
 ## Definition of Done for v0
 
-v0 is considered successful when:
+v0 is successful when:
 
-1. The PSX pipeline command runs successfully.
+1. PSX pipeline runs successfully.
 2. Raw ticker data is saved.
-3. Cleaned `psx_prices.csv` is generated.
-4. Feature-engineered `psx_features.csv` is generated.
-5. ML-ready `ml_dataset.csv` is generated.
+3. `psx_prices.csv` is generated.
+4. `psx_features.csv` is generated.
+5. `ml_dataset.csv` is generated.
 6. `target_next_day_up` exists.
-7. Baseline Random Forest model is trained.
+7. Baseline Random Forest model trains.
 8. Accuracy, precision, recall, and F1 are saved.
 9. `pytest` passes.
 10. FastAPI starts successfully.
-11. `/docs` displays the API UI.
-12. `/predict/{ticker}` returns a prediction JSON.
+11. `/docs` shows the API UI.
+12. `/predict/{ticker}` returns prediction JSON.
 
-## Immediate next milestone: v0.1
+## Definition of Done for v0.1
 
-Before adding sentiment or dashboard, v0 should be hardened.
+v0.1 is successful when:
 
-Recommended next tasks:
+1. Expanded priority-2 stock universe pipeline runs.
+2. Data-quality report is generated.
+3. Report shows row counts, date coverage, missing values, duplicates, and label balance.
+4. Price-only model comparison runs.
+5. `/quality/data`, `/quality/tickers`, and `/models/comparison` work.
+6. Tests pass.
+7. Teammate can clone and run using `RUN_FROM_GITHUB.md`.
 
-1. Push current v0 to GitHub.
-2. Add `RUN_FROM_GITHUB.md` and `PROJECT_CONTEXT.md` to the repo.
-3. Expand stock universe from 3 tickers to 10–20 PSX tickers.
-4. Run the pipeline on the larger stock list.
-5. Create a simple data-quality report.
-6. Check missing values, date coverage, duplicate rows, and per-ticker row counts.
-7. Document PSX source limitations.
-8. Confirm the exact prediction target with the supervisor: next-day up/down or another horizon.
-9. Improve the baseline experiment so results are reproducible and easy to compare.
+## Next recommended versions
 
-## Recommended next versions
+### v1 — News ingestion
 
-### v0.1 — Data quality and larger stock universe
-
-Goal: Make PSX stock pipeline more reliable and document data quality.
-
-### v0.2 — Better baseline experiments
-
-Goal: Train and compare simple ML models using price-only technical indicators.
-
-Suggested models:
-
-- Logistic Regression
-- Random Forest
-- XGBoost, if added
-
-### v1 — News pipeline
-
-Goal: Collect financial news linked to companies/sectors/dates.
+Collect financial news linked to companies, dates, and sectors.
 
 ### v2 — Sentiment features
 
-Goal: Use FinBERT/HuggingFace model to generate daily sentiment features per stock.
+Use FinBERT/HuggingFace to generate daily sentiment features per company.
 
-### v3 — Model comparison with and without sentiment
+### v3 — Price-only vs price+sentiment comparison
 
-Goal: Compare price-only models against price + sentiment models.
+Compare whether sentiment actually improves accuracy, precision, recall, and F1.
 
 ### v4 — Explainability
 
-Goal: Add SHAP or feature-importance explanations for predictions.
+Add SHAP or improved model-specific explanations.
 
 ### v5 — Dashboard
 
-Goal: Build React + Plotly dashboard for stock selection, charts, predictions, sentiment, and explanations.
+Build React + Plotly dashboard for stock selection, charts, predictions, quality summaries, model results, and explanations.
 
 ## Main rule going forward
 
-Do not jump directly to the dashboard or LSTM. Keep the project incremental:
+Do not jump straight to LSTM or dashboard.
+
+Follow this order:
 
 ```text
-Reliable data → reproducible dataset → baseline model → comparison models → news/sentiment → explainability → dashboard
+Reliable PSX data → data quality → price-only baseline comparison → news collection → sentiment features → price+sentiment comparison → explainability → dashboard
 ```

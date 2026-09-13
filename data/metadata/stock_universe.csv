@@ -1,11 +1,16 @@
 ticker,name,sector_hint,priority,notes
-OGDC,Oil & Gas Development Company,Oil & Gas,1,Starter symbol for v0 testing
+OGDC,Oil & Gas Development Company,Oil & Gas Exploration,1,Starter symbol for v0 testing
 HBL,Habib Bank Limited,Banking,1,Starter symbol for v0 testing
 MCB,MCB Bank Limited,Banking,1,Starter symbol for v0 testing
-LUCK,Lucky Cement,Cement,2,Add after first successful run
-ENGRO,Engro Corporation,Conglomerate,2,Add after first successful run
-HUBC,Hub Power Company,Power,2,Add after first successful run
-FFC,Fauji Fertilizer Company,Fertilizer,2,Add after first successful run
-EFERT,Engro Fertilizers,Fertilizer,2,Add after first successful run
-PSO,Pakistan State Oil,Oil Marketing,2,Add after first successful run
-UBL,United Bank Limited,Banking,2,Add after first successful run
+PPL,Pakistan Petroleum Limited,Oil & Gas Exploration,2,Expanded v0.1 symbol
+UBL,United Bank Limited,Banking,2,Expanded v0.1 symbol
+LUCK,Lucky Cement,Cement,2,Expanded v0.1 symbol
+ENGRO,Engro Corporation,Conglomerate,2,Expanded v0.1 symbol
+FFC,Fauji Fertilizer Company,Fertilizer,2,Expanded v0.1 symbol
+HUBC,Hub Power Company,Power,2,Expanded v0.1 symbol
+PSO,Pakistan State Oil,Oil Marketing,2,Expanded v0.1 symbol
+EFERT,Engro Fertilizers,Fertilizer,2,Expanded v0.1 symbol
+MARI,Mari Energies Limited,Oil & Gas Exploration,2,Expanded v0.1 symbol
+SYS,Systems Limited,Technology,2,Expanded v0.1 symbol
+NBP,National Bank of Pakistan,Banking,3,Optional broader coverage
+BAFL,Bank Alfalah Limited,Banking,3,Optional broader coverage

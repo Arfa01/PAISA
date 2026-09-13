@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+
+# Generated data/model artifacts
+# Keep folders, ignore generated contents.
+data/raw/**/*.csv
+data/raw/**/*.json
+data/processed/**/*.csv
+data/processed/**/*.json
+models/**/*.joblib
+models/**/*.pkl
+models/**/*.json
+models/**/*.csv
+!data/**/.gitkeep
+!models/.gitkeep
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

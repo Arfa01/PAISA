@@ -8,7 +8,7 @@ The stage creates reproducible Random Forest variants for one stock, OGDC, using
 
 ## What it does
 
-- Uses the existing PAISA PSX pipeline with `provider=psx-dps`.
+- Uses the existing PAISA PSX pipeline with `provider=psx-dps` by default.
 - Requests OGDC data from `2021-01-01`.
 - Does not use synthetic fallback data.
 - Preserves the v0 target but uses a separate experimental target:
@@ -32,6 +32,18 @@ The stage creates reproducible Random Forest variants for one stock, OGDC, using
 source .venv/bin/activate
 python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider psx-dps --output-dir artifacts/model_training --random-state 42
 ```
+
+## If `psx-dps` returns 404
+
+The DPS endpoint is undocumented and may temporarily reject requests even when the symbol is valid. The provider now sends browser-like headers and retries the endpoint with and without a trailing slash.
+
+After pulling the latest branch, retry the same command. If it still returns 404, use the alternate real PSX provider instead of sample/synthetic data:
+
+```bash
+python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider pypsx --output-dir artifacts/model_training --random-state 42
+```
+
+Do not use `--provider sample` for the real training-stage artifact.
 
 ## Run in Colab/Kaggle
 

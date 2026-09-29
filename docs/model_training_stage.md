@@ -30,14 +30,23 @@ The stage creates reproducible Random Forest variants for one stock, OGDC, using
 
 ```bash
 source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install -e .
 python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider psx-dps --output-dir artifacts/model_training --random-state 42
 ```
 
-## If `psx-dps` returns 404
+## If `psx-dps` returns 403/404
 
-The DPS endpoint is undocumented and may temporarily reject requests even when the symbol is valid. The provider now sends browser-like headers and retries the endpoint with and without a trailing slash.
+The DPS endpoint is undocumented and may temporarily reject requests even when the symbol is valid. The provider sends browser-like headers and retries the endpoint with and without a trailing slash, but a rejection can still happen.
 
-After pulling the latest branch, retry the same command. If it still returns 404, use the alternate real PSX provider instead of sample/synthetic data:
+If DPS keeps failing, verify the alternate real PSX provider is importable:
+
+```bash
+python -m pip install -r requirements.txt
+python -c "import pypsx_toolkit as pt; print('pypsx_toolkit import OK:', pt.__file__)"
+```
+
+Then run the training stage with the alternate real PSX provider instead of sample/synthetic data:
 
 ```bash
 python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider pypsx --output-dir artifacts/model_training --random-state 42

@@ -1,4 +1,4 @@
-.PHONY: setup sample psx psx-expanded quality compare api test clean
+.PHONY: setup sample psx psx-expanded quality compare train-ogdc-rf api test clean
 
 setup:
 	python3 -m venv .venv
@@ -19,11 +19,14 @@ quality:
 compare:
 	. .venv/bin/activate && python scripts/run_model_comparison.py
 
+train-ogdc-rf:
+	. .venv/bin/activate && python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider psx-dps --output-dir artifacts/model_training --random-state 42
+
 api:
-	. .venv/bin/activate && PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+	. .venv/bin/activate && python scripts/serve_api.py
 
 test:
 	. .venv/bin/activate && pytest
 
 clean:
-	rm -rf data/raw/psx data/processed/*.csv data/processed/*.json models/baseline_* models/model_comparison_* .pytest_cache
+	rm -rf data/raw/psx data/processed/*.csv data/processed/*.json models/baseline_* models/model_comparison_* artifacts/model_training artifacts/paisa_TRN-*.zip .pytest_cache

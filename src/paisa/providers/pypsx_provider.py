@@ -13,7 +13,7 @@ class PyPsxToolkitProvider(StockDataProvider):
 
     This provider is useful when you want high/low columns in addition to the
     PSX DPS open/close/volume fields. The project still keeps psx-dps as the
-    no-key PSX-first provider.
+    no-key PSX-first provider, but DPS is undocumented and may reject requests.
     """
 
     source_name = "pypsx_toolkit"
@@ -27,13 +27,23 @@ class PyPsxToolkitProvider(StockDataProvider):
         except Exception as exc:
             raise DataSourceError(
                 "pypsx-toolkit is not installed or failed to import. "
-                "Run `pip install pypsx-toolkit`, or use `--provider psx-dps`."
+                f"Actual import error: {type(exc).__name__}: {exc}. "
+                "Run `python -m pip install -r requirements.txt` from the active virtualenv, "
+                "then verify with `python -c \"import pypsx_toolkit as pt; print(pt.__file__)\"`."
             ) from exc
 
+        symbol = symbol.upper().strip()
         try:
-            frame = pt.download(symbol.upper().strip(), period=self.period)
+            # pypsx-toolkit supports the yfinance-like download(symbol, period, interval) API.
+            frame = pt.download(symbol, period=self.period, interval="1d")
+        except TypeError:
+            # Older compatible builds may not accept interval.
+            try:
+                frame = pt.download(symbol, period=self.period)
+            except Exception as exc:
+                raise DataSourceError(f"pypsx-toolkit could not download {symbol}: {type(exc).__name__}: {exc}") from exc
         except Exception as exc:
-            raise DataSourceError(f"pypsx-toolkit could not download {symbol}: {exc}") from exc
+            raise DataSourceError(f"pypsx-toolkit could not download {symbol}: {type(exc).__name__}: {exc}") from exc
 
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             raise DataSourceError(f"pypsx-toolkit returned no rows for {symbol}.")

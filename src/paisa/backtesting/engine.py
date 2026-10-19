@@ -34,7 +34,12 @@ class BacktestOutcome:
 def evaluation_market_bars(
     config: ExperimentConfig, market_bars: Sequence[MarketBar]
 ) -> tuple[MarketBar, ...]:
-    """Validate and return the exact observed evaluation-session sequence."""
+    """Select the configured ticker, then validate its evaluation sessions.
+
+    Canonical PAISA price files may contain several symbols. Other symbols are
+    intentionally ignored before uniqueness and date-window validation so the
+    same immutable market file can be used by independent single-stock runs.
+    """
 
     if not market_bars:
         raise ValueError("At least one market bar is required.")
@@ -44,15 +49,12 @@ def evaluation_market_bars(
     for bar in market_bars:
         if not isinstance(bar, MarketBar):
             raise TypeError("market_bars must contain MarketBar records")
+        if bar.ticker != config.symbol:
+            continue
         key = (bar.ticker, bar.date)
         if key in seen:
             raise ValueError(f"Duplicate market bar for {bar.ticker} on {bar.date}.")
         seen.add(key)
-        if bar.ticker != config.symbol:
-            raise ValueError(
-                f"Market ticker {bar.ticker!r} does not match configured symbol "
-                f"{config.symbol!r}."
-            )
         if config.evaluation_dates.feature_start <= bar.date <= config.evaluation_dates.target_end:
             selected.append(bar)
 

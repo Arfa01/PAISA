@@ -90,6 +90,60 @@ This was the command used successfully for v0:
 python scripts/run_v0_pipeline.py --provider psx-dps --symbols OGDC HBL MCB --start 2021-01-01 --train
 ```
 
+## Run versioned OGDC model experiments
+
+The unified trainer uses OGDC daily data and a chronological train/validation/test
+split. It preserves the v0 baseline model and writes each new run to a unique,
+immutable artifact directory.
+
+```bash
+python scripts/train_ogdc_models.py
+```
+
+The command defaults to:
+
+```text
+symbol=OGDC
+start=2021-01-01
+provider=psx-dps
+output-dir=artifacts/model_training
+random-state=42
+```
+
+For the same command with every option visible:
+
+```bash
+python scripts/train_ogdc_models.py \
+  --symbol OGDC \
+  --start 2021-01-01 \
+  --provider psx-dps \
+  --output-dir artifacts/model_training \
+  --random-state 42
+```
+
+It trains three Random Forest variants and one XGBoost variant, writes
+contract-compatible prediction CSV files, compares them with majority-class and
+previous-direction baselines, and selects a provisional champion using
+validation metrics only. Generated artifacts and ZIP archives are ignored by
+Git.
+
+For Colab, use:
+
+```text
+notebooks/PAISA_OGDC_Model_Training.ipynb
+```
+
+The separate optional LSTM workflow is:
+
+```text
+notebooks/PAISA_OGDC_LSTM_Training.ipynb
+```
+
+TensorFlow/Keras is not part of the default CPU installation. See
+[`docs/model_training_stage.md`](docs/model_training_stage.md) for the optional
+installation, chronological sequence rules, immutable model-plus-scaler bundle,
+shared prediction contract, and data-provider details.
+
 ## Run a versioned OGDC backtest
 
 Backtesting is separate from model training. Supply contract-compatible model
@@ -113,6 +167,22 @@ The required input columns, complete configuration example, after-close to
 next-session-open timing, accounting rules, metric formulas, and generated
 artifact tree are documented in
 [`docs/BACKTESTING.md`](docs/BACKTESTING.md).
+
+A generated model prediction file can be supplied directly:
+
+```bash
+python scripts/run_backtest.py \
+  --predictions artifacts/model_training/<run_id>/models/<model_id>/predictions.csv \
+  --prices data/processed/psx_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+The experiment configuration's `model_id` and evaluation window must match the
+selected prediction file. The backtester reads only the standardized prediction
+fields; training diagnostics remain model artifacts. A canonical multi-symbol
+price file is supported directly because the configured symbol is selected
+before market-session validation.
 
 All backtest output is an academic simulation and is not financial advice.
 

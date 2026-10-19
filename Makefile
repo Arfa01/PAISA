@@ -1,4 +1,4 @@
-.PHONY: setup sample psx api test clean
+.PHONY: setup sample psx train-ogdc-models api test clean
 
 setup:
 	python3 -m venv .venv
@@ -9,6 +9,9 @@ sample:
 
 psx:
 	. .venv/bin/activate && python scripts/run_v0_pipeline.py --provider psx-dps --symbols OGDC HBL MCB --start 2021-01-01 --train
+
+train-ogdc-models:
+	. .venv/bin/activate && python scripts/train_ogdc_models.py
 
 api:
 	. .venv/bin/activate && uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000

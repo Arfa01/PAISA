@@ -78,13 +78,15 @@ boundary, not permission to relabel an existing run.
 
 ## Price input
 
-`OGDC_prices.csv` uses the existing PAISA daily price schema. Backtesting
-requires these columns:
+The price input uses the existing PAISA daily price schema. It may be an
+OGDC-only extract or the canonical multi-symbol `psx_prices.csv`; the runner
+selects the configured symbol before duplicate-session and evaluation-window
+validation. Backtesting requires these columns:
 
 | Column | Type | Rule |
 |---|---|---|
 | `date` | date | ISO `YYYY-MM-DD`, strictly chronological after sorting. |
-| `ticker` | string | Uppercase and equal to the configured symbol. |
+| `ticker` | string | Uppercase; rows for the configured symbol are selected. |
 | `open` | PKR decimal | Finite and positive; used for next-session execution. |
 | `close` | PKR decimal | Finite and positive; used for end-of-session valuation. |
 

@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -67,6 +68,7 @@ from paisa.experiments.training_features import (
     TECHNICAL_FEATURE_COLUMNS,
     chronological_target_split,
     prepare_model_frame,
+    validate_feature_columns,
 )
 from paisa.experiments.training_targets import add_next_session_target
 from paisa.features import build_features
@@ -117,15 +119,37 @@ def _repo_root_from_file() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _safe_symbol(value: str) -> str:
+    """Return one canonical ticker that is also safe as a path component."""
+
+    symbol = str(value).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]*", symbol):
+        raise ValueError(
+            "symbol must be a filesystem-safe uppercase ticker containing only "
+            "letters, digits, '.', '_', and '-'"
+        )
+    return symbol
+
+
+def _contained_output_path(root: Path, filename: str) -> Path:
+    """Resolve a staged output and fail closed if it leaves its declared root."""
+
+    resolved_root = root.resolve()
+    destination = (resolved_root / filename).resolve()
+    try:
+        destination.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"Staged output path escapes {resolved_root}") from exc
+    return destination
+
+
 def _normalise_prices(prices: pd.DataFrame, symbol: str) -> pd.DataFrame:
     required = {"date", "open", "close", "volume"}
     missing = sorted(required - set(prices.columns))
     if missing:
         raise ValueError(f"Price input is missing required columns: {missing}")
 
-    ticker = symbol.strip().upper()
-    if not ticker:
-        raise ValueError("symbol must be non-empty")
+    ticker = _safe_symbol(symbol)
     frame = prices.copy()
     if "ticker" not in frame.columns:
         frame["ticker"] = ticker
@@ -211,7 +235,7 @@ def fit_variant(
 ) -> FittedVariant:
     """Fit one variant on training rows only, with train-fitted imputation."""
 
-    columns = tuple(feature_columns)
+    columns = validate_feature_columns(feature_columns)
     missing = sorted((set(columns) | {TARGET_NAME}) - set(train_rows.columns))
     if missing:
         raise ValueError(f"Training rows are missing required columns: {missing}")
@@ -279,6 +303,7 @@ def _variant_model_id(
     prepared: PreparedTrainingData,
     random_state: int,
     run_id: str,
+    invocation_id: str,
 ) -> str:
     semantic_payload = {
         "variant": variant.to_dict(),
@@ -291,7 +316,7 @@ def _variant_model_id(
         json.dumps(to_jsonable(semantic_payload), sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
     run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
-    return f"{variant.model_id}-{semantic_digest}-{run_digest}"
+    return f"{variant.model_id}-{semantic_digest}-{run_digest}-{invocation_id}"
 
 
 def _date_string(series: pd.Series, which: str) -> str:
@@ -407,6 +432,7 @@ def _leaderboard(
                         "matthews_corrcoef",
                         "roc_auc",
                         "brier_score",
+                        "selection_eligible",
                     )
                 },
             }
@@ -442,11 +468,11 @@ def _safe_run_id(value: str) -> str:
 
 def _load_or_fetch_prices(
     *,
-    repo: Path,
     symbol: str,
     start: str,
     provider: str,
     prices_path: str | Path | None,
+    acquisition_parent: Path,
 ) -> tuple[pd.DataFrame, dict[str, Any], str]:
     if prices_path is not None:
         source_path = Path(prices_path).expanduser().resolve()
@@ -464,17 +490,34 @@ def _load_or_fetch_prices(
             "provider": provenance_provider,
         }
     else:
-        acquisition = run_v0_pipeline(
-            symbols=[symbol],
-            provider_name=provider,
-            start=date.fromisoformat(start),
-            train=False,
-            data_dir=repo / "data",
-            model_dir=repo / "models",
-        )
-        source_path = repo / "data" / "processed" / "psx_prices.csv"
-        prices = pd.read_csv(source_path)
-        provenance_provider = str(acquisition.get("provider", provider))
+        # Reuse the v0 acquisition/cleaning pipeline without publishing its
+        # single-symbol outputs over the canonical v0 data and API files.
+        with tempfile.TemporaryDirectory(
+            prefix=".provider-acquisition-", dir=acquisition_parent
+        ) as acquisition_directory:
+            isolated_root = Path(acquisition_directory)
+            pipeline_metadata = run_v0_pipeline(
+                symbols=[symbol],
+                provider_name=provider,
+                start=date.fromisoformat(start),
+                train=False,
+                data_dir=isolated_root / "data",
+                model_dir=isolated_root / "models",
+            )
+            source_path = isolated_root / "data" / "processed" / "psx_prices.csv"
+            prices = pd.read_csv(source_path)
+            provenance_provider = str(pipeline_metadata.get("provider", provider))
+            acquisition = {
+                "mode": "isolated_v0_pipeline",
+                "provider": provenance_provider,
+                "symbols_requested": pipeline_metadata.get(
+                    "symbols_requested", [symbol]
+                ),
+                "raw_row_counts": pipeline_metadata.get("raw_row_counts", {}),
+                "errors": pipeline_metadata.get("errors", {}),
+                "prices_rows": pipeline_metadata.get("prices_rows", len(prices)),
+                "date_range": pipeline_metadata.get("date_range"),
+            }
 
     prices["date"] = pd.to_datetime(prices["date"], errors="raise")
     prices = prices[prices["date"].dt.date >= date.fromisoformat(start)].copy()
@@ -515,6 +558,7 @@ def run_training_stage(
     A provided CSV is useful for reproducible offline runs and CLI tests.
     """
 
+    safe_symbol = _safe_symbol(symbol)
     set_deterministic_seeds(random_state)
     repo = Path(repo_root).resolve() if repo_root else _repo_root_from_file()
     output_root = Path(output_dir)
@@ -525,6 +569,7 @@ def run_training_stage(
 
     selected_variants = _select_variants(model_ids)
     resolved_run_id = _safe_run_id(run_id or make_run_id(repo))
+    invocation_id = str(uuid.uuid4())
     final_run_dir = output_root / resolved_run_id
     if final_run_dir.exists():
         raise FileExistsError(
@@ -536,13 +581,13 @@ def run_training_stage(
 
     baseline_before = _baseline_hashes(repo)
     prices, acquisition, provenance_provider = _load_or_fetch_prices(
-        repo=repo,
-        symbol=symbol.strip().upper(),
+        symbol=safe_symbol,
         start=start,
         provider=provider,
         prices_path=prices_path,
+        acquisition_parent=output_root,
     )
-    prepared = prepare_training_data(prices, symbol=symbol)
+    prepared = prepare_training_data(prices, symbol=safe_symbol)
     environment = detect_runtime_environment()
     environment["package_versions"] = package_versions()
     code_version = get_git_commit_sha(repo) or "unknown"
@@ -558,13 +603,15 @@ def run_training_stage(
         (stage_dir / "reports").mkdir()
         models_root = stage_dir / "models"
         models_root.mkdir()
-        prepared.prices.to_csv(
-            stage_dir / "frozen_input" / f"{prepared.symbol}_prices.csv", index=False
+        frozen_input_root = stage_dir / "frozen_input"
+        prices_destination = _contained_output_path(
+            frozen_input_root, f"{prepared.symbol}_prices.csv"
         )
-        prepared.model_frame.to_csv(
-            stage_dir / "frozen_input" / f"{prepared.symbol}_model_rows.csv",
-            index=False,
+        rows_destination = _contained_output_path(
+            frozen_input_root, f"{prepared.symbol}_model_rows.csv"
         )
+        prepared.prices.to_csv(prices_destination, index=False)
+        prepared.model_frame.to_csv(rows_destination, index=False)
 
         split_manifest = {
             "schema_version": "1.0",
@@ -601,7 +648,11 @@ def run_training_stage(
         evaluations: dict[str, dict[str, VariantEvaluation]] = {}
         for variant in selected_variants:
             registered_id = _variant_model_id(
-                variant, prepared, random_state, resolved_run_id
+                variant,
+                prepared,
+                random_state,
+                resolved_run_id,
+                invocation_id,
             )
             fitted = fit_variant(
                 variant,
@@ -681,6 +732,7 @@ def run_training_stage(
             manifest = {
                 "schema_version": "1.0",
                 "model_id": fitted.model_id,
+                "invocation_id": invocation_id,
                 "variant_id": fitted.variant.model_id,
                 "algorithm": fitted.variant.algorithm,
                 "model_configuration": fitted.model_configuration,
@@ -735,6 +787,7 @@ def run_training_stage(
             }
             configuration = fitted.variant.to_dict()
             configuration["registered_model_id"] = fitted.model_id
+            configuration["invocation_id"] = invocation_id
             configuration["model_configuration"] = fitted.model_configuration
             configuration["random_seed"] = random_state
             extra_files = {
@@ -757,6 +810,7 @@ def run_training_stage(
             artifact_records.append(
                 {
                     "model_id": fitted.model_id,
+                    "invocation_id": invocation_id,
                     "variant_id": fitted.variant.model_id,
                     "manifest_path": f"models/{fitted.model_id}/manifest.json",
                     "artifact_sha256": stored_manifest["artifact_sha256"],
@@ -772,6 +826,7 @@ def run_training_stage(
         run_manifest = {
             "schema_version": "1.0",
             "run_id": resolved_run_id,
+            "invocation_id": invocation_id,
             "created_at": utc_now_z(),
             "symbol": prepared.symbol,
             "source_frequency": SOURCE_FREQUENCY,
@@ -789,6 +844,7 @@ def run_training_stage(
 
         persisted_summary = to_jsonable({
             "run_id": resolved_run_id,
+            "invocation_id": invocation_id,
             "artifact_directory": str(final_run_dir),
             "model_ids": {
                 fitted.variant.model_id: fitted.model_id for fitted in fitted_models

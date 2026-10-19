@@ -9,6 +9,7 @@ import platform
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from typing import Any, Iterable, Mapping
 import joblib
 import numpy as np
 import pandas as pd
+
+from paisa.experiments.training_features import validate_feature_columns
 
 
 MANIFEST_FILENAME = "manifest.json"
@@ -331,8 +334,10 @@ def validate_model_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     ).strip():
         raise ValueError("feature_set ID and code version must be non-empty")
     columns = _string_list(feature_set["columns"], field_name="feature_set.columns")
-    if len(columns) != len(set(columns)):
-        raise ValueError("feature_set.columns must be ordered and unique")
+    try:
+        validate_feature_columns(columns)
+    except ValueError as exc:
+        raise ValueError(f"feature_set.columns are invalid: {exc}") from exc
     transforms = feature_set["transforms"]
     if not isinstance(transforms, list):
         raise ValueError("feature_set.transforms must be an array")
@@ -419,6 +424,10 @@ def validate_model_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "brier_score",
         "confusion_matrix",
         "class_distribution",
+        "observed_classes",
+        "complete_class_coverage",
+        "selection_eligible",
+        "metric_warnings",
         "support",
         "positive_label",
         "average",
@@ -429,7 +438,6 @@ def validate_model_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         _require_fields(split_metrics, metric_fields, field_name=f"metrics.{split}")
         for metric in (
             "accuracy",
-            "balanced_accuracy",
             "precision",
             "recall",
             "f1",
@@ -441,24 +449,6 @@ def validate_model_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"metrics.{split}.{metric} must be numeric") from exc
             if not np.isfinite(score) or not 0 <= score <= 1:
                 raise ValueError(f"metrics.{split}.{metric} must be in [0, 1]")
-        try:
-            matthews = float(split_metrics["matthews_corrcoef"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"metrics.{split}.matthews_corrcoef must be numeric"
-            ) from exc
-        if not np.isfinite(matthews) or not -1 <= matthews <= 1:
-            raise ValueError(
-                f"metrics.{split}.matthews_corrcoef must be in [-1, 1]"
-            )
-        roc_auc = split_metrics["roc_auc"]
-        if roc_auc is not None:
-            try:
-                roc_auc_score = float(roc_auc)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"metrics.{split}.roc_auc must be numeric or null") from exc
-            if not np.isfinite(roc_auc_score) or not 0 <= roc_auc_score <= 1:
-                raise ValueError(f"metrics.{split}.roc_auc must be null or in [0, 1]")
         support = split_metrics["support"]
         if isinstance(support, bool) or not isinstance(support, int) or support <= 0:
             raise ValueError(f"metrics.{split}.support must be a positive integer")
@@ -490,6 +480,58 @@ def validate_model_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
                 f"metrics.{split}.class_distribution must contain non-negative "
                 "integer counts for classes 0 and 1 summing to support"
             )
+        observed_classes = [
+            class_id for class_id in (0, 1) if distribution[str(class_id)] > 0
+        ]
+        if split_metrics["observed_classes"] != observed_classes:
+            raise ValueError(
+                f"metrics.{split}.observed_classes must match class_distribution"
+            )
+        complete_coverage = len(observed_classes) == 2
+        if split_metrics["complete_class_coverage"] is not complete_coverage:
+            raise ValueError(
+                f"metrics.{split}.complete_class_coverage does not match "
+                "class_distribution"
+            )
+        if split_metrics["selection_eligible"] is not complete_coverage:
+            raise ValueError(
+                f"metrics.{split}.selection_eligible must require both actual classes"
+            )
+        warnings = split_metrics["metric_warnings"]
+        if not isinstance(warnings, list) or any(
+            not isinstance(item, str) for item in warnings
+        ):
+            raise ValueError(f"metrics.{split}.metric_warnings must be an array of strings")
+        if complete_coverage:
+            if "single_class_actuals" in warnings:
+                raise ValueError(
+                    f"metrics.{split}.metric_warnings contradict complete class coverage"
+                )
+            for metric, lower, upper in (
+                ("balanced_accuracy", 0.0, 1.0),
+                ("matthews_corrcoef", -1.0, 1.0),
+                ("roc_auc", 0.0, 1.0),
+            ):
+                try:
+                    score = float(split_metrics[metric])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"metrics.{split}.{metric} must be numeric when both classes are observed"
+                    ) from exc
+                if not np.isfinite(score) or not lower <= score <= upper:
+                    raise ValueError(
+                        f"metrics.{split}.{metric} must be in [{lower}, {upper}]"
+                    )
+        else:
+            if "single_class_actuals" not in warnings:
+                raise ValueError(
+                    f"metrics.{split}.metric_warnings must flag single_class_actuals"
+                )
+            for metric in ("balanced_accuracy", "matthews_corrcoef", "roc_auc"):
+                if split_metrics[metric] is not None:
+                    raise ValueError(
+                        f"metrics.{split}.{metric} must be null for single-class actuals"
+                    )
         if (
             split_metrics["positive_label"] != 1
             or split_metrics["average"] != "binary"
@@ -667,24 +709,133 @@ def write_model_artifact(
     return destination
 
 
-def load_model_artifact(model_dir: str | Path) -> tuple[Any, dict[str, Any]]:
-    """Load a trusted registered artifact only after path and checksum checks."""
+def _registered_model_directory(
+    model_dir: str | Path,
+    *,
+    trusted_root: str | Path | None = None,
+) -> Path:
+    """Resolve one real model directory within an optional registry boundary."""
 
-    directory = Path(model_dir).resolve()
+    candidate = Path(model_dir)
+    if candidate.is_symlink():
+        raise ValueError(f"Registered model directory must not be a symlink: {candidate}")
+    try:
+        directory = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Registered model directory is missing: {candidate}") from exc
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Registered model directory is missing: {candidate}")
+
+    if trusted_root is not None:
+        root = Path(trusted_root).resolve(strict=True)
+        try:
+            relative = directory.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                "Registered model directory resolves outside the trusted registry root"
+            ) from exc
+        if not relative.parts:
+            raise ValueError("A registered model directory cannot be the registry root")
+    return directory
+
+
+def _reject_symlink_components(path: Path, *, root: Path, field_name: str) -> None:
+    """Reject symlinks at every path component below a resolved trusted root."""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must remain inside its model directory") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{field_name} must not contain symlinks: {current}")
+
+
+def _open_regular_file(path: Path, *, field_name: str):
+    """Open a regular file without following its final symlink component."""
+
+    if path.is_symlink():
+        raise ValueError(f"{field_name} must not be a symlink: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if path.is_symlink():
+            raise ValueError(f"{field_name} must not be a symlink: {path}") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{field_name} must be a regular file: {path}")
+        return os.fdopen(descriptor, "rb")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_registered_manifest(
+    model_dir: str | Path,
+    *,
+    trusted_root: str | Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    directory = _registered_model_directory(model_dir, trusted_root=trusted_root)
     manifest_path = directory / MANIFEST_FILENAME
-    if not directory.is_dir() or not manifest_path.is_file():
+    _reject_symlink_components(
+        manifest_path,
+        root=directory,
+        field_name="Registered model manifest",
+    )
+    if not manifest_path.is_file():
         raise FileNotFoundError(f"Registered model manifest is missing: {manifest_path}")
 
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    with _open_regular_file(
+        manifest_path,
+        field_name="Registered model manifest",
+    ) as manifest_handle:
+        raw = json.load(manifest_handle)
     if not isinstance(raw, dict):
         raise ValueError("Model manifest must be a JSON object")
     raw = validate_model_manifest(raw)
     if str(raw.get("model_id", "")) != directory.name:
         raise ValueError("Manifest model_id does not match its immutable directory")
+    return directory, raw
+
+
+def read_model_manifest(
+    model_dir: str | Path,
+    *,
+    trusted_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Read and validate a registered manifest without deserializing its model."""
+
+    _, manifest = _read_registered_manifest(model_dir, trusted_root=trusted_root)
+    return manifest
+
+
+def load_model_artifact(
+    model_dir: str | Path,
+    *,
+    trusted_root: str | Path | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Checksum and load trusted model bytes without reopening their path."""
+
+    directory, raw = _read_registered_manifest(model_dir, trusted_root=trusted_root)
 
     relative = _safe_relative_path(raw.get("artifact_path", ""), field_name="artifact_path")
     model_root = directory.parent
-    artifact_path = model_root.joinpath(*relative.parts).resolve()
+    artifact_candidate = model_root.joinpath(*relative.parts)
+    _reject_symlink_components(
+        artifact_candidate,
+        root=directory,
+        field_name="Registered model artifact",
+    )
+    try:
+        artifact_path = artifact_candidate.resolve(strict=True)
+    except ValueError as exc:
+        raise ValueError("artifact_path must resolve inside its model directory") from exc
     try:
         artifact_path.relative_to(directory)
     except ValueError as exc:
@@ -695,12 +846,22 @@ def load_model_artifact(model_dir: str | Path) -> tuple[Any, dict[str, Any]]:
     expected = str(raw.get("artifact_sha256", "")).lower()
     if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
         raise ValueError("artifact_sha256 must be a lowercase SHA-256 digest")
-    actual = sha256_file(artifact_path)
-    if actual != expected:
-        raise ValueError(
-            f"Model artifact checksum mismatch for {directory.name}: expected {expected}, got {actual}"
-        )
-    return joblib.load(artifact_path), raw
+    with _open_regular_file(
+        artifact_path,
+        field_name="Registered model artifact",
+    ) as artifact_handle:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: artifact_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected:
+            raise ValueError(
+                f"Model artifact checksum mismatch for {directory.name}: "
+                f"expected {expected}, got {actual}"
+            )
+        artifact_handle.seek(0)
+        artifact = joblib.load(artifact_handle)
+    return artifact, raw
 
 
 def file_size_mb(path: Path) -> float:

@@ -29,6 +29,10 @@ def _complete_manifest(model_id: str, *, algorithm: str = "random_forest") -> di
         "brier_score": 0.0,
         "confusion_matrix": [[1, 0], [0, 1]],
         "class_distribution": {"0": 1, "1": 1},
+        "observed_classes": [0, 1],
+        "complete_class_coverage": True,
+        "selection_eligible": True,
+        "metric_warnings": [],
         "support": 2,
         "positive_label": 1,
         "average": "binary",
@@ -212,3 +216,34 @@ def test_runtime_environment_reports_the_actual_local_platform(monkeypatch):
     monkeypatch.delenv("COLAB_RELEASE_TAG", raising=False)
     monkeypatch.delenv("KAGGLE_URL_BASE", raising=False)
     assert detect_runtime_environment()["runtime_environment"] == "darwin"
+
+
+def test_manifest_accepts_explicitly_undefined_single_class_metrics():
+    manifest = _complete_manifest("M-001-single-class")
+    metrics = manifest["metrics"]["test"]
+    metrics.update(
+        {
+            "accuracy": 1.0,
+            "balanced_accuracy": None,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "matthews_corrcoef": None,
+            "roc_auc": None,
+            "brier_score": 0.025,
+            "confusion_matrix": [[2, 0], [0, 0]],
+            "class_distribution": {"0": 2, "1": 0},
+            "observed_classes": [0],
+            "complete_class_coverage": False,
+            "selection_eligible": False,
+            "metric_warnings": ["single_class_actuals"],
+        }
+    )
+    validated = validate_model_manifest(
+        {
+            **manifest,
+            "artifact_path": "M-001-single-class/model.joblib",
+            "artifact_sha256": "d" * 64,
+        }
+    )
+    assert validated["metrics"]["test"]["balanced_accuracy"] is None

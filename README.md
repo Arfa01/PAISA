@@ -129,7 +129,8 @@ Generated model binaries, frozen inputs, and ZIP archives are ignored by Git.
 Each model's `predictions.csv` follows the architecture prediction-record
 contract and can be passed directly to the backtesting CLI. The experiment
 configuration must reference the same `model_id` and the desired test-date
-window:
+window. The normal multi-symbol `data/processed/psx_prices.csv` is accepted;
+the backtester selects the configured symbol before session validation:
 
 ```bash
 python scripts/run_backtest.py \
@@ -142,7 +143,10 @@ python scripts/run_backtest.py \
 Open [`notebooks/PAISA_OGDC_Model_Training.ipynb`](notebooks/PAISA_OGDC_Model_Training.ipynb)
 for the Colab workflow. The optional
 [`notebooks/PAISA_OGDC_LSTM_Training.ipynb`](notebooks/PAISA_OGDC_LSTM_Training.ipynb)
-keeps deep-learning dependencies separate from the CPU pipeline. See
+keeps deep-learning dependencies separate from the CPU pipeline. It calls the
+reusable optional LSTM trainer and registers one checksum-protected inference
+bundle containing both the Keras model and its train-fitted scaler; its
+`predictions.csv` uses the same backtesting contract as the CPU models. See
 [`docs/model_training_stage.md`](docs/model_training_stage.md) for target,
 split, metric, artifact, and provider details.
 

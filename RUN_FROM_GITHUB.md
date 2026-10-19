@@ -140,8 +140,9 @@ notebooks/PAISA_OGDC_LSTM_Training.ipynb
 ```
 
 TensorFlow/Keras is not part of the default CPU installation. See
-[`docs/model_training_stage.md`](docs/model_training_stage.md) for artifact and
-data-provider details.
+[`docs/model_training_stage.md`](docs/model_training_stage.md) for the optional
+installation, chronological sequence rules, immutable model-plus-scaler bundle,
+shared prediction contract, and data-provider details.
 
 ## Run a versioned OGDC backtest
 
@@ -179,7 +180,9 @@ python scripts/run_backtest.py \
 
 The experiment configuration's `model_id` and evaluation window must match the
 selected prediction file. The backtester reads only the standardized prediction
-fields; training diagnostics remain model artifacts.
+fields; training diagnostics remain model artifacts. A canonical multi-symbol
+price file is supported directly because the configured symbol is selected
+before market-session validation.
 
 All backtest output is an academic simulation and is not financial advice.
 

@@ -40,9 +40,13 @@ artifacts/model_training/
 ```
 
 `M-001`, `M-002`, and `M-003` are the stable Random Forest variant IDs;
-`M-004` is the XGBoost variant. Their registered model IDs add a deterministic
-version suffix derived from the run inputs and configuration. The complete
-registered ID appears in the manifest and in every prediction row.
+`M-004` is the XGBoost variant. Their registered model IDs combine a
+deterministic semantic digest of the data, feature order, configuration,
+target, and seed with the run ID digest and a per-invocation UUID. The UUID
+prevents collisions when identical reproducible runs are created in separate
+artifact roots; it is identity metadata and is not used as model randomness.
+The complete registered ID and invocation UUID are persisted in the model and
+run manifests, and the registered ID appears in every prediction row.
 
 Each model's `predictions.csv` contains only the untouched test split in the
 prediction-record schema required by `scripts/run_backtest.py`, including

@@ -184,12 +184,26 @@ The following nested structures are required in schema `1.0`:
 }
 ```
 
+`feature_set.columns` is an ordered, duplicate-free subset of the existing
+PAISA technical feature set. Training and manifest validation both reject
+future/label fields (`next_*`, `target_*`, and `actual_class`) and audit or
+identity metadata such as dates, ticker, and source.
+
 Every target-date split is non-empty, internally ordered, non-overlapping, and
 strictly later than the preceding split. Each of `train`, `validation`, and
 `test` under `metrics` requires numeric `accuracy`, `precision`, `recall`, and
 `f1`, integer `support`, `positive_label: 1`, `average: "binary"`, and
 `zero_division: 0`. Precision, recall, and F1 are therefore recorded as zero
 when their denominator is zero.
+
+Balanced accuracy, Matthews correlation coefficient, and ROC-AUC require both
+actual classes to be observed. When a split contains one class, these fields
+are `null`, `selection_eligible` is `false`, and `metric_warnings` contains
+`single_class_actuals`; ordinary accuracy is never substituted for balanced
+accuracy. A provisional champion may be selected only when the validation
+split contains both classes. If no validation result is eligible, training
+fails closed instead of consulting test metrics or reporting a misleading
+champion.
 
 `data_provenance` requires `provider`, `requested_symbols`, `included_symbols`,
 `requested_start`, `requested_end`, `actual_feature_start`,
@@ -206,7 +220,12 @@ The `model_id` must change whenever the algorithm, configuration, ordered
 feature set, training data fingerprint/window, target/horizon, or seed changes.
 A random UUID is acceptable only if the immutable manifest carries all of that
 provenance. Loading executable formats such as joblib is permitted only from a
-trusted local registry entry whose checksum matches.
+trusted local registry entry whose checksum matches. The resolved model
+directory must remain below the configured registry root; model directories,
+manifests, artifact binaries, and nested artifact path components must not be
+symlinks. The loader hashes and deserializes through one already-open file
+handle so path replacement cannot swap in a different file between those
+operations.
 
 ## B. Prediction record contract
 

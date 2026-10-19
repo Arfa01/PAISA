@@ -88,22 +88,28 @@ def binary_classification_metrics(
         "0": int((y_pred_arr == 0).sum()),
         "1": int((y_pred_arr == 1).sum()),
     }
+    complete_class_coverage = len(labels_present) == 2
     balanced_accuracy = (
-        accuracy_score(y_true_arr, y_pred_arr)
-        if len(labels_present) == 1
-        else balanced_accuracy_score(y_true_arr, y_pred_arr)
+        balanced_accuracy_score(y_true_arr, y_pred_arr)
+        if complete_class_coverage
+        else None
     )
     matthews = (
-        0.0
-        if len(labels_present) == 1
-        else matthews_corrcoef(y_true_arr, y_pred_arr)
+        matthews_corrcoef(y_true_arr, y_pred_arr)
+        if complete_class_coverage
+        else None
     )
+    metric_warnings = [] if complete_class_coverage else ["single_class_actuals"]
     metrics: dict[str, Any] = {
         "row_count": int(len(y_true_arr)),
         "support": int(len(y_true_arr)),
         "positive_label": 1,
         "average": "binary",
         "zero_division": 0,
+        "observed_classes": labels_present,
+        "complete_class_coverage": complete_class_coverage,
+        "selection_eligible": complete_class_coverage,
+        "metric_warnings": metric_warnings,
         "accuracy": _safe_float(accuracy_score(y_true_arr, y_pred_arr)),
         "balanced_accuracy": _safe_float(balanced_accuracy),
         "precision": _safe_float(precision_score(y_true_arr, y_pred_arr, zero_division=0)),
@@ -121,7 +127,7 @@ def binary_classification_metrics(
         "confusion_matrix": confusion_matrix(y_true_arr, y_pred_arr, labels=[0, 1]).astype(int).tolist(),
     }
 
-    if len(labels_present) == 2:
+    if complete_class_coverage:
         metrics["roc_auc"] = _safe_float(roc_auc_score(y_true_arr, prob_arr))
         proba_2col = np.column_stack([1.0 - prob_arr, prob_arr])
         metrics["log_loss"] = _safe_float(log_loss(y_true_arr, proba_2col, labels=[0, 1]))
@@ -309,6 +315,7 @@ def predictions_to_leaderboard(metrics_by_model: dict[str, dict[str, Any]], spli
             "roc_auc",
             "brier_score",
             "log_loss",
+            "selection_eligible",
         ]:
             record[metric_name] = split_metrics.get(metric_name)
         records.append(record)
@@ -327,17 +334,38 @@ def predictions_to_leaderboard(metrics_by_model: dict[str, dict[str, Any]], spli
 def select_provisional_champion(validation_leaderboard: pd.DataFrame) -> dict[str, Any]:
     if validation_leaderboard.empty:
         raise ValueError("Validation leaderboard is empty; cannot select champion.")
-    row = validation_leaderboard.iloc[0].to_dict()
+    if "selection_eligible" in validation_leaderboard.columns:
+        eligible = validation_leaderboard[
+            validation_leaderboard["selection_eligible"].eq(True)
+        ].copy()
+    else:
+        eligible = validation_leaderboard[
+            validation_leaderboard["balanced_accuracy"].notna()
+        ].copy()
+    if eligible.empty:
+        raise ValueError(
+            "No validation model is eligible for champion selection; validation "
+            "must contain both actual classes."
+        )
+    eligible = eligible.sort_values(
+        ["balanced_accuracy", "f1", "accuracy", "model_id"],
+        ascending=[False, False, False, True],
+        na_position="last",
+        kind="mergesort",
+    )
+    row = eligible.iloc[0].to_dict()
     return {
         "selection_rule": (
-            "Highest validation balanced accuracy; then validation F1; then "
-            "validation accuracy; then ascending model_id as deterministic tie breakers."
+            "Require both actual classes in validation; then highest validation "
+            "balanced accuracy; then validation F1; then validation accuracy; "
+            "then ascending model_id as deterministic tie breakers."
         ),
         "model_id": row["model_id"],
         "label": row["label"],
         "validation_balanced_accuracy": row.get("balanced_accuracy"),
         "validation_f1": row.get("f1"),
         "validation_accuracy": row.get("accuracy"),
+        "validation_complete_class_coverage": True,
     }
 
 

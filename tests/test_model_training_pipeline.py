@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from paisa.experiments.evaluation import PREDICTION_COLUMNS
+from paisa.experiments.artifacts import load_model_artifact
 from paisa.experiments.experiment_config import TARGET_NAME, get_variant
 from paisa.experiments.runner import load_predictions, run_experiment
 from paisa.experiments.trainer import (
@@ -104,6 +105,34 @@ def test_all_variants_share_dates_features_and_have_unique_registered_ids(comple
         }
         expected_dates = split_dates if expected_dates is None else expected_dates
         assert split_dates == expected_dates
+
+
+def test_all_variants_share_targets_seed_and_train_fitted_imputer(completed_run):
+    _, _, summary = completed_run
+    expected_training = prepare_training_data(_price_fixture()).splits.train
+    expected_statistics = expected_training[list(TECHNICAL_FEATURE_COLUMNS)].median().to_numpy()
+    reference_targets = None
+
+    for registered_id in summary["model_ids"].values():
+        model_dir = Path(summary["artifact_directory"]) / "models" / registered_id
+        model, manifest = load_model_artifact(model_dir)
+        audit = pd.read_csv(model_dir / "predictions_all_splits.csv")
+        targets = audit[["split", "feature_date", "target_date", "actual_class"]]
+        reference_targets = targets if reference_targets is None else reference_targets
+        pd.testing.assert_frame_equal(targets, reference_targets)
+        assert manifest["random_seed"] == 42
+        assert model.named_steps["model"].get_params(deep=False)["random_state"] == 42
+        configuration = json.loads(
+            (model_dir / "config.json").read_text(encoding="utf-8")
+        )
+        assert configuration["random_seed"] == 42
+        assert configuration["model_configuration"]["random_state"] == 42
+        np.testing.assert_allclose(
+            model.named_steps["imputer"].statistics_,
+            expected_statistics,
+            rtol=0,
+            atol=1e-12,
+        )
 
 
 def test_prediction_csv_is_exact_backtesting_contract(completed_run):

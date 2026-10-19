@@ -21,9 +21,11 @@ models/**/*.pkl
 models/**/*.json
 models/**/*.csv
 /runs/**
+/artifacts/**
 !data/**/.gitkeep
 !models/.gitkeep
 !/runs/.gitkeep
+!/artifacts/.gitkeep
 
 # OS/editor
 .DS_Store

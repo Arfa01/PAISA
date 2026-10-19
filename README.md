@@ -102,6 +102,50 @@ python scripts/run_v0_pipeline.py --provider manual-csv --manual-csv-dir data/ex
 
 Accepted column variants include `date`, `open`, `open_price`, `close`, `close_price`, `volume`, `high`, and `low`.
 
+## Versioned OGDC model experiments
+
+The experiment trainer reuses the daily PAISA feature pipeline without
+replacing the legacy v0 baseline. It trains four variants on one shared,
+chronological, leakage-safe split:
+
+- `M-001`: Random Forest with the existing baseline configuration.
+- `M-002`: conservative Random Forest.
+- `M-003`: more flexible Random Forest.
+- `M-004`: XGBoost using the same features, target dates, and split dates.
+
+Install the default dependencies and run the unified command:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
+python scripts/train_ogdc_models.py
+```
+
+The defaults are OGDC, daily data, the `psx-dps` provider, a requested start
+date of `2021-01-01`, random seed `42`, and immutable output below
+`artifacts/model_training/`. Use `--help` to see the explicit overrides.
+Generated model binaries, frozen inputs, and ZIP archives are ignored by Git.
+
+Each model's `predictions.csv` follows the architecture prediction-record
+contract and can be passed directly to the backtesting CLI. The experiment
+configuration must reference the same `model_id` and the desired test-date
+window:
+
+```bash
+python scripts/run_backtest.py \
+  --predictions artifacts/model_training/<run_id>/models/<model_id>/predictions.csv \
+  --prices data/processed/psx_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+Open [`notebooks/PAISA_OGDC_Model_Training.ipynb`](notebooks/PAISA_OGDC_Model_Training.ipynb)
+for the Colab workflow. The optional
+[`notebooks/PAISA_OGDC_LSTM_Training.ipynb`](notebooks/PAISA_OGDC_LSTM_Training.ipynb)
+keeps deep-learning dependencies separate from the CPU pipeline. See
+[`docs/model_training_stage.md`](docs/model_training_stage.md) for target,
+split, metric, artifact, and provider details.
+
 ## Versioned OGDC backtesting
 
 The backtesting engine consumes a standardized prediction CSV, daily OGDC

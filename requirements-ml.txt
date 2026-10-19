@@ -1,4 +1,5 @@
-# Local machine-learning runtime used by the v0 Random Forest.
-# XGBoost and LSTM dependencies belong on their future feature branches.
+# CPU machine-learning runtime for the v0 baseline and versioned experiments.
+# LSTM dependencies remain optional and are installed only by its notebook.
 scikit-learn>=1.4.0
 joblib>=1.3.0
+xgboost>=2.1.0,<4.0

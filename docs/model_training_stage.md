@@ -1,83 +1,175 @@
-# PAISA model-training stage: frozen OGDC Random Forest variants
+# PAISA versioned OGDC model-training stage
 
-This stage is a separate experimental layer. It does **not** replace the existing PAISA v0 baseline model.
+This stage is the reproducible model boundary for the OGDC vertical slice. It
+reuses PAISA's existing daily PSX cleaning and technical-feature pipeline and
+does not replace the legacy v0 baseline model. It does not own decision rules,
+portfolio balances, trade execution, API routes, or dashboard logic.
 
-## Purpose
+All outputs are academic experiments and are not financial advice.
 
-The stage creates reproducible Random Forest variants for one stock, OGDC, using daily PSX technical data only. It freezes the input dataset, builds a paper-trading-aligned next-session target, trains multiple immutable variants, compares them on the same chronological splits, and saves all artifacts under a unique run directory.
+## Models
 
-## What it does
+The default full run trains the following immutable variants from identical
+modelling rows and split dates. A deliberately selected `--model-id` subset
+uses the same preparation and artifact contracts:
 
-- Uses the existing PAISA PSX pipeline with `provider=psx-dps` by default.
-- Requests OGDC data from `2021-01-01`.
-- Does not use synthetic fallback data.
-- Preserves the v0 target but uses a separate experimental target:
-  - signal after close of day `t`
-  - earliest future execution at open of day `t+1`
-  - target measures `close(t+1) / open(t+1) - 1`
-- Creates short, week, and month feature contexts.
-- Uses a shared chronological train/validation/test split with boundary purging.
-- Trains five immutable Random Forest variants:
-  - M-001: short context, CFG-A
-  - M-002: week context, CFG-A
-  - M-003: month context, CFG-A
-  - M-004: month context, CFG-B conservative
-  - M-005: month context, CFG-C flexible
-- Selects a provisional champion using validation balanced accuracy and validation F1 as tie breaker.
-- Saves model files, predictions, metrics, manifests, plots, and a ZIP archive.
+| Model | Algorithm | Purpose |
+|---|---|---|
+| `M-001` | Random Forest | Existing baseline configuration. |
+| `M-002` | Random Forest | Conservative configuration. |
+| `M-003` | Random Forest | More flexible configuration. |
+| `M-004` | XGBoost classifier | Same dates, features, target, and splits as the Random Forest variants. |
 
-## Run locally
+The run also evaluates two non-trained references:
 
-```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m pip install -e .
-python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider psx-dps --output-dir artifacts/model_training --random-state 42
-```
+- Majority class, learned from the training split only.
+- Previous direction, using only information available on the feature date.
 
-## If `psx-dps` returns 403/404
+The provisional champion is selected from validation metrics only. The test
+split remains untouched until configurations and the champion-selection rule
+have been frozen; test results never select or tune a model.
 
-The DPS endpoint is undocumented and may temporarily reject requests even when the symbol is valid. The provider sends browser-like headers and retries the endpoint with and without a trailing slash, but a rejection can still happen.
+## Target and timing contract
 
-If DPS keeps failing, verify the alternate real PSX provider is importable:
-
-```bash
-python -m pip install -r requirements.txt
-python -c "import pypsx_toolkit as pt; print('pypsx_toolkit import OK:', pt.__file__)"
-```
-
-Then run the training stage with the alternate real PSX provider instead of sample/synthetic data:
-
-```bash
-python scripts/train_ogdc_rf_variants.py --symbol OGDC --start 2021-01-01 --provider pypsx --output-dir artifacts/model_training --random-state 42
-```
-
-Do not use `--provider sample` for the real training-stage artifact.
-
-## Run in Colab/Kaggle
-
-Use:
+The experimental target follows `docs/ARCHITECTURE_CONTRACTS.md`:
 
 ```text
-notebooks/train_ogdc_rf_variants_colab_kaggle.ipynb
+target_next_day_up = 1 if close[target_date] > close[feature_date], else 0
 ```
 
-## Output
+`feature_date` is trading session `t`. `target_date` is the next observed OGDC
+trading session, not the next calendar date. A feature row uses information
+available no later than the close of `feature_date`. The prediction is formed
+after that close and can execute no earlier than `target_date` at the price
+defined by the later backtesting experiment.
 
-Each run creates:
+Rows are split chronologically. Split assignment follows target dates, with
+boundary purging where needed so a future label cannot cross from one split
+into another. Rows are never shuffled. Imputers or other learned transforms are
+fit on training rows only.
+
+## Install and train
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+python scripts/train_ogdc_models.py
+```
+
+The explicit equivalent is:
+
+```bash
+python scripts/train_ogdc_models.py \
+  --symbol OGDC \
+  --start 2021-01-01 \
+  --provider psx-dps \
+  --output-dir artifacts/model_training \
+  --random-state 42
+```
+
+Use `--prices data/processed/psx_prices.csv` to train from an existing cleaned
+price file instead of fetching. Use `--run-id` only to supply a new immutable
+identifier; an existing destination fails. `--no-zip` is useful for quick local
+smoke tests. Run `python scripts/train_ogdc_models.py --help` for details.
+`pypsx-toolkit` remains an optional provider and is not required by the default
+installation.
+
+## Saved evidence
+
+Each successful run creates a new directory below:
 
 ```text
 artifacts/model_training/<run_id>/
 ```
 
-and a ZIP archive:
+The run records, at minimum:
+
+- Ordered feature columns and feature-set version.
+- Complete model configuration and random seed.
+- Data fingerprint, provider, symbol, and coverage.
+- Inclusive train, validation, and test target-date ranges.
+- Target definition and one-session horizon.
+- Predictions and class probabilities for every split.
+- Accuracy, balanced accuracy, precision, recall, F1, Matthews correlation
+  coefficient, ROC-AUC when valid, Brier score, confusion matrix, and class
+  distributions.
+- Feature importance where the estimator supports it.
+- Fitted model binary, checksum, manifest, tabular leaderboards, and a ZIP of
+  the complete run.
+
+Writers reject an existing run or model destination rather than overwriting it.
+Generated inputs, binaries, results, and ZIP files are ignored by Git.
+
+## Prediction handoff to backtesting
+
+Every per-model test `predictions.csv` includes the prediction-record fields:
 
 ```text
-artifacts/paisa_<run_id>.zip
+schema_version,model_id,ticker,feature_date,target_date,predicted_class,
+probability_up,probability_down,actual_class
 ```
 
-In Colab, the ZIP is placed in `/content/`. In Kaggle, the ZIP is placed in `/kaggle/working/`.
+`actual_class` is evaluation-only. It is not available to feature generation,
+model inference, policies, or execution. Probabilities map through the saved
+class order, sum to one within contract tolerance, and an exact tie maps to
+class `0`.
 
-## Not included yet
+The CSV can be passed directly to the backtester. Supply the cleaned daily
+price file and an experiment configuration whose `model_id`, symbol, and
+evaluation dates match the chosen prediction rows:
 
-This stage does not perform portfolio simulation, live trading, news analysis, sentiment analysis, fundamental analysis, reinforcement learning, XGBoost, LSTM, SHAP, or financial advice.
+```bash
+python scripts/run_backtest.py \
+  --predictions artifacts/model_training/<run_id>/models/<model_id>/predictions.csv \
+  --prices data/processed/psx_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+Backtesting remains independent: training does not create signals, trades, or
+portfolio state.
+
+## Colab notebooks
+
+The primary notebook is:
+
+```text
+notebooks/PAISA_OGDC_Model_Training.ipynb
+```
+
+It clones or uses the repository, installs the normal dependencies, invokes the
+same reusable trainer used by the CLI, displays saved metrics, creates
+presentation-only plots from the saved leaderboards, and exposes the generated
+ZIP for download. Training logic remains in `src/paisa/`; plot files are not
+part of the immutable run artifact.
+
+The optional deep-learning workflow is separate:
+
+```text
+notebooks/PAISA_OGDC_LSTM_Training.ipynb
+```
+
+Its TensorFlow/Keras installation is notebook-local and is not part of
+`requirements.txt`, so it cannot block the Random Forest/XGBoost CPU pipeline.
+It uses the shared data-preparation function and must preserve the same target,
+chronological splits, prediction schema, and artifact contract before an LSTM
+is promoted beyond an optional experiment.
+
+## Provider limitations
+
+The public PSX endpoint can be unavailable or reject automated requests. A
+provider failure is reported as a failed acquisition; the trainer does not
+silently substitute sample rows for a real-data run. See
+[`training_when_live_psx_is_blocked.md`](training_when_live_psx_is_blocked.md)
+for the existing-processed-data path.
+
+The current provider does not independently establish adjusted prices or full
+corporate-action and dividend treatment. Manifests therefore retain the
+contract's `price_adjustment: "unknown"`, `dividends_included: false`, and
+`corporate_actions_policy: "not_modeled"` limitations unless a source is later
+verified.

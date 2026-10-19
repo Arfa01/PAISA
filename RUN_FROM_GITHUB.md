@@ -5,8 +5,8 @@ These are the exact steps to run the current PAISA v0 backend from a fresh clone
 ## 1. Clone the repo
 
 ```bash
-git clone https://github.com/Arfa01/paisa-v0.git
-cd paisa-v0
+git clone https://github.com/Arfa01/PAISA.git
+cd PAISA
 ```
 
 ## 2. Create and activate a virtual environment
@@ -23,6 +23,18 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install -e .
 ```
+
+The default install supports `psx-dps`, `manual-csv`, and `sample`. To try the
+optional full-OHLCV provider, install its dependencies separately:
+
+```bash
+pip install -r requirements-provider-pypsx.txt
+python -c "import pypsx_toolkit"
+```
+
+`pypsx-toolkit` is excluded from the default requirements because its upstream
+package can install successfully but fail to import on some platforms. A failed
+optional-provider install or import does not block the standard PAISA workflow.
 
 ## 4. Generate PSX data, features, dataset, and baseline model
 
@@ -47,11 +59,7 @@ models/baseline_metrics.json
 pytest
 ```
 
-Expected:
-
-```text
-3 passed
-```
+Expected: all collected tests pass. The count will grow as components are added.
 
 ## 6. Start the API
 
@@ -59,12 +67,6 @@ Use this command:
 
 ```bash
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Alternative:
-
-```bash
-python scripts/serve_api.py
 ```
 
 ## 7. Open the API in the browser

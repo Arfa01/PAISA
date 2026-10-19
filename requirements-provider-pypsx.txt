@@ -1,0 +1,5 @@
+# Optional full-OHLCV provider. This is not part of the default install because
+# upstream packaging is unreliable on some platforms, including macOS.
+# After installation, verify it with: python -c "import pypsx_toolkit"
+-r requirements-core.txt
+pypsx-toolkit>=3.1.1

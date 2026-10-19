@@ -27,7 +27,8 @@ class PyPsxToolkitProvider(StockDataProvider):
         except Exception as exc:
             raise DataSourceError(
                 "pypsx-toolkit is not installed or failed to import. "
-                "Run `pip install pypsx-toolkit`, or use `--provider psx-dps`."
+                "Run `pip install -r requirements-provider-pypsx.txt` and verify "
+                "the import, or use `--provider psx-dps`."
             ) from exc
 
         try:

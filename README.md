@@ -102,6 +102,30 @@ python scripts/run_v0_pipeline.py --provider manual-csv --manual-csv-dir data/ex
 
 Accepted column variants include `date`, `open`, `open_price`, `close`, `close_price`, `volume`, `high`, and `low`.
 
+## Versioned OGDC backtesting
+
+The backtesting engine consumes a standardized prediction CSV, daily OGDC
+prices, and an immutable experiment configuration. It does not train models and
+does not change the existing v0 pipeline.
+
+```bash
+python scripts/run_backtest.py \
+  --predictions path/to/predictions.csv \
+  --prices path/to/OGDC_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+`--runs-dir` is optional and defaults to `runs/`. Each successful run creates a
+new `runs/<experiment_id>/` directory containing the normalized configuration,
+predictions, signals, trades, daily portfolio snapshots, benchmark ledgers,
+metrics, an equity-curve PNG, and a drawdown PNG. Existing experiment IDs and
+portfolio IDs are rejected rather than overwritten.
+
+See [the backtesting runbook](docs/BACKTESTING.md) for the exact CSV schemas,
+configuration, execution timing, accounting rules, metric formulas, and output
+tree. All backtests are academic simulations and are not financial advice.
+
 ## API endpoints
 
 | Endpoint | Purpose |

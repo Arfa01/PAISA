@@ -90,6 +90,32 @@ This was the command used successfully for v0:
 python scripts/run_v0_pipeline.py --provider psx-dps --symbols OGDC HBL MCB --start 2021-01-01 --train
 ```
 
+## Run a versioned OGDC backtest
+
+Backtesting is separate from model training. Supply contract-compatible model
+predictions, the corresponding daily OGDC prices, and an immutable experiment
+configuration:
+
+```bash
+python scripts/run_backtest.py \
+  --predictions path/to/predictions.csv \
+  --prices path/to/OGDC_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+`--runs-dir` is optional and defaults to `runs/`. A successful command writes
+`runs/<experiment_id>/`. It fails if that experiment directory already exists
+or any configured strategy or benchmark portfolio ID has already been used;
+choose new IDs instead of deleting or overwriting an old run.
+
+The required input columns, complete configuration example, after-close to
+next-session-open timing, accounting rules, metric formulas, and generated
+artifact tree are documented in
+[`docs/BACKTESTING.md`](docs/BACKTESTING.md).
+
+All backtest output is an academic simulation and is not financial advice.
+
 ## Notes
 
 - Generated CSV/model files are ignored by Git and should be regenerated locally.

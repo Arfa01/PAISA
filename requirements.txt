@@ -3,4 +3,5 @@
 #   pip install -r requirements-provider-pypsx.txt
 -r requirements-core.txt
 -r requirements-ml.txt
+-r requirements-backtesting.txt
 -r requirements-dev.txt

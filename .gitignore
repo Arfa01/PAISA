@@ -20,8 +20,10 @@ models/**/*.joblib
 models/**/*.pkl
 models/**/*.json
 models/**/*.csv
+/runs/**
 !data/**/.gitkeep
 !models/.gitkeep
+!/runs/.gitkeep
 
 # OS/editor
 .DS_Store

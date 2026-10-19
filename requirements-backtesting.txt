@@ -1,0 +1,2 @@
+# Static, headless report generation for versioned backtest runs.
+matplotlib>=3.8,<4.0

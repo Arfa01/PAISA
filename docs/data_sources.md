@@ -30,7 +30,17 @@ The PSX DPS time-series endpoint may not provide high/low. v0 stores high/low as
 
 ## Optional provider
 
-`pypsx-toolkit` is included as an optional provider for full OHLCV. Use it only if it installs and runs successfully in your environment.
+`pypsx-toolkit` is an optional provider for full OHLCV and is deliberately not
+part of the default requirements. Install and verify it separately:
+
+```bash
+pip install -r requirements-provider-pypsx.txt
+python -c "import pypsx_toolkit"
+```
+
+Use it only if both commands succeed. Its upstream package can report a
+successful installation but fail to import on some platforms. This does not
+block the primary `psx-dps`, `manual-csv`, or `sample` workflows.
 
 ## Manual CSV fallback
 

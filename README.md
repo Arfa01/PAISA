@@ -69,12 +69,20 @@ So this provider gives `open`, `close`, and `volume`; `high` and `low` may remai
 
 ## Optional full-OHLCV run
 
-`pypsx-toolkit` advertises 10 years of PSX OHLCV data as pandas DataFrames. If it installs successfully on your Mac, use:
+`pypsx-toolkit` advertises 10 years of PSX OHLCV data as pandas DataFrames. If
+both its installation and import verification succeed, use:
 
 ```bash
 source .venv/bin/activate
+pip install -r requirements-provider-pypsx.txt
+python -c "import pypsx_toolkit"
 python scripts/run_v0_pipeline.py --provider pypsx --symbols OGDC HBL MCB --start 2021-01-01 --train
 ```
+
+The optional provider is intentionally excluded from `requirements.txt` because
+its upstream distribution can install successfully but fail to import on some
+platforms. The default `psx-dps`, `manual-csv`, and `sample` providers do not
+require it.
 
 ## Manual CSV fallback
 
@@ -94,6 +102,30 @@ python scripts/run_v0_pipeline.py --provider manual-csv --manual-csv-dir data/ex
 
 Accepted column variants include `date`, `open`, `open_price`, `close`, `close_price`, `volume`, `high`, and `low`.
 
+## Versioned OGDC backtesting
+
+The backtesting engine consumes a standardized prediction CSV, daily OGDC
+prices, and an immutable experiment configuration. It does not train models and
+does not change the existing v0 pipeline.
+
+```bash
+python scripts/run_backtest.py \
+  --predictions path/to/predictions.csv \
+  --prices path/to/OGDC_prices.csv \
+  --config path/to/experiment.json \
+  --runs-dir runs
+```
+
+`--runs-dir` is optional and defaults to `runs/`. Each successful run creates a
+new `runs/<experiment_id>/` directory containing the normalized configuration,
+predictions, signals, trades, daily portfolio snapshots, benchmark ledgers,
+metrics, an equity-curve PNG, and a drawdown PNG. Existing experiment IDs and
+portfolio IDs are rejected rather than overwritten.
+
+See [the backtesting runbook](docs/BACKTESTING.md) for the exact CSV schemas,
+configuration, execution timing, accounting rules, metric formulas, and output
+tree. All backtests are academic simulations and are not financial advice.
+
 ## API endpoints
 
 | Endpoint | Purpose |
@@ -110,7 +142,7 @@ Accepted column variants include `date`, `open`, `open_price`, `close`, `close_p
 ## Folder structure
 
 ```text
-paisa-v0/
+PAISA/
 ├── data/
 │   ├── raw/          # generated raw provider outputs
 │   ├── processed/    # generated prices/features/dataset/metadata
@@ -144,10 +176,10 @@ v0 is considered successful when:
 9. `GET /health` returns `prices_ready=true`, `dataset_ready=true`, and `model_ready=true`.
 10. `GET /predict/OGDC` returns a JSON prediction with direction, confidence, top factors, and the academic disclaimer.
 
-## Next versions
+## Current roadmap
 
-- v1: add news ingestion and daily sentiment aggregation.
-- v2: compare price-only vs price+sentiment models.
-- v3: add SHAP explanations.
-- v4: add React + Plotly dashboard.
-- v5: add sector/event relationship graph.
+The earlier v1–v5 sequence placed news and sentiment before the dashboard. The
+dated OGDC vertical-slice sprint supersedes that order for 19–24 October 2026;
+news, sentiment, SHAP, and relationship graphs are deferred. See
+[`docs/OCT19_24_SPRINT.md`](docs/OCT19_24_SPRINT.md) for the active scope and
+dependency order.

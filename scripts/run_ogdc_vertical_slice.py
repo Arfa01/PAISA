@@ -48,7 +48,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="data/processed/psx_prices.csv",
         help=(
             "Previously cleaned real PSX file considered only when the live "
-            "psx-dps request fails. Sample/synthetic/fixture sources are rejected."
+            "psx-dps request fails. Its directory must contain the matching "
+            "pipeline_metadata.json whose prices_artifact binds the exact CSV "
+            "checksum, provider, daily frequency, row count, and OGDC coverage. "
+            "Sample/synthetic/fixture, mixed, blank, or stale provenance is rejected."
         ),
     )
     parser.add_argument(

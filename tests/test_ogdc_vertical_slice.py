@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import pytest
 
 from paisa.experiments.evaluation import PREDICTION_COLUMNS
 from paisa.experiments.runner import run_experiment
+from paisa.pipeline import run_v0_pipeline
 from paisa.vertical_slice import (
     PriceAcquisition,
     build_combined_leaderboard,
@@ -24,7 +26,9 @@ from paisa.vertical_slice import (
 REQUIRED_OUTPUTS = {
     "manifest.json",
     "model_training_run_reference.json",
+    "input_snapshot",
     "experiment_configs",
+    "experiments",
     "model_metrics.csv",
     "portfolio_metrics.csv",
     "combined_leaderboard.csv",
@@ -35,6 +39,20 @@ REQUIRED_OUTPUTS = {
     "final_summary.json",
 }
 EXPECTED_VARIANTS = {"M-001", "M-002", "M-003", "M-004"}
+EXPECTED_EXPERIMENT_FILES = {
+    "config.json",
+    "predictions.csv",
+    "signals.csv",
+    "trades.csv",
+    "portfolio_snapshots.csv",
+    "metrics.json",
+    "result.json",
+    "equity_curve.png",
+    "drawdown.png",
+    "benchmarks/cash_only_snapshots.csv",
+    "benchmarks/buy_and_hold_snapshots.csv",
+    "benchmarks/buy_and_hold_trades.csv",
+}
 
 
 def _price_fixture(
@@ -78,12 +96,110 @@ def _fixture_acquisition(*, symbol: str, start: str, work_dir: Path) -> PriceAcq
     )
 
 
+def _pipeline_produced_psx_contract_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, pd.DataFrame]:
+    """Exercise the real pipeline writer with an offline provider test double."""
+
+    prices = _price_fixture(source="psx_dps")
+
+    class OfflinePsxProvider:
+        source_name = "psx_dps"
+
+        def fetch_history(self, symbol: str, start=None, end=None):
+            assert symbol == "OGDC"
+            return prices.drop(columns=["ticker", "source"]).copy()
+
+    monkeypatch.setattr(
+        "paisa.pipeline.get_provider",
+        lambda *_args, **_kwargs: OfflinePsxProvider(),
+    )
+    data_dir = tmp_path / "pipeline-data"
+    run_v0_pipeline(
+        symbols=["OGDC"],
+        provider_name="psx-dps",
+        start=date(2025, 1, 1),
+        train=False,
+        data_dir=data_dir,
+        model_dir=tmp_path / "pipeline-models",
+    )
+    processed = data_dir / "processed"
+    cached = processed / "psx_prices.csv"
+    return cached, processed / "pipeline_metadata.json", pd.read_csv(cached)
+
+
 def _sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_price_provenance(
+    prices_path: Path,
+    *,
+    provider: str = "psx_dps",
+    metadata_overrides: dict[str, Any] | None = None,
+) -> Path:
+    """Write the pipeline provenance shape for one test price artifact."""
+
+    frame = pd.read_csv(prices_path)
+    dates = pd.to_datetime(frame["date"], errors="raise")
+    tickers = frame["ticker"].astype(str).str.strip().str.upper()
+    symbols: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(tickers.unique()):
+        selected_dates = dates.loc[tickers.eq(symbol)]
+        symbols[symbol] = {
+            "row_count": int(len(selected_dates)),
+            "date_start": selected_dates.min().strftime("%Y-%m-%d"),
+            "date_end": selected_dates.max().strftime("%Y-%m-%d"),
+            "source": provider,
+        }
+    metadata: dict[str, Any] = {
+        "schema_version": "1.0",
+        "producer": {
+            "component": "paisa.pipeline.run_v0_pipeline",
+            "schema_version": "1.0",
+            "status": "complete",
+        },
+        "generated_at": "2026-10-20T00:00:00",
+        "provider": provider,
+        "symbols_requested": sorted(symbols),
+        "raw_row_counts": {
+            symbol: details["row_count"] for symbol, details in symbols.items()
+        },
+        "errors": {},
+        "prices_rows": int(len(frame)),
+        "features_rows": int(len(frame)),
+        "ml_dataset_rows": max(0, int(len(frame)) - 30),
+        "date_range": {
+            "start": dates.min().strftime("%Y-%m-%d"),
+            "end": dates.max().strftime("%Y-%m-%d"),
+        },
+        "prices_artifact": {
+            "schema_version": "1.0",
+            "status": "complete",
+            "path": prices_path.name,
+            "sha256": _sha256(prices_path),
+            "provider": provider,
+            "frequency": "daily",
+            "row_count": int(len(frame)),
+            "symbols": symbols,
+        },
+        "files": {
+            "prices": str(prices_path),
+            "features": str(prices_path.parent / "psx_features.csv"),
+            "dataset": str(prices_path.parent / "ml_dataset.csv"),
+            "model_dir": str(prices_path.parent / "models"),
+        },
+        "model_metrics": None,
+    }
+    if metadata_overrides:
+        metadata.update(metadata_overrides)
+    metadata_path = prices_path.parent / "pipeline_metadata.json"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return metadata_path
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:
@@ -114,12 +230,22 @@ def completed_vertical_slice(tmp_path_factory: pytest.TempPathFactory) -> Comple
         prediction_path = Path(kwargs["predictions_path"])
         prices_path = Path(kwargs["prices_path"])
         before = _sha256(prediction_path)
+        prediction_frame = pd.read_csv(prediction_path)
         completed = run_experiment(**kwargs)
         calls.append(
             {
                 **kwargs,
+                "variant_id": Path(kwargs["config_path"]).stem,
                 "prediction_sha256_before": before,
                 "prediction_sha256_after": _sha256(prediction_path),
+                "prediction_columns": prediction_frame.columns.tolist(),
+                "prediction_date_pairs": list(
+                    zip(
+                        prediction_frame["feature_date"],
+                        prediction_frame["target_date"],
+                        strict=True,
+                    )
+                ),
                 "prices_sha256": _sha256(prices_path),
                 "completed": completed,
             }
@@ -191,12 +317,7 @@ def test_all_four_experiments_use_identical_dates_market_prices_and_rules(
             for bar in call["completed"].strategy.market_bars
         ) == common_market
 
-    date_pairs = []
-    for call in calls:
-        predictions = pd.read_csv(call["predictions_path"])
-        date_pairs.append(
-            list(zip(predictions["feature_date"], predictions["target_date"], strict=True))
-        )
+    date_pairs = [call["prediction_date_pairs"] for call in calls]
     assert all(pairs == date_pairs[0] for pairs in date_pairs[1:])
 
 
@@ -288,10 +409,11 @@ def test_live_data_failure_never_uses_synthetic_cached_data(tmp_path: Path):
     assert not (tmp_path / "vertical" / "reject-sample-cache").exists()
 
 
-def test_cached_real_price_validation_confirms_ogdc_and_date_range(tmp_path: Path):
-    cached = tmp_path / "psx_prices.csv"
-    prices = _price_fixture(source="psx_dps")
-    prices.to_csv(cached, index=False)
+def test_pipeline_produced_price_pair_confirms_ogdc_and_date_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cached, _, prices = _pipeline_produced_psx_contract_fixture(tmp_path, monkeypatch)
 
     validated = validate_real_price_file(cached, symbol="OGDC", start="2025-02-03")
 
@@ -299,6 +421,199 @@ def test_cached_real_price_validation_confirms_ogdc_and_date_range(tmp_path: Pat
     assert validated.date_start == "2025-02-03"
     assert validated.date_end == pd.Timestamp(prices["date"].max()).strftime("%Y-%m-%d")
     assert validated.row_count == int((prices["date"] >= "2025-02-03").sum())
+    assert validated.prices_sha256 == _sha256(cached)
+
+
+def test_relabelled_fixture_cache_is_rejected_by_acquisition_checksum(tmp_path: Path):
+    cached = tmp_path / "psx_prices.csv"
+    prices = _price_fixture(source="sample")
+    prices.to_csv(cached, index=False)
+    _write_price_provenance(cached, provider="psx_dps")
+    prices["source"] = "psx_dps"
+    prices.to_csv(cached, index=False)
+
+    with pytest.raises(ValueError, match="checksum|SHA-256"):
+        validate_real_price_file(cached)
+
+
+@pytest.mark.parametrize(
+    ("bad_source", "message"),
+    [(None, "missing|null"), ("   ", "blank|non-empty")],
+    ids=["null-source", "blank-source"],
+)
+def test_every_cached_ogdc_row_requires_nonblank_source(
+    tmp_path: Path,
+    bad_source: str | None,
+    message: str,
+):
+    cached = tmp_path / "psx_prices.csv"
+    prices = _price_fixture(source="psx_dps")
+    prices.loc[0, "source"] = bad_source
+    prices.to_csv(cached, index=False)
+    _write_price_provenance(cached)
+
+    with pytest.raises(ValueError, match=message):
+        validate_real_price_file(cached)
+
+
+def test_cached_ogdc_rows_cannot_mix_allowed_real_providers(tmp_path: Path):
+    cached = tmp_path / "psx_prices.csv"
+    prices = _price_fixture(source="psx_dps")
+    prices.loc[0, "source"] = "pypsx_toolkit"
+    prices.to_csv(cached, index=False)
+    _write_price_provenance(cached, provider="psx_dps")
+
+    with pytest.raises(ValueError, match="source|provider|mixed"):
+        validate_real_price_file(cached)
+
+
+def test_cached_price_mutation_after_acquisition_invalidates_provenance(tmp_path: Path):
+    cached = tmp_path / "psx_prices.csv"
+    prices = _price_fixture(source="psx_dps")
+    prices.to_csv(cached, index=False)
+    _write_price_provenance(cached)
+    prices.loc[0, "close"] += 1.0
+    prices.to_csv(cached, index=False)
+
+    with pytest.raises(ValueError, match="checksum|SHA-256"):
+        validate_real_price_file(cached)
+
+
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    [
+        lambda metadata: metadata.pop("producer"),
+        lambda metadata: metadata["raw_row_counts"].pop("OGDC"),
+        lambda metadata: metadata["errors"].update({"OGDC": "provider failed"}),
+    ],
+    ids=["missing-producer", "missing-raw-rows", "provider-error"],
+)
+def test_cached_metadata_must_record_a_successful_pipeline_acquisition(
+    tmp_path: Path,
+    metadata_mutation: Any,
+):
+    cached = tmp_path / "psx_prices.csv"
+    _price_fixture(source="psx_dps").to_csv(cached, index=False)
+    metadata_path = _write_price_provenance(cached)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_mutation(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="producer|acquisition|metadata"):
+        validate_real_price_file(cached)
+
+
+def test_cached_prices_are_snapshotted_before_training(tmp_path: Path):
+    cached = tmp_path / "psx_prices.csv"
+    original = _price_fixture(source="psx_dps")
+    original.to_csv(cached, index=False)
+    _write_price_provenance(cached)
+    accepted_hash = _sha256(cached)
+
+    def live_failure(**_: Any) -> PriceAcquisition:
+        raise RuntimeError("live provider unavailable")
+
+    def inspect_snapshot_then_stop(**kwargs: Any) -> dict[str, Any]:
+        supplied = Path(kwargs["prices_path"])
+        assert supplied.resolve() != cached.resolve()
+        replacement = original.copy()
+        replacement["source"] = "sample"
+        replacement.to_csv(cached, index=False)
+        assert _sha256(supplied) == accepted_hash
+        assert set(pd.read_csv(supplied)["source"]) == {"psx_dps"}
+        raise RuntimeError("snapshot verified")
+
+    with pytest.raises(RuntimeError, match="snapshot verified"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=cached,
+            vertical_slice_run_id="snapshot-cache",
+            acquire_fn=live_failure,
+            train_fn=inspect_snapshot_then_stop,
+        )
+
+    assert not (tmp_path / "vertical" / "snapshot-cache").exists()
+
+
+def test_mutating_the_private_snapshot_during_training_aborts_the_run(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    def mutate_snapshot(**kwargs: Any) -> dict[str, Any]:
+        supplied = Path(kwargs["prices_path"])
+        prices = pd.read_csv(supplied)
+        prices.loc[0, "close"] = float(prices.loc[0, "close"]) + 1.0
+        prices.to_csv(supplied, index=False)
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": reference["model_ids"],
+            "prediction_paths": reference["prediction_paths"],
+        }
+
+    with pytest.raises(RuntimeError, match="snapshot changed"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="mutated-private-snapshot",
+            acquire_fn=_fixture_acquisition,
+            train_fn=mutate_snapshot,
+        )
+
+    assert not (tmp_path / "vertical" / "mutated-private-snapshot").exists()
+
+
+def test_mutating_snapshotted_provenance_during_training_aborts_the_run(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    cached = tmp_path / "psx_prices.csv"
+    _price_fixture(source="psx_dps").to_csv(cached, index=False)
+    _write_price_provenance(cached)
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    def live_failure(**_: Any) -> PriceAcquisition:
+        raise RuntimeError("forced live outage")
+
+    def mutate_provenance(**kwargs: Any) -> dict[str, Any]:
+        metadata_path = Path(kwargs["prices_path"]).parent / "pipeline_metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["generated_at"] = "2099-01-01T00:00:00"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": reference["model_ids"],
+            "prediction_paths": reference["prediction_paths"],
+        }
+
+    with pytest.raises(RuntimeError, match="provenance snapshot changed"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=cached,
+            vertical_slice_run_id="mutated-provenance-snapshot",
+            acquire_fn=live_failure,
+            train_fn=mutate_provenance,
+        )
+
+    assert not (tmp_path / "vertical" / "mutated-provenance-snapshot").exists()
 
 
 def test_invalid_live_result_does_not_open_cached_fallback(tmp_path: Path):
@@ -308,6 +623,7 @@ def test_invalid_live_result_does_not_open_cached_fallback(tmp_path: Path):
     invalid = _price_fixture(source="psx_dps")
     invalid.loc[0, "open"] = -1
     invalid.to_csv(invalid_live, index=False)
+    _write_price_provenance(invalid_live)
     train_called = False
 
     def invalid_acquisition(**_: Any) -> PriceAcquisition:
@@ -476,7 +792,7 @@ def test_model_predictions_reach_backtester_without_schema_conversion(
         assert prediction_path.name == "predictions.csv"
         assert prediction_path.parent.parent.name == "models"
         assert call["prediction_sha256_before"] == call["prediction_sha256_after"]
-        assert pd.read_csv(prediction_path).columns.tolist() == PREDICTION_COLUMNS
+        assert call["prediction_columns"] == PREDICTION_COLUMNS
 
     reference = json.loads(
         (completed_vertical_slice.artifact_path / "model_training_run_reference.json").read_text(
@@ -484,9 +800,138 @@ def test_model_predictions_reach_backtester_without_schema_conversion(
         )
     )
     referenced_paths = {
-        Path(path).resolve() for path in reference["prediction_paths"].values()
+        variant_id: Path(path).resolve()
+        for variant_id, path in reference["prediction_paths"].items()
     }
-    assert {Path(call["predictions_path"]).resolve() for call in calls} == referenced_paths
+    assert set(referenced_paths) == EXPECTED_VARIANTS
+    for call in calls:
+        public_path = referenced_paths[call["variant_id"]]
+        assert public_path.is_file()
+        assert _sha256(public_path) == call["prediction_sha256_before"]
+
+
+def test_backtester_cannot_replace_the_supplied_model_predictions(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+    calls = 0
+
+    def existing_training(**_: Any) -> dict[str, Any]:
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": reference["model_ids"],
+            "prediction_paths": reference["prediction_paths"],
+        }
+
+    def replacing_backtester(**kwargs: Any):
+        nonlocal calls
+        calls += 1
+        changed = pd.read_csv(kwargs["predictions_path"])
+        original_up = changed["probability_up"].astype(float)
+        changed["probability_up"] = 1.0 - original_up
+        changed["probability_down"] = original_up
+        changed["predicted_class"] = (
+            changed["probability_up"] > changed["probability_down"]
+        ).astype(int)
+        replacement = tmp_path / f"replacement-{calls}.csv"
+        changed.to_csv(replacement, index=False)
+        return run_experiment(
+            predictions_path=replacement,
+            prices_path=kwargs["prices_path"],
+            config_path=kwargs["config_path"],
+            runs_root=kwargs["runs_root"],
+        )
+
+    with pytest.raises(ValueError, match="differs|prediction"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="replaced-model-predictions",
+            acquire_fn=_fixture_acquisition,
+            train_fn=existing_training,
+            backtest_fn=replacing_backtester,
+        )
+
+    assert calls == 4
+    assert not (tmp_path / "vertical" / "replaced-model-predictions").exists()
+
+
+def test_backtester_cannot_mutate_a_training_prediction_after_using_it(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def mutating_backtester(**kwargs: Any):
+        nonlocal calls
+        completed = run_experiment(**kwargs)
+        calls += 1
+        if calls == 1:
+            path = Path(kwargs["predictions_path"])
+            changed = pd.read_csv(path)
+            original_up = float(changed.loc[0, "probability_up"])
+            changed.loc[0, "probability_up"] = 1.0 - original_up
+            changed.loc[0, "probability_down"] = original_up
+            changed.to_csv(path, index=False)
+        return completed
+
+    output_dir = tmp_path / "vertical"
+    model_output_dir = tmp_path / "models"
+    with pytest.raises(RuntimeError, match="prediction artifact changed"):
+        run_ogdc_vertical_slice(
+            output_dir=output_dir,
+            model_output_dir=model_output_dir,
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="mutated-training-predictions",
+            acquire_fn=_fixture_acquisition,
+            backtest_fn=mutating_backtester,
+        )
+
+    assert calls == 4
+    assert not (output_dir / "mutated-training-predictions").exists()
+    assert model_output_dir.is_dir()
+    assert not any(model_output_dir.iterdir())
+
+
+def test_backtester_cannot_mutate_the_trainer_frozen_price_evidence(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def mutating_backtester(**kwargs: Any):
+        nonlocal calls
+        if calls == 0:
+            path = Path(kwargs["prices_path"])
+            changed = pd.read_csv(path)
+            changed.loc[0, "open"] = float(changed.loc[0, "open"]) + 1.0
+            changed.to_csv(path, index=False)
+        calls += 1
+        return run_experiment(**kwargs)
+
+    output_dir = tmp_path / "vertical"
+    model_output_dir = tmp_path / "models"
+    with pytest.raises(RuntimeError, match="price snapshot changed"):
+        run_ogdc_vertical_slice(
+            output_dir=output_dir,
+            model_output_dir=model_output_dir,
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="mutated-frozen-prices",
+            acquire_fn=_fixture_acquisition,
+            backtest_fn=mutating_backtester,
+        )
+
+    assert calls == 4
+    assert not (output_dir / "mutated-frozen-prices").exists()
+    assert model_output_dir.is_dir()
+    assert not any(model_output_dir.iterdir())
 
 
 def test_stale_prediction_metrics_prevent_backtesting(
@@ -637,3 +1082,155 @@ def test_complete_fixture_based_end_to_end_smoke_run(
         "drawdown_comparison.png",
     ):
         assert (artifact / filename).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_successful_run_retains_and_checksums_all_experiment_ledgers(
+    completed_vertical_slice: CompletedVerticalSlice,
+):
+    artifact = completed_vertical_slice.artifact_path
+    experiment_root = artifact / "experiments"
+    experiment_dirs = sorted(path for path in experiment_root.iterdir() if path.is_dir())
+    assert len(experiment_dirs) == 4
+
+    retained_portfolios: set[str] = set()
+    for experiment_dir in experiment_dirs:
+        files = {
+            path.relative_to(experiment_dir).as_posix()
+            for path in experiment_dir.rglob("*")
+            if path.is_file()
+        }
+        assert files == EXPECTED_EXPERIMENT_FILES
+        config = json.loads((experiment_dir / "config.json").read_text(encoding="utf-8"))
+        result = json.loads((experiment_dir / "result.json").read_text(encoding="utf-8"))
+        metrics = json.loads((experiment_dir / "metrics.json").read_text(encoding="utf-8"))
+        assert result == metrics
+        assert result["experiment_id"] == config["experiment_id"] == experiment_dir.name
+        assert result["model_id"] == config["model_id"]
+        retained_portfolios.update(
+            {
+                config["portfolio_id"],
+                config["benchmark_portfolio_ids"]["cash_only"],
+                config["benchmark_portfolio_ids"]["buy_and_hold"],
+            }
+        )
+    assert len(retained_portfolios) == 12
+
+    manifest = json.loads((artifact / "manifest.json").read_text(encoding="utf-8"))
+    manifest_paths = {item["path"]: item["sha256"] for item in manifest["artifacts"]}
+    retained_files = {
+        path.relative_to(artifact).as_posix(): _sha256(path)
+        for path in experiment_root.rglob("*")
+        if path.is_file()
+    }
+    assert retained_files
+    assert all(manifest_paths[path] == digest for path, digest in retained_files.items())
+    assert not any(path.startswith(".work/") for path in manifest_paths)
+
+
+def test_aggregate_reports_reconcile_to_retained_strategy_ledgers(
+    completed_vertical_slice: CompletedVerticalSlice,
+):
+    artifact = completed_vertical_slice.artifact_path
+    portfolio_metrics = pd.read_csv(artifact / "portfolio_metrics.csv").set_index(
+        "model_id"
+    )
+    curves = pd.read_csv(artifact / "daily_equity_curves.csv")
+    configs = {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in (artifact / "experiment_configs").glob("*.json")
+    }
+    for variant_id, config in configs.items():
+        experiment_dir = artifact / "experiments" / config["experiment_id"]
+        result = json.loads((experiment_dir / "result.json").read_text(encoding="utf-8"))
+        snapshots = pd.read_csv(experiment_dir / "portfolio_snapshots.csv")
+        trades = pd.read_csv(experiment_dir / "trades.csv")
+        aggregate = portfolio_metrics.loc[variant_id]
+        assert aggregate["ending_portfolio_value"] == pytest.approx(
+            float(result["ending_equity"])
+        )
+        assert aggregate["total_return"] == pytest.approx(result["total_return"])
+        assert aggregate["maximum_drawdown"] == pytest.approx(
+            result["maximum_drawdown"]
+        )
+        assert int(aggregate["number_of_trades"]) == len(trades)
+        strategy_curve = curves.loc[curves["series_id"].eq(variant_id)].reset_index(
+            drop=True
+        )
+        assert strategy_curve["date"].tolist() == snapshots["date"].tolist()
+        assert pd.to_numeric(strategy_curve["total_equity"]).tolist() == pytest.approx(
+            pd.to_numeric(snapshots["total_equity"]).tolist()
+        )
+
+
+def test_pipeline_produced_cached_pair_completes_vertical_slice_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cached, metadata, _ = _pipeline_produced_psx_contract_fixture(tmp_path, monkeypatch)
+
+    def live_failure(**_: Any) -> PriceAcquisition:
+        raise RuntimeError("forced live outage")
+
+    summary = run_ogdc_vertical_slice(
+        output_dir=tmp_path / "vertical",
+        model_output_dir=tmp_path / "models",
+        cached_prices_path=cached,
+        vertical_slice_run_id="cached-real-contract",
+        acquire_fn=live_failure,
+    )
+
+    assert summary["status"] == "PASS"
+    assert summary["data_source"]["mode"] == "cached_real_fallback"
+    assert summary["data_source"]["is_real_data"] is True
+    assert summary["data_source"]["input_prices_sha256"] == _sha256(cached)
+    retained_input = Path(summary["artifact_paths"]["input_snapshot"])
+    assert _sha256(retained_input / cached.name) == _sha256(cached)
+    assert _sha256(retained_input / "pipeline_metadata.json") == _sha256(metadata)
+    training_reference = json.loads(
+        Path(summary["artifact_paths"]["model_training_run_reference"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["data_source"]["frozen_prices_sha256"] == _sha256(
+        training_reference["frozen_prices_path"]
+    )
+    assert summary["data_source"]["provenance_sha256"] == _sha256(metadata)
+
+
+def test_corrupt_fourth_experiment_rolls_back_model_and_vertical_publication(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def corrupt_fourth_result(**kwargs: Any):
+        nonlocal calls
+        completed = run_experiment(**kwargs)
+        calls += 1
+        if calls == 4:
+            result_path = completed.artifact_path / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["total_return"] = float(result["total_return"]) + 0.5
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+        return completed
+
+    output_dir = tmp_path / "vertical"
+    model_output_dir = tmp_path / "models"
+    preexisting = model_output_dir / "preexisting-run"
+    preexisting.mkdir(parents=True)
+    (preexisting / "sentinel.txt").write_text("keep me", encoding="utf-8")
+    before = _tree_hashes(model_output_dir)
+    with pytest.raises(ValueError, match="result|metrics|persisted|reconcile"):
+        run_ogdc_vertical_slice(
+            output_dir=output_dir,
+            model_output_dir=model_output_dir,
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="late-corruption",
+            acquire_fn=_fixture_acquisition,
+            backtest_fn=corrupt_fourth_result,
+        )
+
+    assert calls == 4
+    assert not (output_dir / "late-corruption").exists()
+    assert model_output_dir.is_dir()
+    assert _tree_hashes(model_output_dir) == before
+    assert {path.name for path in model_output_dir.iterdir()} == {"preexisting-run"}

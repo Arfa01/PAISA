@@ -86,13 +86,35 @@ is never a valid substitute for a live vertical-slice run.
 If the live provider is unavailable, the command must:
 
 1. Stop the live acquisition attempt and retain the complete provider error.
-2. Check `data/processed/psx_prices.csv` for existing OGDC rows.
-3. Reject the file if OGDC is absent, the required daily price fields are
-   invalid, or its provenance identifies sample, fixture, or synthetic data.
-4. If the cached rows qualify as real data, record that cached-real fallback
+2. Require `pipeline_metadata.json` beside the configured cached price CSV.
+   The CSV and metadata are one provenance pair; neither is accepted alone.
+3. Require the metadata's completed `prices_artifact` record to identify the
+   exact CSV filename and SHA-256, the real provider, daily frequency, total
+   row count, and per-symbol row count and date coverage. Its OGDC coverage and
+   source must match the rows actually read. The metadata must also identify a
+   completed `paisa.pipeline.run_v0_pipeline` producer, contain a valid
+   generation timestamp and transformation counts, and record positive raw
+   acquisition rows for OGDC without an OGDC provider error.
+4. Reject the pair if OGDC is absent, required daily price fields are invalid,
+   any source value is null or blank, the file mixes providers, the provider is
+   sample/fixture/synthetic, or any checksum, row-count, provider, or coverage
+   claim disagrees with the CSV. Merely relabelling fixture rows is therefore
+   insufficient because their bytes no longer match the producer record.
+5. If the cached pair qualifies as real data, record that cached-real fallback
    was used, preserve the live-provider error, and document the actual first
    and last OGDC dates.
-5. Fail the workflow if no qualifying cached-real OGDC data is available.
+6. Fail the workflow if no qualifying cached-real provenance pair is
+   available.
+
+Before these checks, the runner copies the selected price CSV and its metadata
+to an invocation-private working snapshot. Validation and model training both
+consume that snapshot, not the mutable original cache. The runner verifies the
+snapshot fingerprint around training so an external cache edit cannot create
+a time-of-check/time-of-use mismatch. The snapshot is private while the run is
+being built, but it is not discarded after success: the exact CSV and, for a
+real-data run, its `pipeline_metadata.json` remain in the immutable published
+bundle under `input_snapshot/`. The manifest checksum inventory and final
+report record this input evidence and its price and provenance fingerprints.
 
 The final summary identifies the effective source and date range. A cached run
 must not be described as a successful live fetch, and fixture-based tests must
@@ -117,10 +139,17 @@ has a longer immutable registered model ID. Prediction records and backtest
 configurations use that registered ID; reports retain the stable variant label
 so the four rows remain recognizable.
 
-A model or backtest failure prevents a successful final status. The command
-prints a final `PASS` only after all four models, all portfolio simulations,
-benchmarks, combined tables, and plots have completed and passed their
-consistency checks.
+A model or backtest failure prevents a successful final status. The model run
+is first written to an invocation-owned pending location and is not published
+under its immutable public run ID until all four backtests, their persisted
+ledgers, benchmarks, combined tables, and plots have completed and passed their
+consistency checks. A handled late failure removes the invocation's pending or
+newly published model run along with the staged vertical bundle; it never
+deletes a pre-existing run. The command prints a final `PASS` only after those
+checks and publications succeed. The frozen training-price file and all four
+prediction files are fingerprinted before backtesting, rechecked after every
+experiment has been reconciled, and rechecked again immediately before
+publication. Any in-place mutation aborts the transaction.
 
 ## Output artifacts
 
@@ -130,11 +159,29 @@ A successful run publishes this comparison bundle:
 artifacts/vertical_slice/<vertical_slice_run_id>/
 ├── manifest.json
 ├── model_training_run_reference.json
+├── input_snapshot/
+│   ├── <price_csv_filename>.csv
+│   └── pipeline_metadata.json  # real-data runs
 ├── experiment_configs/
 │   ├── M-001.json
 │   ├── M-002.json
 │   ├── M-003.json
 │   └── M-004.json
+├── experiments/
+│   └── <experiment_id>/
+│       ├── config.json
+│       ├── predictions.csv
+│       ├── signals.csv
+│       ├── trades.csv
+│       ├── portfolio_snapshots.csv
+│       ├── metrics.json
+│       ├── result.json
+│       ├── equity_curve.png
+│       ├── drawdown.png
+│       └── benchmarks/
+│           ├── cash_only_snapshots.csv
+│           ├── buy_and_hold_snapshots.csv
+│           └── buy_and_hold_trades.csv
 ├── model_metrics.csv
 ├── portfolio_metrics.csv
 ├── combined_leaderboard.csv
@@ -153,8 +200,19 @@ The files have these roles:
   references.
 - `model_training_run_reference.json` points to the immutable model-training
   run and its four registered model artifacts and prediction files.
+- `input_snapshot/` retains the exact price CSV that was snapshotted before
+  validation and consumed by training. Real-data runs also retain the matching
+  producer-written `pipeline_metadata.json`; fixture-only tests may omit it.
+  These are immutable evidence for reproducing which input bytes passed the
+  producer-attestation and integrity checks and were used; both are covered by
+  the manifest when present.
 - `experiment_configs/` contains one normalized, immutable configuration per
   model portfolio.
+- `experiments/` retains the complete immutable backtest evidence for each of
+  the four model portfolios: exact prediction input, generated signals, trade
+  ledger, daily strategy snapshots, benchmark ledgers, result/metric records,
+  and per-experiment plots. Each file is included in the vertical manifest's
+  checksum inventory.
 - `model_metrics.csv` keeps the train, validation, and untouched-test
   prediction evidence separate from portfolio outcomes.
 - `portfolio_metrics.csv` contains one row for each of the four model
@@ -163,6 +221,12 @@ The files have these roles:
   treating test accuracy as the portfolio-selection rule.
 - `daily_equity_curves.csv` is the dated source table used for the combined
   equity and drawdown charts.
+- Before publication, the runner reloads the persisted experiment files,
+  reconstructs their typed records, recomputes the result metrics, checks the
+  strategy and benchmark identities and common market observations, and then
+  builds the aggregate portfolio table and curves from that persisted evidence.
+  A mismatch between `result.json`, `metrics.json`, or any retained ledger
+  fails the run instead of publishing an inconsistent summary.
 - The three PNG files compare model metrics, the six logical equity series,
   and their drawdowns. They are presentation artifacts; the CSV and JSON files
   remain the auditable source values.
@@ -255,10 +319,11 @@ not the same measurement, and the report must not claim otherwise.
 - Current provenance does not establish a fully adjusted total-return price
   series. Dividends and corporate actions are not modeled, so buy-and-hold and
   model returns must be interpreted with that limitation.
-- Cached-file qualification validates the standardized source field, OGDC
-  coverage, dates, and numeric market fields. It cannot independently
-  authenticate a deliberately mislabeled local CSV, so the cache remains a
-  trusted local input and its SHA-256 is recorded for auditability.
+- Cached-file qualification depends on the producer-written
+  `pipeline_metadata.json` and its checksum-bound `prices_artifact` entry. This
+  detects post-production edits, stale metadata, mixed/blank sources, and
+  simple relabelling, but cannot prove that an already-compromised producer or
+  a coordinated replacement of both files reported truthful market data.
 - The run covers one stock, one daily horizon, one historical split, fixed
   thresholds, and one controlled cost model. It is not evidence of live
   execution quality or future returns.

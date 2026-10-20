@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import traceback
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -25,6 +25,8 @@ import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
+from paisa.backtesting.benchmarks import BenchmarkOutcome
+from paisa.backtesting.engine import BacktestOutcome
 from paisa.backtesting.metrics import calculate_drawdowns, calculate_portfolio_metrics
 from paisa.experiments.artifacts import (
     make_run_id,
@@ -40,7 +42,14 @@ from paisa.experiments.experiment_config import (
     MODEL_VARIANTS,
     RANDOM_SEED,
 )
-from paisa.experiments.runner import load_predictions, run_experiment
+from paisa.experiments.runner import (
+    build_experiment_metrics,
+    load_portfolio_snapshots,
+    load_predictions,
+    load_signals,
+    load_trades,
+    run_experiment,
+)
 from paisa.experiments.trainer import run_training_stage
 from paisa.pipeline import run_v0_pipeline
 from paisa.trading.models import ExperimentConfig
@@ -55,6 +64,20 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _REQUIRED_PRICE_COLUMNS = {"date", "ticker", "open", "close", "volume", "source"}
 _REAL_PRICE_SOURCES = {"psx_dps", "pypsx_toolkit"}
 _NON_REAL_SOURCE_MARKERS = ("sample", "synthetic", "fixture", "mock", "test")
+_EXPERIMENT_ARTIFACT_FILES = {
+    "config.json",
+    "predictions.csv",
+    "signals.csv",
+    "trades.csv",
+    "portfolio_snapshots.csv",
+    "metrics.json",
+    "result.json",
+    "equity_curve.png",
+    "drawdown.png",
+    "benchmarks/cash_only_snapshots.csv",
+    "benchmarks/buy_and_hold_snapshots.csv",
+    "benchmarks/buy_and_hold_trades.csv",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +97,7 @@ class PriceAcquisition:
     row_count: int | None = None
     is_real_data: bool = True
     live_error: str | None = None
+    provenance_path: str | Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +109,21 @@ class ValidatedPrices:
     date_start: str
     date_end: str
     row_count: int
+    prices_sha256: str
+    provenance_path: Path | None = None
+    provenance_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedExperiment:
+    """An experiment reconstructed from its published, immutable ledgers."""
+
+    artifact_path: Path
+    config: ExperimentConfig
+    strategy: BacktestOutcome
+    cash_only: BenchmarkOutcome
+    buy_and_hold: BenchmarkOutcome
+    metrics: Mapping[str, Any]
 
 
 class LiveDataUnavailableError(RuntimeError):
@@ -114,17 +153,252 @@ def _safe_run_id(value: str) -> str:
     return run_id
 
 
+def _snapshot_file(source: str | Path, destination: Path) -> Path:
+    """Copy one stable version from a single open descriptor into staging."""
+
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Snapshot source does not exist: {source_path}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(f"Snapshot destination already exists: {destination}")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.tmp-", dir=destination.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with source_path.open("rb") as input_file, os.fdopen(
+            descriptor, "wb"
+        ) as output_file:
+            before = os.fstat(input_file.fileno())
+            shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+            after = os.fstat(input_file.fileno())
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after:
+            raise RuntimeError(f"Snapshot source changed while being copied: {source_path}")
+        os.replace(temporary_path, destination)
+    except Exception:
+        if temporary_path.exists():
+            temporary_path.unlink()
+        raise
+    return destination.resolve()
+
+
+def _snapshot_acquisition(
+    acquisition: PriceAcquisition,
+    *,
+    snapshot_dir: Path,
+) -> PriceAcquisition:
+    """Freeze price bytes and their acquisition attestation before validation."""
+
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    original_prices = Path(acquisition.prices_path).expanduser().resolve()
+    prices_snapshot = _snapshot_file(original_prices, snapshot_dir / original_prices.name)
+    provenance_snapshot: Path | None = None
+    if acquisition.is_real_data:
+        original_provenance = (
+            Path(acquisition.provenance_path).expanduser().resolve()
+            if acquisition.provenance_path is not None
+            else original_prices.parent / "pipeline_metadata.json"
+        )
+        provenance_snapshot = _snapshot_file(
+            original_provenance, snapshot_dir / "pipeline_metadata.json"
+        )
+    return PriceAcquisition(
+        prices_path=prices_snapshot,
+        source=acquisition.source,
+        mode=acquisition.mode,
+        date_start=acquisition.date_start,
+        date_end=acquisition.date_end,
+        row_count=acquisition.row_count,
+        is_real_data=acquisition.is_real_data,
+        live_error=acquisition.live_error,
+        provenance_path=provenance_snapshot,
+    )
+
+
+def _provenance_error(message: str) -> ValueError:
+    return ValueError(f"Price provenance validation failed: {message}")
+
+
+def _validate_price_provenance(
+    *,
+    prices_path: Path,
+    provenance_path: str | Path | None,
+    frame: pd.DataFrame,
+    prices_sha256: str,
+    symbol: str,
+) -> tuple[str, Path, str]:
+    """Authenticate a price CSV against the v0 pipeline's bound metadata."""
+
+    metadata_path = (
+        Path(provenance_path).expanduser().resolve()
+        if provenance_path is not None
+        else prices_path.parent / "pipeline_metadata.json"
+    )
+    if not metadata_path.is_file():
+        raise _provenance_error(
+            f"missing acquisition metadata {metadata_path}; cached real prices require "
+            "pipeline_metadata.json"
+        )
+    metadata_hash_before = sha256_file(metadata_path)
+    metadata = _load_json(metadata_path)
+    metadata_hash_after = sha256_file(metadata_path)
+    if metadata_hash_before != metadata_hash_after:
+        raise _provenance_error("acquisition metadata changed while it was read")
+
+    if metadata.get("schema_version") != "1.0":
+        raise _provenance_error("pipeline metadata must use schema version 1.0")
+    producer = _require_mapping(metadata.get("producer"), "pipeline metadata producer")
+    if producer != {
+        "component": "paisa.pipeline.run_v0_pipeline",
+        "schema_version": "1.0",
+        "status": "complete",
+    }:
+        raise _provenance_error(
+            "metadata does not contain a completed PAISA pipeline producer record"
+        )
+    try:
+        datetime.fromisoformat(str(metadata["generated_at"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _provenance_error("generated_at must be a valid acquisition timestamp") from exc
+
+    artifact = _require_mapping(
+        metadata.get("prices_artifact"), "pipeline metadata prices_artifact"
+    )
+    if artifact.get("schema_version") != "1.0" or artifact.get("status") != "complete":
+        raise _provenance_error("prices_artifact must be schema 1.0 with complete status")
+    if artifact.get("frequency") != "daily":
+        raise _provenance_error("only daily price artifacts are accepted")
+    provider = str(artifact.get("provider", "")).strip().lower()
+    if provider not in _REAL_PRICE_SOURCES:
+        raise _provenance_error(
+            f"provider must be one of {sorted(_REAL_PRICE_SOURCES)}; found {provider!r}"
+        )
+    if str(metadata.get("provider", "")).strip().lower() != provider:
+        raise _provenance_error("top-level provider does not match prices_artifact")
+    if str(artifact.get("path", "")).strip() != prices_path.name:
+        raise _provenance_error("artifact path does not identify the exact price CSV")
+    if str(artifact.get("sha256", "")).strip().lower() != prices_sha256:
+        raise _provenance_error("price CSV SHA-256 checksum does not match acquisition metadata")
+    if int(artifact.get("row_count", -1)) != len(frame) or int(
+        metadata.get("prices_rows", -1)
+    ) != len(frame):
+        raise _provenance_error("price CSV row count does not match acquisition metadata")
+
+    dates = pd.to_datetime(frame["date"], errors="raise")
+    tickers = frame["ticker"].astype(str).str.strip().str.upper()
+    if tickers.eq("").any():
+        raise _provenance_error("every price row must identify a symbol")
+    sources = frame["source"]
+    if sources.isna().any():
+        raise _provenance_error("every price row requires a non-null source")
+    normalized_sources = sources.astype(str).str.strip().str.lower()
+    if normalized_sources.eq("").any():
+        raise _provenance_error("every price row requires a non-empty, non-blank source")
+    observed_sources = sorted(normalized_sources.unique().tolist())
+    if observed_sources != [provider]:
+        raise _provenance_error(
+            f"price sources are mixed or do not match provider {provider!r}: "
+            f"{observed_sources}"
+        )
+
+    symbols = _require_mapping(artifact.get("symbols"), "prices_artifact symbols")
+    actual_symbols = sorted(tickers.unique().tolist())
+    if sorted(str(key).strip().upper() for key in symbols) != actual_symbols:
+        raise _provenance_error("symbol coverage does not match the price CSV")
+    requested = metadata.get("symbols_requested")
+    if not isinstance(requested, list) or symbol not in {
+        str(value).strip().upper() for value in requested
+    }:
+        raise _provenance_error(f"requested-symbol metadata does not include {symbol}")
+    raw_row_counts = _require_mapping(
+        metadata.get("raw_row_counts"), "pipeline raw_row_counts"
+    )
+    errors = _require_mapping(metadata.get("errors"), "pipeline errors")
+    files = _require_mapping(metadata.get("files"), "pipeline files")
+    if Path(str(files.get("prices", ""))).name != prices_path.name:
+        raise _provenance_error("pipeline files record does not identify the price CSV")
+    for ticker in actual_symbols:
+        coverage = _require_mapping(symbols[ticker], f"coverage for {ticker}")
+        mask = tickers.eq(ticker)
+        selected_dates = dates.loc[mask]
+        expected = {
+            "row_count": int(mask.sum()),
+            "date_start": selected_dates.min().strftime("%Y-%m-%d"),
+            "date_end": selected_dates.max().strftime("%Y-%m-%d"),
+            "source": provider,
+        }
+        observed = {
+            "row_count": int(coverage.get("row_count", -1)),
+            "date_start": str(coverage.get("date_start", "")),
+            "date_end": str(coverage.get("date_end", "")),
+            "source": str(coverage.get("source", "")).strip().lower(),
+        }
+        if observed != expected:
+            raise _provenance_error(f"coverage for {ticker} does not match the price CSV")
+        try:
+            raw_count = int(raw_row_counts[ticker])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _provenance_error(
+                f"successful raw acquisition evidence is missing for {ticker}"
+            ) from exc
+        if raw_count < expected["row_count"] or ticker in errors:
+            raise _provenance_error(
+                f"metadata does not record a successful acquisition for {ticker}"
+            )
+
+    try:
+        features_rows = int(metadata["features_rows"])
+        dataset_rows = int(metadata["ml_dataset_rows"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _provenance_error("pipeline transformation row counts are missing") from exc
+    if features_rows != len(frame) or not 0 <= dataset_rows <= features_rows:
+        raise _provenance_error(
+            "pipeline transformation row counts do not match the price artifact"
+        )
+
+    global_range = _require_mapping(metadata.get("date_range"), "pipeline date_range")
+    if {
+        "start": str(global_range.get("start", "")),
+        "end": str(global_range.get("end", "")),
+    } != {
+        "start": dates.min().strftime("%Y-%m-%d"),
+        "end": dates.max().strftime("%Y-%m-%d"),
+    }:
+        raise _provenance_error("global date coverage does not match the price CSV")
+    return provider, metadata_path, metadata_hash_before
+
+
 def _inspect_price_file(
     path: str | Path,
     *,
     symbol: str,
     start: str,
     require_real_source: bool,
+    provenance_path: str | Path | None = None,
 ) -> ValidatedPrices:
     source_path = Path(path).expanduser().resolve()
     if not source_path.is_file():
         raise FileNotFoundError(f"Price file does not exist: {source_path}")
 
+    prices_hash_before = sha256_file(source_path)
     frame = pd.read_csv(source_path)
     missing = sorted(_REQUIRED_PRICE_COLUMNS - set(frame.columns))
     if missing:
@@ -165,13 +439,12 @@ def _inspect_price_file(
     if (selected["volume"] < 0).any():
         raise ValueError("Price file volume values must be non-negative")
 
-    sources = sorted(
-        {
-            str(value).strip().lower()
-            for value in selected["source"].dropna().tolist()
-            if str(value).strip()
-        }
-    )
+    if selected["source"].isna().any():
+        raise ValueError("Every selected price row requires a non-null source")
+    normalized_sources = selected["source"].astype(str).str.strip().str.lower()
+    if normalized_sources.eq("").any():
+        raise ValueError("Every selected price row requires a non-empty, non-blank source")
+    sources = sorted(normalized_sources.unique().tolist())
     if not sources:
         raise ValueError("Price file must identify a non-empty source for OGDC")
     blocked = [
@@ -184,13 +457,24 @@ def _inspect_price_file(
             "Refusing to label sample, synthetic, fixture, mock, or test data as "
             f"real PSX data; rejected sources: {blocked}"
         )
+    resolved_provenance_path: Path | None = None
+    provenance_sha256: str | None = None
     if require_real_source:
-        unknown = [source for source in sources if source not in _REAL_PRICE_SOURCES]
-        if unknown:
+        provider, resolved_provenance_path, provenance_sha256 = _validate_price_provenance(
+            prices_path=source_path,
+            provenance_path=provenance_path,
+            frame=frame,
+            prices_sha256=prices_hash_before,
+            symbol=ticker,
+        )
+        if sources != [provider]:
             raise ValueError(
-                "Cached real-data fallback requires an explicit PSX source from "
-                f"{sorted(_REAL_PRICE_SOURCES)}; found {unknown}"
+                f"Selected {ticker} sources do not match attested provider {provider!r}"
             )
+
+    prices_hash_after = sha256_file(source_path)
+    if prices_hash_before != prices_hash_after:
+        raise ValueError("Price CSV changed while it was being validated")
 
     selected = selected.sort_values("date", kind="mergesort")
     return ValidatedPrices(
@@ -199,6 +483,9 @@ def _inspect_price_file(
         date_start=selected["date"].iloc[0].strftime("%Y-%m-%d"),
         date_end=selected["date"].iloc[-1].strftime("%Y-%m-%d"),
         row_count=int(len(selected)),
+        prices_sha256=prices_hash_before,
+        provenance_path=resolved_provenance_path,
+        provenance_sha256=provenance_sha256,
     )
 
 
@@ -215,6 +502,8 @@ def validate_real_price_file(
         symbol=symbol,
         start=start,
         require_real_source=True,
+        provenance_path=Path(path).expanduser().resolve().parent
+        / "pipeline_metadata.json",
     )
 
 
@@ -246,20 +535,18 @@ def acquire_live_ogdc_prices(
             f"Live PSX DPS acquisition failed for {symbol}: {exc}"
         ) from exc
     prices_path = acquisition_root / "data" / "processed" / "psx_prices.csv"
-    validated = validate_real_price_file(prices_path, symbol=symbol, start=start)
-    provider = str(metadata.get("provider", validated.source))
+    provenance_path = acquisition_root / "data" / "processed" / "pipeline_metadata.json"
+    provider = str(metadata.get("provider", ""))
     if provider != "psx_dps":
         raise ValueError(
             f"Live acquisition must use provider 'psx_dps'; received {provider!r}"
         )
     return PriceAcquisition(
-        prices_path=validated.path,
-        source=validated.source,
+        prices_path=prices_path,
+        source=provider,
         mode="live_psx_dps",
-        date_start=validated.date_start,
-        date_end=validated.date_end,
-        row_count=validated.row_count,
         is_real_data=True,
+        provenance_path=provenance_path,
     )
 
 
@@ -269,6 +556,7 @@ def _resolve_prices(
     start: str,
     work_dir: Path,
     cached_prices_path: Path,
+    snapshot_dir: Path,
     acquire_fn: Callable[..., PriceAcquisition],
     custom_acquirer: bool,
 ) -> tuple[PriceAcquisition, ValidatedPrices]:
@@ -284,11 +572,16 @@ def _resolve_prices(
     else:
         if not isinstance(acquisition, PriceAcquisition):
             raise TypeError("acquire_fn must return PriceAcquisition")
+        acquisition = _snapshot_acquisition(
+            acquisition,
+            snapshot_dir=snapshot_dir,
+        )
         inspected = _inspect_price_file(
             acquisition.prices_path,
             symbol=symbol,
             start=start,
             require_real_source=acquisition.is_real_data,
+            provenance_path=acquisition.provenance_path,
         )
         if not acquisition.is_real_data and not custom_acquirer:
             raise ValueError("The production acquisition path must return real PSX data")
@@ -301,14 +594,28 @@ def _resolve_prices(
             row_count=inspected.row_count,
             is_real_data=acquisition.is_real_data,
             live_error=acquisition.live_error,
+            provenance_path=inspected.provenance_path,
         )
         return normalized, inspected
 
     try:
-        fallback = validate_real_price_file(
-            cached_prices_path,
+        snapshotted_fallback = _snapshot_acquisition(
+            PriceAcquisition(
+                prices_path=cached_prices_path,
+                source="pending_validation",
+                mode="cached_real_fallback",
+                is_real_data=True,
+                live_error=live_error,
+                provenance_path=cached_prices_path.parent / "pipeline_metadata.json",
+            ),
+            snapshot_dir=snapshot_dir,
+        )
+        fallback = _inspect_price_file(
+            snapshotted_fallback.prices_path,
             symbol=symbol,
             start=start,
+            require_real_source=True,
+            provenance_path=snapshotted_fallback.provenance_path,
         )
     except Exception:
         fallback_error = traceback.format_exc()
@@ -328,6 +635,7 @@ def _resolve_prices(
             row_count=fallback.row_count,
             is_real_data=True,
             live_error=live_error,
+            provenance_path=fallback.provenance_path,
         ),
         fallback,
     )
@@ -727,21 +1035,144 @@ def _economic_trade_signature(outcome: Any) -> tuple[tuple[Any, ...], ...]:
     )
 
 
+def _load_persisted_experiment(
+    artifact_path: Path,
+    *,
+    expected_config: ExperimentConfig,
+    expected_run: Any,
+    expected_predictions: Sequence[Any],
+) -> PersistedExperiment:
+    """Reconstruct and reconcile one complete experiment artifact tree."""
+
+    expected_path = artifact_path.resolve()
+    if not expected_path.is_dir():
+        raise FileNotFoundError(f"Persisted experiment directory is missing: {expected_path}")
+    actual_files = {
+        path.relative_to(expected_path).as_posix()
+        for path in expected_path.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != _EXPERIMENT_ARTIFACT_FILES:
+        raise ValueError(
+            f"Persisted experiment {expected_config.experiment_id} has incomplete or "
+            f"unexpected evidence: {sorted(actual_files ^ _EXPERIMENT_ARTIFACT_FILES)}"
+        )
+
+    raw_config = _load_json(expected_path / "config.json")
+    config = ExperimentConfig.from_mapping(raw_config)
+    if config != expected_config or raw_config != expected_config.to_dict():
+        raise ValueError(
+            f"Persisted config does not match requested experiment {expected_config.experiment_id}"
+        )
+    if expected_path.name != config.experiment_id:
+        raise ValueError("Persisted experiment directory does not match experiment_id")
+
+    persisted_metrics = _load_json(expected_path / "metrics.json")
+    persisted_result = _load_json(expected_path / "result.json")
+    if persisted_result != persisted_metrics:
+        raise ValueError("Persisted result.json does not match metrics.json")
+
+    predictions = load_predictions(expected_path / "predictions.csv")
+    signals = load_signals(expected_path / "signals.csv")
+    trades = load_trades(expected_path / "trades.csv")
+    snapshots = load_portfolio_snapshots(expected_path / "portfolio_snapshots.csv")
+    cash_snapshots = load_portfolio_snapshots(
+        expected_path / "benchmarks" / "cash_only_snapshots.csv"
+    )
+    buy_hold_snapshots = load_portfolio_snapshots(
+        expected_path / "benchmarks" / "buy_and_hold_snapshots.csv"
+    )
+    buy_hold_trades = load_trades(
+        expected_path / "benchmarks" / "buy_and_hold_trades.csv"
+    )
+
+    if any(record.model_id != config.model_id for record in predictions):
+        raise ValueError("Persisted predictions do not match experiment model_id")
+    if any(
+        signal.model_id != config.model_id
+        or signal.portfolio_id != config.portfolio_id
+        for signal in signals
+    ):
+        raise ValueError("Persisted signals do not match model and portfolio identities")
+    if any(trade.portfolio_id != config.portfolio_id for trade in trades):
+        raise ValueError("Persisted trades do not match the strategy portfolio")
+    if any(snapshot.portfolio_id != config.portfolio_id for snapshot in snapshots):
+        raise ValueError("Persisted snapshots do not match the strategy portfolio")
+    if any(
+        snapshot.portfolio_id != config.benchmark_portfolio_ids.cash_only
+        for snapshot in cash_snapshots
+    ):
+        raise ValueError("Persisted cash benchmark snapshots have the wrong portfolio")
+    if any(
+        snapshot.portfolio_id != config.benchmark_portfolio_ids.buy_and_hold
+        for snapshot in buy_hold_snapshots
+    ) or any(
+        trade.portfolio_id != config.benchmark_portfolio_ids.buy_and_hold
+        for trade in buy_hold_trades
+    ):
+        raise ValueError("Persisted buy-and-hold ledgers have the wrong portfolio")
+
+    strategy = BacktestOutcome(predictions, (), signals, trades, snapshots)
+    cash_only = BenchmarkOutcome(
+        config.benchmark_portfolio_ids.cash_only, (), (), cash_snapshots
+    )
+    buy_and_hold = BenchmarkOutcome(
+        config.benchmark_portfolio_ids.buy_and_hold,
+        (),
+        buy_hold_trades,
+        buy_hold_snapshots,
+    )
+    recalculated = to_jsonable(
+        build_experiment_metrics(config, strategy, cash_only, buy_and_hold)
+    )
+    if recalculated != persisted_metrics:
+        raise ValueError(
+            f"Persisted experiment {config.experiment_id} metrics do not reconcile "
+            "with its prediction, trade, and snapshot ledgers"
+        )
+    if Path(expected_run.artifact_path).resolve() != expected_path:
+        raise ValueError("Backtest returned an unexpected experiment artifact path")
+    if (
+        predictions != tuple(expected_predictions)
+        or predictions != tuple(expected_run.strategy.predictions)
+        or signals != tuple(expected_run.strategy.signals)
+        or trades != tuple(expected_run.strategy.trades)
+        or snapshots != tuple(expected_run.strategy.snapshots)
+        or cash_snapshots != tuple(expected_run.cash_only.snapshots)
+        or buy_hold_trades != tuple(expected_run.buy_and_hold.trades)
+        or buy_hold_snapshots != tuple(expected_run.buy_and_hold.snapshots)
+        or persisted_metrics != to_jsonable(expected_run.metrics)
+    ):
+        raise ValueError(
+            f"Persisted experiment {config.experiment_id} differs from the completed "
+            "in-memory ledgers"
+        )
+    return PersistedExperiment(
+        artifact_path=expected_path,
+        config=config,
+        strategy=strategy,
+        cash_only=cash_only,
+        buy_and_hold=buy_and_hold,
+        metrics=persisted_metrics,
+    )
+
+
 def _run_four_experiments(
     *,
     vertical_slice_run_id: str,
     model_ids: Mapping[str, str],
     prediction_paths: Mapping[str, Path],
+    expected_predictions_by_variant: Mapping[str, Sequence[Any]],
     prices_path: Path,
     evaluation_dates: Mapping[str, str],
     config_root: Path,
     runs_root: Path,
     backtest_fn: Callable[..., Any],
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict[str, PersistedExperiment], pd.DataFrame, pd.DataFrame]:
     config_root.mkdir(parents=True, exist_ok=False)
     created_at = utc_now_z()
     outcomes: dict[str, Any] = {}
-    model_portfolio_records: list[dict[str, Any]] = []
+    expected_configs: dict[str, ExperimentConfig] = {}
     reference_market: tuple[tuple[Any, ...], ...] | None = None
     reference_cash: tuple[tuple[Any, ...], ...] | None = None
     reference_buy_hold: tuple[tuple[Any, ...], ...] | None = None
@@ -764,7 +1195,14 @@ def _run_four_experiments(
             config_path=config_path,
             runs_root=runs_root,
         )
-        for attribute in ("config", "strategy", "cash_only", "buy_and_hold", "metrics"):
+        for attribute in (
+            "artifact_path",
+            "config",
+            "strategy",
+            "cash_only",
+            "buy_and_hold",
+            "metrics",
+        ):
             if not hasattr(completed, attribute):
                 raise TypeError(f"backtest_fn result is missing {attribute}")
         if completed.config.model_id != model_ids[variant_id]:
@@ -794,12 +1232,53 @@ def _run_four_experiments(
             )
 
         outcomes[variant_id] = completed
+        expected_configs[variant_id] = config
+
+    persisted = {
+        variant_id: _load_persisted_experiment(
+            runs_root / expected_configs[variant_id].experiment_id,
+            expected_config=expected_configs[variant_id],
+            expected_run=outcomes[variant_id],
+            expected_predictions=expected_predictions_by_variant[variant_id],
+        )
+        for variant_id in REQUIRED_VARIANT_IDS
+    }
+
+    persisted_market: tuple[tuple[Any, ...], ...] | None = None
+    persisted_cash: tuple[tuple[Any, ...], ...] | None = None
+    persisted_buy_hold: tuple[tuple[Any, ...], ...] | None = None
+    persisted_buy_hold_trades: tuple[tuple[Any, ...], ...] | None = None
+    model_portfolio_records: list[dict[str, Any]] = []
+    for variant_id in REQUIRED_VARIANT_IDS:
+        completed = persisted[variant_id]
+        strategy_market = tuple(
+            (snapshot.date, snapshot.market_price)
+            for snapshot in completed.strategy.snapshots
+        )
+        cash_signature = _economic_snapshot_signature(completed.cash_only)
+        buy_hold_signature = _economic_snapshot_signature(completed.buy_and_hold)
+        buy_hold_trade_signature = _economic_trade_signature(completed.buy_and_hold)
+        if persisted_market is None:
+            persisted_market = strategy_market
+            persisted_cash = cash_signature
+            persisted_buy_hold = buy_hold_signature
+            persisted_buy_hold_trades = buy_hold_trade_signature
+        elif (
+            strategy_market != persisted_market
+            or cash_signature != persisted_cash
+            or buy_hold_signature != persisted_buy_hold
+            or buy_hold_trade_signature != persisted_buy_hold_trades
+        ):
+            raise ValueError(
+                "Persisted experiments do not contain identical market and benchmark evidence"
+            )
+
         metrics = completed.metrics
         model_portfolio_records.append(
             _portfolio_metric_record(
                 portfolio_type="model",
                 model_id=variant_id,
-                portfolio_id=config.portfolio_id,
+                portfolio_id=completed.config.portfolio_id,
                 metrics=metrics,
                 result_versus_buy_and_hold=float(
                     metrics["comparison_with_buy_and_hold"]
@@ -807,7 +1286,7 @@ def _run_four_experiments(
             )
         )
 
-    first = outcomes[REQUIRED_VARIANT_IDS[0]]
+    first = persisted[REQUIRED_VARIANT_IDS[0]]
     metric_options = {
         "annualization_factor": first.config.metric_assumptions.annualization_factor,
         "risk_free_rate_annual": float(
@@ -839,8 +1318,8 @@ def _run_four_experiments(
         ),
     ]
     portfolio_metrics = pd.DataFrame([*model_portfolio_records, *benchmark_records])
-    daily_curves = _daily_equity_frame(outcomes)
-    return outcomes, portfolio_metrics, daily_curves
+    daily_curves = _daily_equity_frame(persisted)
+    return persisted, portfolio_metrics, daily_curves
 
 
 def _daily_equity_frame(outcomes: Mapping[str, Any]) -> pd.DataFrame:
@@ -1097,6 +1576,151 @@ def _artifact_manifest(stage_dir: Path) -> list[dict[str, str]]:
     ]
 
 
+def _normalized_price_evidence(
+    path: Path,
+    *,
+    symbol: str,
+    start: str,
+) -> pd.DataFrame:
+    """Return the trading fields used to compare source and trainer snapshots."""
+
+    frame = pd.read_csv(path)
+    missing = sorted(_REQUIRED_PRICE_COLUMNS - set(frame.columns))
+    if missing:
+        raise ValueError(f"Price evidence is missing required columns: {missing}")
+    frame["ticker"] = frame["ticker"].astype(str).str.strip().str.upper()
+    frame["date"] = pd.to_datetime(frame["date"], errors="raise")
+    frame = frame.loc[
+        frame["ticker"].eq(symbol)
+        & frame["date"].dt.date.ge(date.fromisoformat(start))
+    ].copy()
+    for column in ("open", "close", "volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="raise")
+    frame["source"] = frame["source"].astype(str).str.strip().str.lower()
+    frame["date"] = frame["date"].dt.strftime("%Y-%m-%d")
+    return frame[
+        ["date", "ticker", "open", "close", "volume", "source"]
+    ].sort_values("date", kind="mergesort").reset_index(drop=True)
+
+
+def _assert_validated_snapshot_unchanged(validated: ValidatedPrices) -> None:
+    """Fail if either member of an integrity-validated snapshot pair was modified."""
+
+    if sha256_file(validated.path) != validated.prices_sha256:
+        raise RuntimeError("Authenticated price snapshot changed after validation")
+    if validated.provenance_path is not None:
+        if validated.provenance_sha256 is None or sha256_file(
+            validated.provenance_path
+        ) != validated.provenance_sha256:
+            raise RuntimeError("Authenticated provenance snapshot changed after validation")
+
+
+def _assert_frozen_prices_match(
+    source_path: Path,
+    frozen_path: Path,
+    *,
+    symbol: str,
+    start: str,
+) -> None:
+    """Prove the trainer froze the same economic observations it received."""
+
+    source = _normalized_price_evidence(source_path, symbol=symbol, start=start)
+    frozen = _normalized_price_evidence(frozen_path, symbol=symbol, start=start)
+    try:
+        pd.testing.assert_frame_equal(
+            frozen,
+            source,
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    except AssertionError as exc:
+        raise ValueError(
+            "Training frozen prices do not match the integrity-validated input snapshot"
+        ) from exc
+
+
+def _assert_training_evidence_unchanged(
+    *,
+    input_validation: ValidatedPrices,
+    frozen_validation: ValidatedPrices,
+    prediction_paths: Mapping[str, Path],
+    prediction_sha256: Mapping[str, str],
+    symbol: str,
+    start: str,
+) -> None:
+    """Reassert every immutable input owned by the composed training run."""
+
+    _assert_validated_snapshot_unchanged(input_validation)
+    _assert_validated_snapshot_unchanged(frozen_validation)
+    _assert_frozen_prices_match(
+        input_validation.path,
+        frozen_validation.path,
+        symbol=symbol,
+        start=start,
+    )
+    for variant_id in REQUIRED_VARIANT_IDS:
+        if sha256_file(prediction_paths[variant_id]) != prediction_sha256[variant_id]:
+            raise RuntimeError(
+                f"Training prediction artifact changed after validation: {variant_id}"
+            )
+
+
+def _rewrite_owned_training_paths(
+    *,
+    training_dir: Path,
+    public_training_dir: Path,
+    acquisition: PriceAcquisition,
+    validated_prices: ValidatedPrices,
+) -> None:
+    """Finalize references inside a privately staged default training run."""
+
+    summary_path = training_dir / "reports" / "final_summary.json"
+    summary = _load_json(summary_path)
+    summary["artifact_directory"] = str(public_training_dir)
+    summary["prediction_paths"] = {
+        variant_id: str(
+            public_training_dir / "models" / registered_id / "predictions.csv"
+        )
+        for variant_id, registered_id in _require_mapping(
+            summary.get("model_ids"), "training model_ids"
+        ).items()
+    }
+    write_json(summary, summary_path)
+
+    data_manifest_path = training_dir / "data_manifest.json"
+    data_manifest = _load_json(data_manifest_path)
+    acquisition_details = dict(
+        _require_mapping(data_manifest.get("acquisition"), "training acquisition")
+    )
+    acquisition_details.update(
+        {
+            "path": f"frozen_input/{DEFAULT_SYMBOL}_prices.csv",
+            "input_snapshot_sha256": validated_prices.prices_sha256,
+            "upstream_provenance_sha256": validated_prices.provenance_sha256,
+            "vertical_slice_acquisition_mode": acquisition.mode,
+        }
+    )
+    data_manifest["acquisition"] = acquisition_details
+    write_json(data_manifest, data_manifest_path)
+
+
+def _remove_owned_training_run(path: Path, invocation_id: str) -> None:
+    """Rollback only the model tree created by this invocation."""
+
+    if not path.exists():
+        return
+    manifest_path = path / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"Cannot safely roll back model run without manifest: {path}")
+    manifest = _load_json(manifest_path)
+    if manifest.get("invocation_id") != invocation_id:
+        raise RuntimeError(
+            f"Refusing to remove model run not owned by this invocation: {path}"
+        )
+    shutil.rmtree(path)
+
+
 def run_ogdc_vertical_slice(
     *,
     output_dir: str | Path = "artifacts/vertical_slice",
@@ -1139,24 +1763,33 @@ def run_ogdc_vertical_slice(
     backtesting_callable = backtest_fn or run_experiment
     stage_dir = Path(tempfile.mkdtemp(prefix=f".{run_id}.tmp-", dir=output_root))
     work_dir = stage_dir / ".work"
-    work_dir.mkdir()
+    pending_training_root: Path | None = None
+    published_training_dir: Path | None = None
+    owned_training_invocation: str | None = None
 
     try:
-        acquisition, _ = _resolve_prices(
+        work_dir.mkdir()
+        if train_fn is None:
+            pending_training_root = Path(
+                tempfile.mkdtemp(prefix=f".{run_id}.pending-", dir=model_output_root)
+            )
+        acquisition, input_validation = _resolve_prices(
             symbol=symbol,
             start=start,
             work_dir=work_dir / "live-acquisition",
             cached_prices_path=cached_path,
+            snapshot_dir=stage_dir / "input_snapshot",
             acquire_fn=acquisition_callable,
             custom_acquirer=acquire_fn is not None,
         )
+        _assert_validated_snapshot_unchanged(input_validation)
 
         training_summary_raw = training_callable(
             symbol=symbol,
             start=start,
             provider="psx-dps",
             prices_path=acquisition.prices_path,
-            output_dir=model_output_root,
+            output_dir=pending_training_root or model_output_root,
             random_state=random_state,
             repo_root=repo,
             create_zip=False,
@@ -1168,6 +1801,25 @@ def run_ogdc_vertical_slice(
             model_ids,
             prediction_paths,
         ) = _validate_training_summary(training_summary_raw, repo=repo)
+        _assert_validated_snapshot_unchanged(input_validation)
+
+        final_training_dir = training_dir
+        if pending_training_root is not None:
+            try:
+                training_dir.relative_to(pending_training_root.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    "Default trainer published outside the private transaction root"
+                ) from exc
+            if training_dir.parent != pending_training_root.resolve():
+                raise ValueError("Default trainer returned an unexpected nested run directory")
+            final_training_dir = model_output_root / str(training_summary["run_id"])
+            if final_training_dir.exists():
+                raise FileExistsError(
+                    "Model-training run already exists; refusing to overwrite: "
+                    f"{final_training_dir}"
+                )
+            owned_training_invocation = str(training_summary["invocation_id"])
 
         (
             model_metrics,
@@ -1197,28 +1849,67 @@ def run_ogdc_vertical_slice(
         frozen_prices = training_dir / "frozen_input" / f"{symbol}_prices.csv"
         if not frozen_prices.is_file():
             raise FileNotFoundError(
-                f"Training run did not preserve its exact price input: {frozen_prices}"
+                f"Training run did not preserve its normalized price evidence: {frozen_prices}"
             )
         frozen_validation = _inspect_price_file(
             frozen_prices,
             symbol=symbol,
             start=start,
-            require_real_source=acquisition.is_real_data,
+            require_real_source=False,
+        )
+        prediction_sha256 = {
+            variant_id: sha256_file(path)
+            for variant_id, path in prediction_paths.items()
+        }
+        _assert_training_evidence_unchanged(
+            input_validation=input_validation,
+            frozen_validation=frozen_validation,
+            prediction_paths=prediction_paths,
+            prediction_sha256=prediction_sha256,
+            symbol=symbol,
+            start=start,
         )
 
         outcomes, portfolio_metrics, daily_curves = _run_four_experiments(
             vertical_slice_run_id=run_id,
             model_ids=model_ids,
             prediction_paths=prediction_paths,
+            expected_predictions_by_variant=predictions_by_variant,
             prices_path=frozen_prices,
             evaluation_dates=evaluation_dates,
             config_root=stage_dir / "experiment_configs",
-            runs_root=work_dir / "backtests",
+            runs_root=stage_dir / "experiments",
             backtest_fn=backtesting_callable,
+        )
+        _assert_training_evidence_unchanged(
+            input_validation=input_validation,
+            frozen_validation=frozen_validation,
+            prediction_paths=prediction_paths,
+            prediction_sha256=prediction_sha256,
+            symbol=symbol,
+            start=start,
         )
         if len({outcome.config.portfolio_id for outcome in outcomes.values()}) != 4:
             raise AssertionError("Each model experiment must have a unique portfolio ID")
 
+        final_prediction_paths = {
+            variant_id: final_training_dir
+            / prediction_paths[variant_id].relative_to(training_dir)
+            for variant_id in REQUIRED_VARIANT_IDS
+        }
+        if pending_training_root is not None:
+            model_metrics["predictions_path"] = model_metrics["model_id"].map(
+                {key: str(value) for key, value in final_prediction_paths.items()}
+            )
+            model_metrics["manifest_path"] = model_metrics.apply(
+                lambda row: str(
+                    final_training_dir
+                    / "models"
+                    / row["registered_model_id"]
+                    / "manifest.json"
+                ),
+                axis=1,
+            )
         combined = build_combined_leaderboard(model_metrics, portfolio_metrics)
         model_metrics.to_csv(stage_dir / "model_metrics.csv", index=False)
         portfolio_metrics.to_csv(stage_dir / "portfolio_metrics.csv", index=False)
@@ -1234,14 +1925,18 @@ def run_ogdc_vertical_slice(
             "schema_version": VERTICAL_SLICE_SCHEMA_VERSION,
             "training_run_id": training_summary["run_id"],
             "training_invocation_id": training_summary["invocation_id"],
-            "artifact_directory": str(training_dir),
-            "run_manifest_path": str(training_dir / "run_manifest.json"),
+            "artifact_directory": str(final_training_dir),
+            "run_manifest_path": str(final_training_dir / "run_manifest.json"),
             "run_manifest_sha256": sha256_file(training_dir / "run_manifest.json"),
-            "frozen_prices_path": str(frozen_prices),
+            "frozen_prices_path": str(
+                final_training_dir / frozen_prices.relative_to(training_dir)
+            ),
             "frozen_prices_sha256": sha256_file(frozen_prices),
+            "input_prices_sha256": input_validation.prices_sha256,
+            "upstream_provenance_sha256": input_validation.provenance_sha256,
             "model_ids": model_ids,
             "prediction_paths": {
-                key: str(value) for key, value in prediction_paths.items()
+                key: str(value) for key, value in final_prediction_paths.items()
             },
             "prediction_sha256": {
                 key: sha256_file(value) for key, value in prediction_paths.items()
@@ -1283,8 +1978,8 @@ def run_ogdc_vertical_slice(
                 "Live PSX acquisition failed; a separately validated cached real-data file was used."
             )
             warnings.append(
-                "Cached-file provenance is validated from its standardized source field and "
-                "content checks; a deliberately mislabeled local file cannot be independently authenticated."
+                "The cached CSV was accepted only with pipeline acquisition metadata bound "
+                "to its exact checksum, provider, symbol coverage, dates, and row count."
             )
         if not acquisition.is_real_data:
             warnings.append(
@@ -1297,6 +1992,8 @@ def run_ogdc_vertical_slice(
                 destination / "model_training_run_reference.json"
             ),
             "experiment_configs": str(destination / "experiment_configs"),
+            "experiments": str(destination / "experiments"),
+            "input_snapshot": str(destination / "input_snapshot"),
             "model_metrics": str(destination / "model_metrics.csv"),
             "portfolio_metrics": str(destination / "portfolio_metrics.csv"),
             "combined_leaderboard": str(destination / "combined_leaderboard.csv"),
@@ -1321,7 +2018,9 @@ def run_ogdc_vertical_slice(
                     "source": frozen_validation.source,
                     "mode": acquisition.mode,
                     "is_real_data": acquisition.is_real_data,
+                    "input_prices_sha256": input_validation.prices_sha256,
                     "frozen_prices_sha256": sha256_file(frozen_prices),
+                    "provenance_sha256": input_validation.provenance_sha256,
                     "actual_ogdc_date_range": {
                         "start": frozen_validation.date_start,
                         "end": frozen_validation.date_end,
@@ -1364,6 +2063,7 @@ def run_ogdc_vertical_slice(
         )
         write_json(final_summary, stage_dir / "final_summary.json")
 
+        _assert_validated_snapshot_unchanged(input_validation)
         if work_dir.exists():
             shutil.rmtree(work_dir)
         manifest = {
@@ -1410,15 +2110,51 @@ def run_ogdc_vertical_slice(
         }
         write_json(manifest, stage_dir / "manifest.json")
 
+        _assert_training_evidence_unchanged(
+            input_validation=input_validation,
+            frozen_validation=frozen_validation,
+            prediction_paths=prediction_paths,
+            prediction_sha256=prediction_sha256,
+            symbol=symbol,
+            start=start,
+        )
+
         if destination.exists():
             raise FileExistsError(
                 f"Vertical-slice run already exists; refusing to overwrite: {destination}"
             )
+        if pending_training_root is not None:
+            _rewrite_owned_training_paths(
+                training_dir=training_dir,
+                public_training_dir=final_training_dir,
+                acquisition=acquisition,
+                validated_prices=input_validation,
+            )
+            if final_training_dir.exists():
+                raise FileExistsError(
+                    "Model-training run already exists; refusing to overwrite: "
+                    f"{final_training_dir}"
+                )
+            os.rename(training_dir, final_training_dir)
+            published_training_dir = final_training_dir
+            if pending_training_root.exists():
+                shutil.rmtree(pending_training_root)
         os.rename(stage_dir, destination)
         return final_summary
     except Exception:
-        if stage_dir.exists():
-            shutil.rmtree(stage_dir)
+        try:
+            if (
+                published_training_dir is not None
+                and owned_training_invocation is not None
+            ):
+                _remove_owned_training_run(
+                    published_training_dir, owned_training_invocation
+                )
+        finally:
+            if pending_training_root is not None and pending_training_root.exists():
+                shutil.rmtree(pending_training_root)
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
         raise
 
 

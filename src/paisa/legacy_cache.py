@@ -8,6 +8,7 @@ and publishes a checksum-bound schema-1.0 bundle under a distinct producer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import pandas as pd
 
 from paisa.experiments.artifacts import sha256_file, utc_now_z, write_json
 from paisa.preprocessing import (
+    COLUMN_ALIASES,
     REQUIRED_OUTPUT_COLUMNS,
     combine_price_frames,
     standardize_price_frame,
@@ -121,6 +123,128 @@ def _stable_sha256(path: Path, *, label: str) -> str:
     if identity_before != identity_after:
         raise _error(f"{label} changed while it was being hashed: {path}")
     return digest
+
+
+def _snapshot_and_hash(source: Path, destination: Path, *, label: str) -> str:
+    """Hash and copy exactly the bytes read through one stable descriptor."""
+
+    if not source.is_file():
+        raise _error(f"missing {label}: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with source.open("rb") as input_file, destination.open("xb") as output_file:
+            before = os.fstat(input_file.fileno())
+            copied = 0
+            while chunk := input_file.read(1024 * 1024):
+                digest.update(chunk)
+                output_file.write(chunk)
+                copied += len(chunk)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+            after = os.fstat(input_file.fileno())
+    except FileExistsError:
+        raise _error(f"private snapshot destination already exists: {destination}") from None
+
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after or copied != before.st_size:
+        raise _error(f"{label} changed while its private snapshot was created: {source}")
+    return digest.hexdigest()
+
+
+def _raw_column(frame: pd.DataFrame, field: str, *, label: str) -> Any | None:
+    aliases = COLUMN_ALIASES[field]
+    matches = [
+        column
+        for column in frame.columns
+        if str(column).strip().lower().replace(" ", "_").replace("-", "_")
+        in aliases
+    ]
+    if len(matches) > 1:
+        raise _error(f"{label} has ambiguous columns for {field!r}: {matches}")
+    return matches[0] if matches else None
+
+
+def _raw_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("--", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
+
+
+def _validate_raw_capture(frame: pd.DataFrame, *, symbol: str) -> None:
+    """Reject provider evidence that normal cleaning would repair or discard."""
+
+    label = f"legacy raw capture for {symbol}"
+    if frame.empty:
+        raise _error(f"{label} cannot be empty")
+    columns = {
+        field: _raw_column(frame, field, label=label)
+        for field in ("date", "open", "high", "low", "close", "volume")
+    }
+    missing = [
+        field
+        for field in ("date", "open", "close", "volume")
+        if columns[field] is None
+    ]
+    if missing:
+        raise _error(f"{label} is missing required columns: {missing}")
+
+    dates = pd.to_datetime(frame[columns["date"]], errors="coerce", utc=False)
+    if dates.isna().any():
+        raise _error(f"{label} contains invalid dates")
+    normalized_dates = dates.dt.date
+    if normalized_dates.duplicated().any():
+        raise _error(f"{label} contains duplicate trading dates")
+
+    numeric: dict[str, pd.Series] = {}
+    for field in ("open", "close", "volume"):
+        values = _raw_numeric(frame[columns[field]])
+        if values.isna().any() or not all(
+            math.isfinite(float(value)) for value in values
+        ):
+            raise _error(f"{label} column {field!r} must be finite and numeric")
+        numeric[field] = values
+    if (numeric["open"] <= 0).any() or (numeric["close"] <= 0).any():
+        raise _error(f"{label} open and close prices must be strictly positive")
+    if (numeric["volume"] < 0).any():
+        raise _error(f"{label} volume must be non-negative")
+    if (numeric["volume"] % 1 != 0).any():
+        raise _error(f"{label} volume must be a whole integer and cannot be rounded")
+
+    for field in ("high", "low"):
+        column = columns[field]
+        if column is None:
+            continue
+        original = frame[column]
+        present = original.notna() & original.astype("string").str.strip().ne("")
+        values = _raw_numeric(original)
+        if values.loc[present].isna().any() or not all(
+            math.isfinite(float(value)) for value in values.loc[present]
+        ):
+            raise _error(
+                f"{label} column {field!r} must be finite and numeric when provided"
+            )
+        if (values.loc[present] <= 0).any():
+            raise _error(
+                f"{label} column {field!r} must be strictly positive when provided"
+            )
 
 
 def _validate_price_frame(
@@ -355,6 +479,8 @@ def _normalized_comparison(frame: pd.DataFrame) -> pd.DataFrame:
 def _rebuild_from_raw(
     *,
     raw_files: Mapping[str, Path],
+    original_raw_files: Mapping[str, Path],
+    raw_hashes: Mapping[str, str],
     raw_row_counts: Mapping[str, int],
     provider: str,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
@@ -362,26 +488,33 @@ def _rebuild_from_raw(
     artifacts: dict[str, dict[str, Any]] = {}
     for symbol in sorted(raw_files):
         raw_path = raw_files[symbol]
-        raw_hash = _stable_sha256(raw_path, label=f"legacy raw capture for {symbol}")
         raw = pd.read_csv(raw_path)
         if len(raw) != raw_row_counts[symbol]:
             raise _error(
                 f"raw capture row count for {symbol} does not match legacy metadata"
             )
+        _validate_raw_capture(raw, symbol=symbol)
         cleaned = standardize_price_frame(raw, ticker=symbol, source=provider)
-        if cleaned.empty:
-            raise _error(f"raw capture for {symbol} produced no valid cleaned rows")
+        if len(cleaned) != len(raw):
+            raise _error(
+                f"raw capture for {symbol} does not have one-to-one raw-to-cleaned "
+                "row accounting"
+            )
         frames.append(cleaned)
+        original_path = original_raw_files[symbol]
         artifacts[symbol] = {
-            "path": str(raw_path),
-            "filename": raw_path.name,
-            "sha256": raw_hash,
+            "path": str(original_path),
+            "filename": original_path.name,
+            "sha256": raw_hashes[symbol],
             "row_count": int(len(raw)),
             "cleaned_row_count": int(len(cleaned)),
             "date_start": pd.to_datetime(cleaned["date"]).min().strftime("%Y-%m-%d"),
             "date_end": pd.to_datetime(cleaned["date"]).max().strftime("%Y-%m-%d"),
         }
-    return combine_price_frames(frames), artifacts
+    combined = combine_price_frames(frames)
+    if len(combined) != sum(record["row_count"] for record in artifacts.values()):
+        raise _error("combined raw reconstruction is not one-to-one with raw evidence")
+    return combined, artifacts
 
 
 def _prices_artifact(
@@ -434,40 +567,71 @@ def migrate_legacy_psx_cache(
             f"Legacy cache destination already exists; refusing to overwrite: {destination}"
         )
 
-    original_prices_hash = _stable_sha256(prices_source, label="legacy price CSV")
-    original_metadata_hash = _stable_sha256(
-        metadata_source, label="legacy pipeline metadata"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent)
     )
-    legacy_prices = pd.read_csv(prices_source)
-    validated_prices, original_coverage = _validate_price_frame(
-        legacy_prices,
-        expected_provider=provider,
-        label="legacy price CSV",
-    )
-    dates = validated_prices["date"]
-    global_start = dates.min().strftime("%Y-%m-%d")
-    global_end = dates.max().strftime("%Y-%m-%d")
-    legacy_metadata = _load_json(metadata_source, label="legacy pipeline metadata")
-    evidence = _validate_legacy_metadata(
-        legacy_metadata,
-        coverage=original_coverage,
-        row_count=len(validated_prices),
-        date_start=global_start,
-        date_end=global_end,
-        expected_provider=provider,
-        required_symbol=symbol,
-    )
+    snapshots = stage / ".source-snapshots"
+    try:
+        original_prices_hash = _snapshot_and_hash(
+            prices_source,
+            snapshots / "legacy_prices.csv",
+            label="legacy price CSV",
+        )
+        original_metadata_hash = _snapshot_and_hash(
+            metadata_source,
+            snapshots / "legacy_pipeline_metadata.json",
+            label="legacy pipeline metadata",
+        )
+        legacy_prices = pd.read_csv(snapshots / "legacy_prices.csv")
+        validated_prices, original_coverage = _validate_price_frame(
+            legacy_prices,
+            expected_provider=provider,
+            label="legacy price CSV",
+        )
+        dates = validated_prices["date"]
+        global_start = dates.min().strftime("%Y-%m-%d")
+        global_end = dates.max().strftime("%Y-%m-%d")
+        legacy_metadata = _load_json(
+            snapshots / "legacy_pipeline_metadata.json",
+            label="legacy pipeline metadata",
+        )
+        evidence = _validate_legacy_metadata(
+            legacy_metadata,
+            coverage=original_coverage,
+            row_count=len(validated_prices),
+            date_start=global_start,
+            date_end=global_end,
+            expected_provider=provider,
+            required_symbol=symbol,
+        )
 
-    raw_root, raw_files = _discover_raw_files(
-        legacy_prices_path=prices_source,
-        symbols=evidence["symbols_requested"],
-        provider=provider,
-        legacy_raw_dir=raw_dir,
-    )
-    raw_artifacts: dict[str, dict[str, Any]] = {}
-    if raw_files:
+        raw_root, original_raw_files = _discover_raw_files(
+            legacy_prices_path=prices_source,
+            symbols=evidence["symbols_requested"],
+            provider=provider,
+            legacy_raw_dir=raw_dir,
+        )
+        if not original_raw_files:
+            raise _error(
+                "complete legacy raw captures are required; processed-only evidence "
+                "cannot be certified as verified real PSX data"
+            )
+        raw_files: dict[str, Path] = {}
+        raw_hashes: dict[str, str] = {}
+        for raw_symbol, original_raw_path in original_raw_files.items():
+            snapshot_path = snapshots / "raw" / original_raw_path.name
+            raw_hashes[raw_symbol] = _snapshot_and_hash(
+                original_raw_path,
+                snapshot_path,
+                label=f"legacy raw capture for {raw_symbol}",
+            )
+            raw_files[raw_symbol] = snapshot_path
+
         migrated_prices, raw_artifacts = _rebuild_from_raw(
             raw_files=raw_files,
+            original_raw_files=original_raw_files,
+            raw_hashes=raw_hashes,
             raw_row_counts=evidence["raw_row_counts"],
             provider=provider,
         )
@@ -491,22 +655,14 @@ def migrate_legacy_psx_cache(
         strategy = "rebuild_from_legacy_raw_captures"
         provenance_strength = "raw_capture_rebuild_matches_legacy_processed_cache"
         coverage = rebuilt_coverage
-    else:
-        migrated_prices = legacy_prices.loc[:, REQUIRED_OUTPUT_COLUMNS].copy()
-        strategy = "validated_legacy_processed_cache_copy"
-        provenance_strength = "processed_cache_and_legacy_metadata_only"
-        coverage = original_coverage
+    except Exception:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent)
-    )
     try:
         migrated_prices_path = stage / PRICES_FILENAME
-        if raw_files:
-            migrated_prices.to_csv(migrated_prices_path, index=False)
-        else:
-            shutil.copyfile(prices_source, migrated_prices_path)
+        migrated_prices.to_csv(migrated_prices_path, index=False)
         migrated_frame = pd.read_csv(migrated_prices_path)
         _, migrated_coverage = _validate_price_frame(
             migrated_frame,
@@ -517,7 +673,9 @@ def migrate_legacy_psx_cache(
             raise _error("migrated price coverage changed while the bundle was written")
 
         preserved_metadata_path = stage / LEGACY_METADATA_FILENAME
-        shutil.copyfile(metadata_source, preserved_metadata_path)
+        shutil.copyfile(
+            snapshots / "legacy_pipeline_metadata.json", preserved_metadata_path
+        )
         if sha256_file(preserved_metadata_path) != original_metadata_hash:
             raise _error("preserved legacy metadata is not byte-for-byte identical")
 
@@ -549,7 +707,8 @@ def migrate_legacy_psx_cache(
             "single_expected_real_provider_verified": True,
             "legacy_metadata_counts_and_dates_verified": True,
             "per_symbol_coverage": migrated_coverage,
-            "raw_rebuild_matches_legacy_processed_cache": bool(raw_files),
+            "raw_rebuild_matches_legacy_processed_cache": True,
+            "raw_one_to_one_row_accounting_verified": True,
         }
         generated_metadata: dict[str, Any] = {
             "schema_version": LEGACY_CACHE_SCHEMA_VERSION,
@@ -629,6 +788,7 @@ def migrate_legacy_psx_cache(
         manifest_path = stage / MIGRATION_MANIFEST_FILENAME
         write_json(manifest, manifest_path)
 
+        shutil.rmtree(snapshots)
         validate_verified_legacy_bundle(
             migrated_prices_path,
             metadata_path=generated_metadata_path,
@@ -722,17 +882,14 @@ def validate_verified_legacy_bundle(
     if manifest.get("original_provider") != "psx_dps":
         raise _error("migration manifest must identify original provider psx_dps")
     migration_strategy = manifest.get("migration_strategy")
-    expected_strength = {
-        "rebuild_from_legacy_raw_captures": (
-            "raw_capture_rebuild_matches_legacy_processed_cache"
-        ),
-        "validated_legacy_processed_cache_copy": (
-            "processed_cache_and_legacy_metadata_only"
-        ),
-    }
-    if migration_strategy not in expected_strength:
-        raise _error("migration manifest strategy is unsupported")
-    if manifest.get("provenance_strength") != expected_strength[migration_strategy]:
+    if migration_strategy != "rebuild_from_legacy_raw_captures":
+        raise _error(
+            "verified legacy bundles require raw-capture reconstruction; "
+            "processed-only migration is not certifiable"
+        )
+    if manifest.get("provenance_strength") != (
+        "raw_capture_rebuild_matches_legacy_processed_cache"
+    ):
         raise _error("migration manifest provenance strength is inconsistent")
     limitations = manifest.get("limitations")
     if not isinstance(limitations, list) or not limitations or not all(
@@ -858,11 +1015,6 @@ def validate_verified_legacy_bundle(
     original_prices_location = Path(str(original_prices.get("path", "")))
     if not original_prices_location.is_absolute():
         raise _error("original price path must be absolute evidence")
-    if (
-        migration_strategy == "validated_legacy_processed_cache_copy"
-        and original_prices_hash != manifest_prices_hash
-    ):
-        raise _error("processed-cache copy does not preserve the original price bytes")
     original_price_rows = _json_integer(
         original_prices.get("row_count"),
         "migration manifest original price row_count",
@@ -903,50 +1055,51 @@ def validate_verified_legacy_bundle(
     raw_captures = _mapping(
         original_artifacts.get("raw_captures"), "migration manifest raw captures"
     )
-    if migration_strategy == "rebuild_from_legacy_raw_captures":
-        raw_directory = Path(str(original_artifacts.get("raw_directory", "")))
-        if not raw_directory.is_absolute():
-            raise _error("raw-capture migration must record an absolute raw directory")
-        if set(raw_captures) != set(coverage):
-            raise _error("raw-capture evidence does not cover every migrated symbol")
-        for raw_symbol, raw_value in raw_captures.items():
-            raw_record = _mapping(raw_value, f"raw-capture evidence for {raw_symbol}")
-            if raw_record.get("filename") != f"{raw_symbol}_{provider}_raw.csv":
-                raise _error(f"raw-capture filename is invalid for {raw_symbol}")
-            raw_location = Path(str(raw_record.get("path", "")))
-            if (
-                not raw_location.is_absolute()
-                or raw_location.name != raw_record.get("filename")
-                or not raw_location.is_relative_to(raw_directory)
-            ):
-                raise _error(f"raw-capture path is invalid for {raw_symbol}")
-            raw_hash = str(raw_record.get("sha256", "")).strip().lower()
-            if len(raw_hash) != 64 or any(
-                character not in "0123456789abcdef" for character in raw_hash
-            ):
-                raise _error(f"raw-capture SHA-256 is invalid for {raw_symbol}")
-            raw_rows = _json_integer(
-                raw_record.get("row_count"),
-                f"raw-capture row count for {raw_symbol}",
+    raw_directory = Path(str(original_artifacts.get("raw_directory", "")))
+    if not raw_directory.is_absolute():
+        raise _error("raw-capture migration must record an absolute raw directory")
+    if set(raw_captures) != set(coverage):
+        raise _error("raw-capture evidence does not cover every migrated symbol")
+    for raw_symbol, raw_value in raw_captures.items():
+        raw_record = _mapping(raw_value, f"raw-capture evidence for {raw_symbol}")
+        if raw_record.get("filename") != f"{raw_symbol}_{provider}_raw.csv":
+            raise _error(f"raw-capture filename is invalid for {raw_symbol}")
+        raw_location = Path(str(raw_record.get("path", "")))
+        if (
+            not raw_location.is_absolute()
+            or raw_location.name != raw_record.get("filename")
+            or not raw_location.is_relative_to(raw_directory)
+        ):
+            raise _error(f"raw-capture path is invalid for {raw_symbol}")
+        raw_hash = str(raw_record.get("sha256", "")).strip().lower()
+        if len(raw_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in raw_hash
+        ):
+            raise _error(f"raw-capture SHA-256 is invalid for {raw_symbol}")
+        raw_rows = _json_integer(
+            raw_record.get("row_count"),
+            f"raw-capture row count for {raw_symbol}",
+        )
+        cleaned_rows = _json_integer(
+            raw_record.get("cleaned_row_count"),
+            f"raw-capture cleaned row count for {raw_symbol}",
+        )
+        if raw_rows != evidence["raw_row_counts"][raw_symbol]:
+            raise _error(f"raw-capture row count is invalid for {raw_symbol}")
+        if raw_rows != cleaned_rows:
+            raise _error(
+                f"raw-capture rows are not one-to-one with cleaned rows for {raw_symbol}"
             )
-            cleaned_rows = _json_integer(
-                raw_record.get("cleaned_row_count"),
-                f"raw-capture cleaned row count for {raw_symbol}",
-            )
-            if raw_rows != evidence["raw_row_counts"][raw_symbol]:
-                raise _error(f"raw-capture row count is invalid for {raw_symbol}")
-            if cleaned_rows != coverage[raw_symbol]["row_count"]:
-                raise _error(f"raw-capture cleaned coverage is invalid for {raw_symbol}")
-            if {
-                "date_start": raw_record.get("date_start"),
-                "date_end": raw_record.get("date_end"),
-            } != {
-                "date_start": coverage[raw_symbol]["date_start"],
-                "date_end": coverage[raw_symbol]["date_end"],
-            }:
-                raise _error(f"raw-capture date coverage is invalid for {raw_symbol}")
-    elif raw_captures:
-        raise _error("processed-only migration cannot claim raw-capture evidence")
+        if cleaned_rows != coverage[raw_symbol]["row_count"]:
+            raise _error(f"raw-capture cleaned coverage is invalid for {raw_symbol}")
+        if {
+            "date_start": raw_record.get("date_start"),
+            "date_end": raw_record.get("date_end"),
+        } != {
+            "date_start": coverage[raw_symbol]["date_start"],
+            "date_end": coverage[raw_symbol]["date_end"],
+        }:
+            raise _error(f"raw-capture date coverage is invalid for {raw_symbol}")
 
     expected_validation = {
         "required_columns_verified": True,
@@ -956,9 +1109,8 @@ def validate_verified_legacy_bundle(
         "single_expected_real_provider_verified": True,
         "legacy_metadata_counts_and_dates_verified": True,
         "per_symbol_coverage": coverage,
-        "raw_rebuild_matches_legacy_processed_cache": (
-            migration_strategy == "rebuild_from_legacy_raw_captures"
-        ),
+        "raw_rebuild_matches_legacy_processed_cache": True,
+        "raw_one_to_one_row_accounting_verified": True,
     }
     if manifest.get("validation") != expected_validation:
         raise _error("migration manifest validation evidence is inconsistent")

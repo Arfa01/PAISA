@@ -114,9 +114,18 @@ The run records, at minimum:
 - Feature importance where the estimator supports it.
 - Fitted model binary, checksum, manifest, tabular leaderboards, and a ZIP of
   the complete run.
+- Run-level Git/source provenance that must agree with every model manifest.
+- A deterministic, exact-set SHA-256 inventory of every run payload: frozen
+  inputs, split/data manifests, reports, model manifests, binaries,
+  configurations, metrics, feature metadata, and prediction CSVs.
 
 Writers reject an existing run or model destination rather than overwriting it.
-Generated inputs, binaries, results, and ZIP files are ignored by Git.
+The run is sealed and validated before publication. `run_manifest.json` is the
+integrity root and therefore excludes only itself from its embedded inventory;
+consumers checksum that root separately, retain the exact listed
+path-to-checksum baseline, and reject any later root, file-set, or byte change.
+The validation path does not deserialize model binaries. Generated inputs,
+binaries, results, and ZIP files are ignored by Git.
 
 ## Prediction handoff to backtesting
 

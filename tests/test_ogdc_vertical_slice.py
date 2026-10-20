@@ -12,6 +12,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from paisa.experiments.artifacts import (
+    seal_training_run_artifacts,
+    validate_training_run_artifacts,
+)
 from paisa.experiments.evaluation import PREDICTION_COLUMNS
 from paisa.experiments.runner import run_experiment
 from paisa.legacy_cache import migrate_legacy_psx_cache
@@ -234,10 +238,17 @@ def _migrated_legacy_price_bundle(root: Path) -> Path:
     """Create an old-format PSX cache and migrate it through the public API."""
 
     processed = root / "legacy" / "data" / "processed"
+    raw_dir = root / "legacy" / "data" / "raw"
+    raw_psx_dir = raw_dir / "psx"
     processed.mkdir(parents=True)
+    raw_psx_dir.mkdir(parents=True)
     prices = _price_fixture(source="psx_dps")
     prices_path = processed / "psx_prices.csv"
     prices.to_csv(prices_path, index=False)
+    prices.drop(columns=["ticker", "source"]).to_csv(
+        raw_psx_dir / "OGDC_psx_dps_raw.csv",
+        index=False,
+    )
     dates = pd.to_datetime(prices["date"], errors="raise")
     metadata = {
         "generated_at": "2026-09-15T23:46:30",
@@ -268,6 +279,7 @@ def _migrated_legacy_price_bundle(root: Path) -> Path:
         prices_path,
         metadata_path,
         bundle,
+        legacy_raw_dir=raw_dir,
         expected_provider="psx_dps",
         required_symbol="OGDC",
     )
@@ -1045,6 +1057,10 @@ def test_stale_prediction_metrics_prevent_backtesting(
     tampered = pd.read_csv(tampered_path)
     tampered.loc[0, "actual_class"] = 1 - int(tampered.loc[0, "actual_class"])
     tampered.to_csv(tampered_path, index=False)
+    # This test intentionally exercises semantic reconciliation after a
+    # coordinated, trusted reseal. Untrusted byte changes are covered by the
+    # dedicated inventory-tampering regression below.
+    seal_training_run_artifacts(copied_training)
     run_manifest = json.loads(
         (copied_training / "run_manifest.json").read_text(encoding="utf-8")
     )
@@ -1071,6 +1087,172 @@ def test_stale_prediction_metrics_prevent_backtesting(
             train_fn=stale_training,
             backtest_fn=backtest_must_not_run,
         )
+
+
+def test_training_manifest_tamper_is_rejected_before_backtesting(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+    copied_training = tmp_path / "copied-training"
+    shutil.copytree(Path(reference["artifact_directory"]), copied_training)
+    run_manifest = json.loads(
+        (copied_training / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    model_ids = dict(reference["model_ids"])
+    prediction_paths = {
+        variant_id: str(
+            copied_training / "models" / registered_id / "predictions.csv"
+        )
+        for variant_id, registered_id in model_ids.items()
+    }
+    manifest_path = (
+        copied_training / "models" / model_ids["M-001"] / "manifest.json"
+    )
+    model_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    model_manifest["review_tamper"] = "validation evidence changed"
+    manifest_path.write_text(json.dumps(model_manifest), encoding="utf-8")
+
+    def tampered_training(**_: Any) -> dict[str, Any]:
+        return {
+            "run_id": run_manifest["run_id"],
+            "invocation_id": run_manifest["invocation_id"],
+            "artifact_directory": str(copied_training),
+            "model_ids": model_ids,
+            "prediction_paths": prediction_paths,
+        }
+
+    def backtest_must_not_run(**_: Any):
+        raise AssertionError("tampered training evidence must fail before backtesting")
+
+    with pytest.raises(ValueError, match="inventory|checksum|artifact"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="tampered-model-manifest",
+            acquire_fn=_fixture_acquisition,
+            train_fn=tampered_training,
+            backtest_fn=backtest_must_not_run,
+        )
+
+
+def test_external_prediction_paths_are_rejected_before_backtesting(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+    external_root = tmp_path / "external-predictions"
+    external_root.mkdir()
+    external_paths: dict[str, str] = {}
+    for variant_id, source in reference["prediction_paths"].items():
+        destination = external_root / f"{variant_id}.csv"
+        shutil.copyfile(source, destination)
+        external_paths[variant_id] = str(destination)
+
+    def external_training(**_: Any) -> dict[str, Any]:
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": reference["model_ids"],
+            "prediction_paths": external_paths,
+        }
+
+    def backtest_must_not_run(**_: Any):
+        raise AssertionError("external predictions must fail before backtesting")
+
+    with pytest.raises(ValueError, match="prediction paths|checksum-inventoried"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="external-predictions",
+            acquire_fn=_fixture_acquisition,
+            train_fn=external_training,
+            backtest_fn=backtest_must_not_run,
+        )
+
+
+def test_unsafe_summary_model_id_is_rejected_before_artifact_reads(
+    completed_vertical_slice: CompletedVerticalSlice,
+    tmp_path: Path,
+):
+    reference = json.loads(
+        (
+            completed_vertical_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+    unsafe_model_ids = dict(reference["model_ids"])
+    unsafe_model_ids["M-001"] = "../outside-run"
+
+    def unsafe_training(**_: Any) -> dict[str, Any]:
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": unsafe_model_ids,
+            "prediction_paths": reference["prediction_paths"],
+        }
+
+    def backtest_must_not_run(**_: Any):
+        raise AssertionError("unsafe model IDs must fail before backtesting")
+
+    with pytest.raises(ValueError, match="model ID|filesystem-safe"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="unsafe-summary-model-id",
+            acquire_fn=_fixture_acquisition,
+            train_fn=unsafe_training,
+            backtest_fn=backtest_must_not_run,
+        )
+
+
+def test_backtester_cannot_mutate_an_inventoried_model_manifest(tmp_path: Path):
+    calls = 0
+
+    def mutating_backtester(**kwargs: Any):
+        nonlocal calls
+        completed = run_experiment(**kwargs)
+        calls += 1
+        if calls == 1:
+            prediction_path = Path(kwargs["predictions_path"])
+            training_root = prediction_path.parents[2]
+            manifest_path = prediction_path.parent / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["review_tamper"] = str(training_root)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return completed
+
+    output_dir = tmp_path / "vertical"
+    model_output_dir = tmp_path / "models"
+    with pytest.raises(RuntimeError, match="training|manifest|artifact|inventory"):
+        run_ogdc_vertical_slice(
+            output_dir=output_dir,
+            model_output_dir=model_output_dir,
+            cached_prices_path=tmp_path / "missing.csv",
+            vertical_slice_run_id="mutated-model-manifest",
+            acquire_fn=_fixture_acquisition,
+            backtest_fn=mutating_backtester,
+        )
+
+    assert calls == 4
+    assert not (output_dir / "mutated-model-manifest").exists()
+    assert model_output_dir.is_dir()
+    assert not any(model_output_dir.iterdir())
 
 
 def test_complete_fixture_based_end_to_end_smoke_run(
@@ -1115,6 +1297,31 @@ def test_complete_fixture_based_end_to_end_smoke_run(
     assert sum(final_summary["common_split_counts"].values()) > 0
     for split_name, split_count in final_summary["common_split_counts"].items():
         assert sum(final_summary["class_distributions"][split_name].values()) == split_count
+
+    training_reference = json.loads(
+        (artifact / "model_training_run_reference.json").read_text(encoding="utf-8")
+    )
+    training_evidence = validate_training_run_artifacts(
+        training_reference["artifact_directory"],
+        expected_run_id=training_reference["training_run_id"],
+        expected_invocation_id=training_reference["training_invocation_id"],
+    )
+    assert training_reference["run_manifest_sha256"] == _sha256(
+        Path(training_reference["run_manifest_path"])
+    )
+    assert (
+        training_reference["run_manifest_sha256"]
+        == training_evidence.run_manifest_sha256
+    )
+    assert training_reference["training_source_provenance"] == {
+        "code_version": training_evidence.code_version,
+        "dirty_tree": training_evidence.dirty_tree,
+        "source_fingerprint": training_evidence.source_fingerprint,
+    }
+    assert training_reference["training_artifact_inventory"]["files"] == [
+        {"path": path, "sha256": checksum}
+        for path, checksum in training_evidence.artifact_sha256
+    ]
 
     model_metrics = pd.read_csv(artifact / "model_metrics.csv")
     portfolio_metrics = pd.read_csv(artifact / "portfolio_metrics.csv")
@@ -1318,6 +1525,10 @@ def test_verified_legacy_cache_completes_after_live_404_with_truthful_labels(
     assert data["legacy_metadata_preserved"] is True
     assert data["producer_component"] == (
         "paisa.legacy_cache.migrate_legacy_psx_cache"
+    )
+    assert data["migration_strategy"] == "rebuild_from_legacy_raw_captures"
+    assert data["provenance_strength"] == (
+        "raw_capture_rebuild_matches_legacy_processed_cache"
     )
     assert run.live_error_text in data["live_acquisition_error"]
     assert "HTTP 404 Not Found" in data["live_acquisition_error"]

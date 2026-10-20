@@ -221,19 +221,22 @@ standard verified-cache destination:
 ```bash
 python scripts/migrate_legacy_psx_cache.py \
   --legacy-prices \
-  "/Users/arfa/University/PAISA/paisa-v0/data/processed/psx_prices.csv" \
+  "<legacy-repository>/data/processed/psx_prices.csv" \
   --legacy-metadata \
-  "/Users/arfa/University/PAISA/paisa-v0/data/processed/pipeline_metadata.json" \
+  "<legacy-repository>/data/processed/pipeline_metadata.json" \
+  --legacy-raw-dir \
+  "<legacy-repository>/data/raw" \
   --output-dir \
   "data/external/verified_legacy_psx_cache"
 ```
 
 By default, the command looks recursively below the inferred legacy
 `data/raw/` directory for exact `<SYMBOL>_psx_dps_raw.csv` filenames. If one
-exists for every requested symbol, it rebuilds prices with the current cleaner
-and requires the result to match the legacy processed data. It uses the
-processed-file migration only when those exact raw captures are wholly absent;
-partial raw evidence is rejected instead of guessed around.
+exists for every requested symbol, it snapshots each source file, strictly
+validates every raw row, rebuilds prices with the current cleaner, and requires
+one-to-one row accounting plus an exact match with the legacy processed data.
+Missing, partial, invalid, duplicate, or processed-only raw evidence is
+rejected; it can never produce a verified-real bundle.
 
 The immutable destination contains exactly the migrated `psx_prices.csv`, new
 schema-1.0 `pipeline_metadata.json`, byte-preserved
@@ -271,9 +274,15 @@ verified-legacy run, the snapshot also retains `legacy_pipeline_metadata.json`
 and `migration_manifest.json`. A model-training run is published only after
 all four backtests and persisted-evidence checks pass. The runner rechecks the
 trainer's frozen price file and all four prediction-file checksums after
-backtesting and immediately before publication, so a callback cannot change
-the model evidence mid-run; a handled late failure rolls back artifacts owned
-by that invocation. Successful outputs are immutable under
+backtesting and immediately before publication. The complete training run also
+has a sorted, exact-file SHA-256 inventory covering its frozen inputs, split
+and data manifests, reports, model manifests, configurations, metrics,
+predictions, and binaries; its source version fields and inventory are checked
+before and after backtesting. Model IDs and prediction paths are derived from
+the validated run manifest, so a caller summary cannot redirect backtesting to
+external files. A callback therefore cannot change model evidence mid-run; a
+handled late failure rolls back artifacts owned by that invocation.
+Successful outputs are immutable under
 `artifacts/vertical_slice/<vertical_slice_run_id>/`, and an existing run ID is
 never overwritten. Each completed bundle retains the four full backtesting
 trees under `experiments/<experiment_id>/`; aggregate metrics and curves are

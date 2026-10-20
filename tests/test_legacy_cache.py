@@ -10,6 +10,7 @@ from typing import Any, Callable
 import pandas as pd
 import pytest
 
+import paisa.legacy_cache as legacy_cache_module
 from paisa.legacy_cache import (
     migrate_legacy_psx_cache,
     validate_verified_legacy_bundle,
@@ -180,6 +181,52 @@ def _migrate(fixture: LegacyFixture, output_dir: Path) -> dict[str, Any]:
     )
 
 
+def _raw_path(fixture: LegacyFixture, symbol: str = "OGDC") -> Path:
+    return fixture.raw_dir / "psx" / f"{symbol}_{EXPECTED_PROVIDER}_raw.csv"
+
+
+def _set_raw_count(fixture: LegacyFixture, symbol: str, count: int) -> None:
+    metadata = json.loads(fixture.metadata_path.read_text(encoding="utf-8"))
+    metadata["raw_row_counts"][symbol] = count
+    fixture.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def _rewrite_as_processed_only_bundle(bundle: Path) -> None:
+    """Turn a strong fixture bundle into the weak schema accepted before this fix."""
+
+    metadata_path = bundle / "pipeline_metadata.json"
+    manifest_path = bundle / "migration_manifest.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    original_artifacts = manifest["original_artifacts"]
+    original_artifacts["prices"]["sha256"] = manifest["migrated_artifacts"][
+        "prices"
+    ]["sha256"]
+    original_artifacts["raw_directory"] = None
+    original_artifacts["raw_captures"] = {}
+    validation = manifest["validation"]
+    validation["raw_rebuild_matches_legacy_processed_cache"] = False
+    validation.pop("raw_one_to_one_row_accounting_verified", None)
+
+    strategy = "validated_legacy_processed_cache_copy"
+    strength = "processed_cache_and_legacy_metadata_only"
+    manifest["migration_strategy"] = strategy
+    manifest["provenance_strength"] = strength
+    metadata["migration"]["strategy"] = strategy
+    metadata["migration"]["provenance_strength"] = strength
+    metadata["legacy_evidence"] = {
+        "original_artifacts": original_artifacts,
+        "validation": validation,
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    manifest["migrated_artifacts"]["pipeline_metadata"]["sha256"] = _sha256(
+        metadata_path
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
 def test_migration_rebuilds_and_authenticates_bundle_from_real_provider_raw_files(
     tmp_path: Path,
 ):
@@ -250,6 +297,13 @@ def test_migration_rebuilds_and_authenticates_bundle_from_real_provider_raw_file
         "rebuild_from_legacy_raw_captures"
     )
     assert persisted_manifest["provenance_strength"]
+    assert persisted_manifest["validation"][
+        "raw_one_to_one_row_accounting_verified"
+    ] is True
+    for raw_record in persisted_manifest["original_artifacts"][
+        "raw_captures"
+    ].values():
+        assert raw_record["row_count"] == raw_record["cleaned_row_count"]
     assert persisted_manifest["limitations"]
     assert persisted_manifest["original_artifacts"]["pipeline_metadata"][
         "generated_at"
@@ -281,28 +335,33 @@ def test_migration_leaves_all_legacy_input_bytes_unchanged(tmp_path: Path):
     ).read_bytes() == fixture.metadata_path.read_bytes()
 
 
-def test_migration_uses_explicit_weaker_processed_only_mode_when_raw_is_absent(
+def test_migration_rejects_processed_only_input_when_raw_is_absent(
     tmp_path: Path,
 ):
     fixture = _write_legacy_fixture(tmp_path / "legacy")
-    original_prices_hash = _sha256(fixture.prices_path)
     shutil.rmtree(fixture.raw_dir)
+    before = _tree_bytes(fixture.root)
     output_dir = tmp_path / "verified"
 
-    manifest = migrate_legacy_psx_cache(
-        fixture.prices_path,
-        fixture.metadata_path,
-        output_dir,
-    )
+    with pytest.raises(ValueError, match="raw|processed|verified|certif"):
+        migrate_legacy_psx_cache(
+            fixture.prices_path,
+            fixture.metadata_path,
+            output_dir,
+        )
 
-    assert manifest["migration_strategy"] == "validated_legacy_processed_cache_copy"
-    assert manifest["provenance_strength"] == (
-        "processed_cache_and_legacy_metadata_only"
-    )
-    assert manifest["validation"]["raw_rebuild_matches_legacy_processed_cache"] is False
-    assert manifest["original_artifacts"]["raw_captures"] == {}
-    assert _sha256(output_dir / "psx_prices.csv") == original_prices_hash
-    validate_verified_legacy_bundle(output_dir / "psx_prices.csv")
+    assert not output_dir.exists()
+    assert _tree_bytes(fixture.root) == before
+
+
+def test_bundle_validation_rejects_preexisting_processed_only_bundle(tmp_path: Path):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    output_dir = tmp_path / "verified"
+    _migrate(fixture, output_dir)
+    _rewrite_as_processed_only_bundle(output_dir)
+
+    with pytest.raises(ValueError, match="raw|processed|strategy|provenance"):
+        validate_verified_legacy_bundle(output_dir / "psx_prices.csv")
 
 
 def test_migration_rejects_missing_legacy_metadata(tmp_path: Path):
@@ -575,3 +634,204 @@ def test_migration_rejects_duplicate_symbol_dates(tmp_path: Path):
 
     with pytest.raises(ValueError, match="duplicate|unique|ticker|date"):
         _migrate(fixture, tmp_path / "verified")
+
+
+@pytest.mark.parametrize(
+    ("column", "bad_value", "message"),
+    [
+        ("date", "not-a-date", "raw|date|one-to-one"),
+        ("open", "not-a-number", "raw|open|finite|numeric|one-to-one"),
+        ("open", 0, "raw|open|positive|one-to-one"),
+        ("close", -1, "raw|close|positive|one-to-one"),
+        ("volume", -1, "raw|volume|non.?negative|one-to-one"),
+    ],
+    ids=[
+        "invalid-date",
+        "non-finite-open",
+        "non-positive-open",
+        "non-positive-close",
+        "negative-volume",
+    ],
+)
+def test_migration_rejects_raw_rows_that_cleaning_would_silently_drop(
+    tmp_path: Path,
+    column: str,
+    bad_value: Any,
+    message: str,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    raw_path = _raw_path(fixture)
+    raw = pd.read_csv(raw_path)
+    extra = raw.iloc[[-1]].copy()
+    extra.loc[:, "date"] = "2025-01-07"
+    if isinstance(bad_value, str):
+        extra[column] = extra[column].astype("object")
+    extra.loc[:, column] = bad_value
+    raw = pd.concat([raw, extra], ignore_index=True)
+    raw.to_csv(raw_path, index=False)
+    _set_raw_count(fixture, "OGDC", len(raw))
+    source_bytes = _tree_bytes(fixture.root)
+    output_dir = tmp_path / "verified"
+
+    with pytest.raises(ValueError, match=message):
+        _migrate(fixture, output_dir)
+
+    assert not output_dir.exists()
+    assert _tree_bytes(fixture.root) == source_bytes
+
+
+def test_migration_rejects_raw_duplicate_that_cleaning_would_silently_collapse(
+    tmp_path: Path,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    raw_path = _raw_path(fixture)
+    raw = pd.read_csv(raw_path)
+    raw = pd.concat([raw, raw.iloc[[0]]], ignore_index=True)
+    raw.to_csv(raw_path, index=False)
+    _set_raw_count(fixture, "OGDC", len(raw))
+    output_dir = tmp_path / "verified"
+
+    with pytest.raises(ValueError, match="raw|duplicate|date|one-to-one"):
+        _migrate(fixture, output_dir)
+
+    assert not output_dir.exists()
+
+
+def test_migration_rejects_fractional_raw_volume_instead_of_rounding_it(
+    tmp_path: Path,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    raw_path = _raw_path(fixture)
+    raw = pd.read_csv(raw_path)
+    raw["volume"] = raw["volume"].astype(float)
+    raw.loc[0, "volume"] = float(raw.loc[0, "volume"]) + 0.4
+    raw.to_csv(raw_path, index=False)
+    output_dir = tmp_path / "verified"
+
+    with pytest.raises(ValueError, match="raw|volume|integer|whole|round"):
+        _migrate(fixture, output_dir)
+
+    assert not output_dir.exists()
+
+
+def test_raw_hash_is_bound_to_private_snapshot_bytes_used_for_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    raw_path = _raw_path(fixture)
+    raw_a_bytes = raw_path.read_bytes()
+    raw_b = pd.read_csv(raw_path)
+    raw_b.loc[0, "close"] = float(raw_b.loc[0, "close"]) + 7.5
+    raw_b_bytes = raw_b.to_csv(index=False).encode("utf-8")
+
+    processed = pd.read_csv(fixture.prices_path)
+    target = (processed["ticker"] == "OGDC") & (
+        processed["date"] == raw_b.loc[0, "date"]
+    )
+    processed.loc[target, "close"] = raw_b.loc[0, "close"]
+    processed.to_csv(fixture.prices_path, index=False)
+
+    real_read_csv = pd.read_csv
+    raced_original = False
+
+    def race_original_raw(path: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        nonlocal raced_original
+        if Path(path).resolve() == raw_path.resolve():
+            raced_original = True
+            raw_path.write_bytes(raw_b_bytes)
+            try:
+                return real_read_csv(path, *args, **kwargs)
+            finally:
+                raw_path.write_bytes(raw_a_bytes)
+        return real_read_csv(path, *args, **kwargs)
+
+    monkeypatch.setattr(legacy_cache_module.pd, "read_csv", race_original_raw)
+    output_dir = tmp_path / "verified"
+
+    with pytest.raises(ValueError, match="reproduce|match|raw|processed"):
+        _migrate(fixture, output_dir)
+
+    assert raced_original is False
+    assert raw_path.read_bytes() == raw_a_bytes
+    assert not output_dir.exists()
+
+
+def test_processed_hash_is_bound_to_private_snapshot_bytes_used_for_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    prices_a_bytes = fixture.prices_path.read_bytes()
+    prices_b = pd.read_csv(fixture.prices_path)
+    target = prices_b["ticker"] == "OGDC"
+    first_index = prices_b.index[target][0]
+    prices_b.loc[first_index, "close"] = (
+        float(prices_b.loc[first_index, "close"]) + 7.5
+    )
+    prices_b_bytes = prices_b.to_csv(index=False).encode("utf-8")
+
+    raw_path = _raw_path(fixture)
+    raw = pd.read_csv(raw_path)
+    raw.loc[0, "close"] = prices_b.loc[first_index, "close"]
+    raw.to_csv(raw_path, index=False)
+
+    real_read_csv = pd.read_csv
+    raced_original = False
+
+    def race_original_prices(path: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        nonlocal raced_original
+        if Path(path).resolve() == fixture.prices_path.resolve():
+            raced_original = True
+            fixture.prices_path.write_bytes(prices_b_bytes)
+            try:
+                return real_read_csv(path, *args, **kwargs)
+            finally:
+                fixture.prices_path.write_bytes(prices_a_bytes)
+        return real_read_csv(path, *args, **kwargs)
+
+    monkeypatch.setattr(legacy_cache_module.pd, "read_csv", race_original_prices)
+    output_dir = tmp_path / "verified"
+
+    with pytest.raises(ValueError, match="reproduce|match|raw|processed"):
+        _migrate(fixture, output_dir)
+
+    assert raced_original is False
+    assert fixture.prices_path.read_bytes() == prices_a_bytes
+    assert not output_dir.exists()
+
+
+def test_metadata_hash_is_bound_to_private_snapshot_bytes_used_for_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixture = _write_legacy_fixture(tmp_path / "legacy")
+    metadata_a_bytes = fixture.metadata_path.read_bytes()
+    metadata_b = json.loads(metadata_a_bytes)
+    metadata_b["errors"] = {"UNRELATED": "race sentinel"}
+    metadata_b_bytes = json.dumps(metadata_b, indent=2).encode("utf-8")
+    real_load_json = legacy_cache_module._load_json
+    raced_original = False
+
+    def race_original_metadata(path: Path, *, label: str) -> dict[str, Any]:
+        nonlocal raced_original
+        if Path(path).resolve() == fixture.metadata_path.resolve():
+            raced_original = True
+            fixture.metadata_path.write_bytes(metadata_b_bytes)
+            try:
+                return real_load_json(path, label=label)
+            finally:
+                fixture.metadata_path.write_bytes(metadata_a_bytes)
+        return real_load_json(path, label=label)
+
+    monkeypatch.setattr(legacy_cache_module, "_load_json", race_original_metadata)
+    output_dir = tmp_path / "verified"
+
+    _migrate(fixture, output_dir)
+
+    generated = json.loads(
+        (output_dir / "pipeline_metadata.json").read_text(encoding="utf-8")
+    )
+    assert raced_original is False
+    assert generated["errors"] == {}
+    assert fixture.metadata_path.read_bytes() == metadata_a_bytes

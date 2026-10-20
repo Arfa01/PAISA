@@ -41,9 +41,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--legacy-raw-dir",
         help=(
-            "Optional legacy raw-data root. By default the command inspects the "
-            "data/raw sibling inferred from --legacy-prices. Complete exact "
-            "<SYMBOL>_psx_dps_raw.csv captures are rebuilt with current cleaning."
+            "Legacy raw-data root. When omitted, the command inspects the data/raw "
+            "sibling inferred from --legacy-prices. Complete exact "
+            "<SYMBOL>_psx_dps_raw.csv captures are mandatory for every requested "
+            "symbol; processed-only caches are rejected."
         ),
     )
     parser.add_argument("--provider", default="psx_dps")

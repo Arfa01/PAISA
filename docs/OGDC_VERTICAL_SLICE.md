@@ -122,9 +122,11 @@ prices and metadata into the standard destination with this exact command:
 ```bash
 python scripts/migrate_legacy_psx_cache.py \
   --legacy-prices \
-  "/Users/arfa/University/PAISA/paisa-v0/data/processed/psx_prices.csv" \
+  "<legacy-repository>/data/processed/psx_prices.csv" \
   --legacy-metadata \
-  "/Users/arfa/University/PAISA/paisa-v0/data/processed/pipeline_metadata.json" \
+  "<legacy-repository>/data/processed/pipeline_metadata.json" \
+  --legacy-raw-dir \
+  "<legacy-repository>/data/raw" \
   --output-dir \
   "data/external/verified_legacy_psx_cache"
 ```
@@ -139,11 +141,14 @@ processed CSV and searches it recursively. Only exact
 `<SYMBOL>_psx_dps_raw.csv` filenames count as raw captures. If a capture exists
 for every symbol requested by the legacy metadata, the command rebuilds the
 standard price table with the current cleaning logic and requires it to match
-the validated legacy processed table. If all exact captures are absent, the
-command makes the explicitly labelled processed-cache copy instead. A partial
-set, ambiguous duplicate captures, a requested explicit raw directory that is
-missing, or a raw rebuild that disagrees with the processed evidence causes a
-failure; it does not silently fall back.
+the validated legacy processed table. Every source is first copied and hashed
+through one open descriptor; parsing uses only that private snapshot. Raw rows
+must have valid unique dates, finite positive required prices, and finite,
+non-negative whole-number volume, and cleaning must preserve every row. A
+missing or partial set, invalid or duplicate rows, ambiguous duplicate
+captures, a requested explicit raw directory that is missing, or a raw rebuild
+that disagrees with the processed evidence causes a failure. Processed-only
+migration is never accepted as verified real data.
 
 The completed bundle has four files:
 
@@ -252,9 +257,17 @@ consistency checks. A handled late failure removes the invocation's pending or
 newly published model run along with the staged vertical bundle; it never
 deletes a pre-existing run. The command prints a final `PASS` only after those
 checks and publications succeed. The frozen training-price file and all four
-prediction files are fingerprinted before backtesting, rechecked after every
-experiment has been reconciled, and rechecked again immediately before
-publication. Any in-place mutation aborts the transaction.
+prediction files are part of a sorted exact-file SHA-256 inventory covering
+every training payload other than the self-referential `run_manifest.json`:
+frozen inputs, data and split manifests, reports, model manifests, model
+configurations, metrics, predictions, and binaries. The run manifest records
+the common code version, dirty-tree flag, and source fingerprint and is itself
+hash-bound by the vertical-slice reference. The full inventory is checked
+before backtesting, after every experiment has been reconciled, and immediately
+before publication. The model IDs and prediction paths consumed by backtesting
+must exactly match the validated root-manifest bindings; external summary paths
+are rejected. Any missing, extra, redirected, or modified file aborts the
+transaction.
 
 ## Output artifacts
 

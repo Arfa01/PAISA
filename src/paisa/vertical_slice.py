@@ -29,10 +29,14 @@ from paisa.backtesting.benchmarks import BenchmarkOutcome
 from paisa.backtesting.engine import BacktestOutcome
 from paisa.backtesting.metrics import calculate_drawdowns, calculate_portfolio_metrics
 from paisa.experiments.artifacts import (
+    TrainingRunEvidence,
+    assert_training_run_artifacts_unchanged,
     make_run_id,
+    seal_training_run_artifacts,
     sha256_file,
     to_jsonable,
     utc_now_z,
+    validate_training_run_artifacts,
     write_json,
 )
 from paisa.experiments.evaluation import binary_classification_metrics
@@ -794,6 +798,13 @@ def _validate_training_summary(
         )
 
     model_ids = {key: str(model_ids_raw[key]) for key in REQUIRED_VARIANT_IDS}
+    unsafe_model_ids = [
+        model_id for model_id in model_ids.values() if not _SAFE_ID.fullmatch(model_id)
+    ]
+    if unsafe_model_ids:
+        raise ValueError(
+            "Every registered model ID in the training summary must be filesystem-safe"
+        )
     if len(set(model_ids.values())) != len(REQUIRED_VARIANT_IDS):
         raise ValueError("Every trained variant must have a unique registered model ID")
 
@@ -1755,6 +1766,7 @@ def _assert_frozen_prices_match(
 
 def _assert_training_evidence_unchanged(
     *,
+    training_run_evidence: TrainingRunEvidence,
     input_validation: ValidatedPrices,
     frozen_validation: ValidatedPrices,
     prediction_paths: Mapping[str, Path],
@@ -1777,6 +1789,7 @@ def _assert_training_evidence_unchanged(
             raise RuntimeError(
                 f"Training prediction artifact changed after validation: {variant_id}"
             )
+    assert_training_run_artifacts_unchanged(training_run_evidence)
 
 
 def _rewrite_owned_training_paths(
@@ -1943,6 +1956,31 @@ def run_ogdc_vertical_slice(
                 )
             owned_training_invocation = str(training_summary["invocation_id"])
 
+        training_run_evidence = validate_training_run_artifacts(
+            training_dir,
+            expected_run_id=str(training_summary["run_id"]),
+            expected_invocation_id=str(training_summary["invocation_id"]),
+        )
+        evidence_model_ids = dict(training_run_evidence.model_ids)
+        if model_ids != evidence_model_ids:
+            raise ValueError(
+                "Training summary model IDs do not match the checksum-bound run manifest"
+            )
+        evidence_prediction_paths = {
+            variant_id: (
+                training_run_evidence.run_directory / relative_path
+            ).resolve()
+            for variant_id, relative_path in training_run_evidence.prediction_paths
+        }
+        if prediction_paths != evidence_prediction_paths:
+            raise ValueError(
+                "Training summary prediction paths do not match the registered models' "
+                "checksum-inventoried predictions.csv files"
+            )
+        # Downstream consumers receive only paths derived from validated run
+        # evidence, never caller-selected equivalents outside the run.
+        prediction_paths = evidence_prediction_paths
+
         (
             model_metrics,
             split_counts,
@@ -1984,6 +2022,7 @@ def run_ogdc_vertical_slice(
             for variant_id, path in prediction_paths.items()
         }
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -2004,6 +2043,7 @@ def run_ogdc_vertical_slice(
             backtest_fn=backtesting_callable,
         )
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -2013,6 +2053,36 @@ def run_ogdc_vertical_slice(
         )
         if len({outcome.config.portfolio_id for outcome in outcomes.values()}) != 4:
             raise AssertionError("Each model experiment must have a unique portfolio ID")
+
+        # A default training run is still private here, so the orchestrator may
+        # finalize its owned public-path and acquisition metadata. Resealing is
+        # deliberately restricted to this owned, unpublished run; custom
+        # trainer output is never rewritten or accepted via resealing.
+        if pending_training_root is not None:
+            _rewrite_owned_training_paths(
+                training_dir=training_dir,
+                public_training_dir=final_training_dir,
+                acquisition=acquisition,
+                validated_prices=input_validation,
+            )
+            training_run_evidence = seal_training_run_artifacts(training_dir)
+            if (
+                training_run_evidence.run_id != str(training_summary["run_id"])
+                or training_run_evidence.invocation_id
+                != str(training_summary["invocation_id"])
+            ):
+                raise RuntimeError(
+                    "Resealed training run identity changed during owned metadata finalization"
+                )
+            _assert_training_evidence_unchanged(
+                training_run_evidence=training_run_evidence,
+                input_validation=input_validation,
+                frozen_validation=frozen_validation,
+                prediction_paths=prediction_paths,
+                prediction_sha256=prediction_sha256,
+                symbol=symbol,
+                start=start,
+            )
 
         final_prediction_paths = {
             variant_id: final_training_dir
@@ -2049,7 +2119,21 @@ def run_ogdc_vertical_slice(
             "training_invocation_id": training_summary["invocation_id"],
             "artifact_directory": str(final_training_dir),
             "run_manifest_path": str(final_training_dir / "run_manifest.json"),
-            "run_manifest_sha256": sha256_file(training_dir / "run_manifest.json"),
+            "run_manifest_sha256": training_run_evidence.run_manifest_sha256,
+            "training_source_provenance": {
+                "code_version": training_run_evidence.code_version,
+                "dirty_tree": training_run_evidence.dirty_tree,
+                "source_fingerprint": training_run_evidence.source_fingerprint,
+            },
+            "training_artifact_inventory": {
+                "algorithm": "sha256",
+                "root": ".",
+                "excludes": ["run_manifest.json"],
+                "files": [
+                    {"path": path, "sha256": checksum}
+                    for path, checksum in training_run_evidence.artifact_sha256
+                ],
+            },
             "frozen_prices_path": str(
                 final_training_dir / frozen_prices.relative_to(training_dir)
             ),
@@ -2263,6 +2347,7 @@ def run_ogdc_vertical_slice(
         write_json(manifest, stage_dir / "manifest.json")
 
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -2276,12 +2361,6 @@ def run_ogdc_vertical_slice(
                 f"Vertical-slice run already exists; refusing to overwrite: {destination}"
             )
         if pending_training_root is not None:
-            _rewrite_owned_training_paths(
-                training_dir=training_dir,
-                public_training_dir=final_training_dir,
-                acquisition=acquisition,
-                validated_prices=input_validation,
-            )
             if final_training_dir.exists():
                 raise FileExistsError(
                     "Model-training run already exists; refusing to overwrite: "
@@ -2289,6 +2368,20 @@ def run_ogdc_vertical_slice(
                 )
             os.rename(training_dir, final_training_dir)
             published_training_dir = final_training_dir
+            published_evidence = validate_training_run_artifacts(
+                final_training_dir,
+                expected_run_id=training_run_evidence.run_id,
+                expected_invocation_id=training_run_evidence.invocation_id,
+            )
+            if (
+                published_evidence.run_manifest_sha256
+                != training_run_evidence.run_manifest_sha256
+                or published_evidence.artifact_sha256
+                != training_run_evidence.artifact_sha256
+            ):
+                raise RuntimeError(
+                    "Published training run differs from its validated private evidence"
+                )
             if pending_training_root.exists():
                 shutil.rmtree(pending_training_root)
         os.rename(stage_dir, destination)

@@ -83,7 +83,15 @@ The command first requests OGDC history from the real `psx-dps` provider. A
 sample provider, generated fixture, synthetic series, or silent provider switch
 is never a valid substitute for a live vertical-slice run.
 
-If the live provider is unavailable, the command must:
+If the live provider is unavailable, the command retains the complete provider
+error and permits only one of the following checksum-bound evidence paths. The
+two producer identities remain distinct.
+
+### Current schema-1.0 pipeline cache
+
+The existing path remains accepted unchanged. It requires the cached CSV and
+its sibling schema-1.0 `pipeline_metadata.json`, both from the completed
+`paisa.pipeline.run_v0_pipeline` producer. The runner must:
 
 1. Stop the live acquisition attempt and retain the complete provider error.
 2. Require `pipeline_metadata.json` beside the configured cached price CSV.
@@ -106,15 +114,112 @@ If the live provider is unavailable, the command must:
 6. Fail the workflow if no qualifying cached-real provenance pair is
    available.
 
-Before these checks, the runner copies the selected price CSV and its metadata
-to an invocation-private working snapshot. Validation and model training both
-consume that snapshot, not the mutable original cache. The runner verifies the
-snapshot fingerprint around training so an external cache edit cannot create
-a time-of-check/time-of-use mismatch. The snapshot is private while the run is
-being built, but it is not discarded after success: the exact CSV and, for a
-real-data run, its `pipeline_metadata.json` remain in the immutable published
-bundle under `input_snapshot/`. The manifest checksum inventory and final
-report record this input evidence and its price and provenance fingerprints.
+### Verified migration of the pre-schema PAISA cache
+
+A pre-schema cache is not accepted directly. Migrate the specified legacy
+prices and metadata into the standard destination with this exact command:
+
+```bash
+python scripts/migrate_legacy_psx_cache.py \
+  --legacy-prices \
+  "/Users/arfa/University/PAISA/paisa-v0/data/processed/psx_prices.csv" \
+  --legacy-metadata \
+  "/Users/arfa/University/PAISA/paisa-v0/data/processed/pipeline_metadata.json" \
+  --output-dir \
+  "data/external/verified_legacy_psx_cache"
+```
+
+The migrator performs no network request or live acquisition. It computes the
+source-file hashes before work, checks them again before publication, and never
+edits the original CSV or metadata. The destination is immutable: if it already
+exists, the command fails rather than overwriting or merging it.
+
+The command automatically infers the legacy `data/raw/` directory from the
+processed CSV and searches it recursively. Only exact
+`<SYMBOL>_psx_dps_raw.csv` filenames count as raw captures. If a capture exists
+for every symbol requested by the legacy metadata, the command rebuilds the
+standard price table with the current cleaning logic and requires it to match
+the validated legacy processed table. If all exact captures are absent, the
+command makes the explicitly labelled processed-cache copy instead. A partial
+set, ambiguous duplicate captures, a requested explicit raw directory that is
+missing, or a raw rebuild that disagrees with the processed evidence causes a
+failure; it does not silently fall back.
+
+The completed bundle has four files:
+
+```text
+data/external/verified_legacy_psx_cache/
+├── psx_prices.csv
+├── pipeline_metadata.json
+├── legacy_pipeline_metadata.json
+└── migration_manifest.json
+```
+
+`legacy_pipeline_metadata.json` is a byte-for-byte copy of the original. The
+new `pipeline_metadata.json` uses schema 1.0 but truthfully identifies its
+producer as `paisa.legacy_cache.migrate_legacy_psx_cache`, never
+`paisa.pipeline.run_v0_pipeline`. `migration_manifest.json` binds the original
+and migrated SHA-256 values, original and migration timestamps, migration
+strategy, per-symbol coverage, evidence strength, and limitations.
+
+Migration validates all of the following before publishing:
+
+- Required price columns; numeric `open`, `close`, and `volume`; positive
+  prices; non-negative volume; and unique ticker/date observations.
+- One exact expected real source, `psx_dps`, across every row. Wrong, blank,
+  mixed, sample, synthetic, fixture, mock, or test sources are rejected.
+- Legacy provider `psx_dps`, `OGDC` in `symbols_requested`, positive OGDC raw
+  acquisition evidence, and no OGDC provider error.
+- The legacy total row count and global date range against the CSV, plus
+  computed per-symbol coverage and agreement between requested symbols and
+  observed symbols. Missing evidence is an error; the migrator never guesses.
+- Checksums for the migrated CSV, schema-1.0 metadata, and preserved legacy
+  metadata. A checksum disagreement invalidates bundle validation, and the
+  runner separately inventories the migration manifest it consumed.
+
+After migration, invoke the real-data runner with the new cache and controlled
+run ID:
+
+```bash
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices \
+  "data/external/verified_legacy_psx_cache/psx_prices.csv" \
+  --run-id \
+  "VSL-20261020-OGDC-real-cache-02"
+```
+
+The runner still tries live PSX DPS first. If that attempt returns HTTP 404,
+the full error is retained in the manifest and final summary. A migrated-cache
+fallback is labelled in all output evidence as:
+
+```text
+acquisition_mode = "verified_legacy_psx_cache"
+live_fetch_succeeded = false
+original_provider = "psx_dps"
+legacy_metadata_preserved = true
+```
+
+It must never be called a successful live fetch. The current schema-1.0
+pipeline-produced cache remains valid through its original, separate producer
+path.
+
+Before validation, the runner copies every required input-evidence file to an
+invocation-private working snapshot. Validation and model training consume
+that snapshot, not the mutable source cache. The runner verifies its
+fingerprints around training, so an external cache edit cannot create a
+time-of-check/time-of-use mismatch. A successful verified-legacy run retains:
+
+```text
+artifacts/vertical_slice/<vertical_slice_run_id>/input_snapshot/
+├── psx_prices.csv
+├── pipeline_metadata.json
+├── legacy_pipeline_metadata.json
+└── migration_manifest.json
+```
+
+A current-pipeline run retains only its exact price CSV and
+`pipeline_metadata.json`. The manifest checksum inventory and final report bind
+all retained input evidence and record its price and provenance fingerprints.
 
 The final summary identifies the effective source and date range. A cached run
 must not be described as a successful live fetch, and fixture-based tests must
@@ -161,7 +266,9 @@ artifacts/vertical_slice/<vertical_slice_run_id>/
 ├── model_training_run_reference.json
 ├── input_snapshot/
 │   ├── <price_csv_filename>.csv
-│   └── pipeline_metadata.json  # real-data runs
+│   ├── pipeline_metadata.json  # real-data runs
+│   ├── legacy_pipeline_metadata.json  # verified-legacy runs only
+│   └── migration_manifest.json  # verified-legacy runs only
 ├── experiment_configs/
 │   ├── M-001.json
 │   ├── M-002.json
@@ -202,10 +309,12 @@ The files have these roles:
   run and its four registered model artifacts and prediction files.
 - `input_snapshot/` retains the exact price CSV that was snapshotted before
   validation and consumed by training. Real-data runs also retain the matching
-  producer-written `pipeline_metadata.json`; fixture-only tests may omit it.
-  These are immutable evidence for reproducing which input bytes passed the
-  producer-attestation and integrity checks and were used; both are covered by
-  the manifest when present.
+  producer-written `pipeline_metadata.json`; verified-legacy runs additionally
+  retain the byte-preserved `legacy_pipeline_metadata.json` and the
+  checksum-binding `migration_manifest.json`. Fixture-only tests may omit
+  provenance files. These are immutable evidence for reproducing which input
+  bytes passed the producer-attestation and integrity checks and were used;
+  every retained file is covered by the manifest.
 - `experiment_configs/` contains one normalized, immutable configuration per
   model portfolio.
 - `experiments/` retains the complete immutable backtest evidence for each of
@@ -319,11 +428,21 @@ not the same measurement, and the report must not claim otherwise.
 - Current provenance does not establish a fully adjusted total-return price
   series. Dividends and corporate actions are not modeled, so buy-and-hold and
   model returns must be interpreted with that limitation.
-- Cached-file qualification depends on the producer-written
-  `pipeline_metadata.json` and its checksum-bound `prices_artifact` entry. This
-  detects post-production edits, stale metadata, mixed/blank sources, and
-  simple relabelling, but cannot prove that an already-compromised producer or
-  a coordinated replacement of both files reported truthful market data.
+- Cached-file qualification depends on the producer-written or migrated
+  `pipeline_metadata.json` and its checksum-bound evidence. This detects
+  post-production edits, stale metadata, mixed/blank sources, and simple
+  relabelling, but cannot prove that an already-compromised producer or a
+  coordinated replacement of all evidence reported truthful market data.
+- Legacy raw files do not contain a cryptographic provider signature or a
+  retained HTTP request/response capture. Their filename, columns, values, and
+  agreement with the legacy processed data provide internal consistency, not
+  independent external authenticity.
+- The captured PSX-DPS rows have blank `high` and `low` fields. Migration
+  verifies them when supplied, but this legacy run's features and simulations
+  rely on the validated `open`, `close`, and `volume` observations.
+- SHA-256 checksums detect byte changes within the recorded evidence chain;
+  they are integrity digests, not digital signatures or third-party
+  attestations.
 - The run covers one stock, one daily horizon, one historical split, fixed
   thresholds, and one controlled cost model. It is not evidence of live
   execution quality or future returns.

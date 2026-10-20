@@ -197,26 +197,83 @@ python scripts/run_ogdc_vertical_slice.py
 ```
 
 The live command uses `psx-dps`. It never substitutes the sample provider or
-synthetic data. If the live request fails, it may use
-`data/processed/psx_prices.csv` only when the same directory also contains the
-`pipeline_metadata.json` produced with that exact CSV. The metadata must bind
-the CSV checksum, real provider, daily frequency, row count, and OGDC symbol
-coverage, and record a completed PAISA pipeline producer plus successful raw
-OGDC acquisition with no provider error. Source values in the CSV must also
-agree with that provider. A CSV alone, stale or incomplete metadata, relabelled
-fixture data, or mixed/blank provenance is rejected.
+synthetic data. If the live request fails, a cached price file is accepted only
+with one of two explicit provenance records:
+
+- A current schema-1.0 `paisa.pipeline.run_v0_pipeline` record produced with
+  that exact CSV. This existing path remains accepted unchanged.
+- A complete, checksum-bound verified-legacy bundle produced by
+  `paisa.legacy_cache.migrate_legacy_psx_cache`. A pre-schema CSV and its old
+  metadata are not accepted directly.
+
+Both paths bind the price bytes, real provider, daily frequency, row count, and
+OGDC coverage and require positive raw-acquisition evidence with no OGDC
+provider error. Source values in the CSV must agree with the provider. A CSV
+alone, stale or incomplete metadata, relabelled fixture data, or mixed/blank
+provenance is rejected.
+
+### Migrate the verified pre-schema PSX cache
+
+The migration command performs no live acquisition and never changes the
+legacy files. Run it once with the exact source paths and the repository's
+standard verified-cache destination:
+
+```bash
+python scripts/migrate_legacy_psx_cache.py \
+  --legacy-prices \
+  "/Users/arfa/University/PAISA/paisa-v0/data/processed/psx_prices.csv" \
+  --legacy-metadata \
+  "/Users/arfa/University/PAISA/paisa-v0/data/processed/pipeline_metadata.json" \
+  --output-dir \
+  "data/external/verified_legacy_psx_cache"
+```
+
+By default, the command looks recursively below the inferred legacy
+`data/raw/` directory for exact `<SYMBOL>_psx_dps_raw.csv` filenames. If one
+exists for every requested symbol, it rebuilds prices with the current cleaner
+and requires the result to match the legacy processed data. It uses the
+processed-file migration only when those exact raw captures are wholly absent;
+partial raw evidence is rejected instead of guessed around.
+
+The immutable destination contains exactly the migrated `psx_prices.csv`, new
+schema-1.0 `pipeline_metadata.json`, byte-preserved
+`legacy_pipeline_metadata.json`, and `migration_manifest.json`. The manifest
+records original and migrated SHA-256 values, coverage checks, timestamps,
+migration strategy, evidence strength, and limitations. The producer remains
+the distinct legacy migrator; it is never represented as a new pipeline or
+live-provider run. An existing output directory is not overwritten.
+
+After a successful migration, run the controlled real-cache workflow with:
+
+```bash
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices \
+  "data/external/verified_legacy_psx_cache/psx_prices.csv" \
+  --run-id \
+  "VSL-20261020-OGDC-real-cache-02"
+```
+
+When the live request returns HTTP 404, that error remains in the run evidence.
+The fallback is labelled `acquisition_mode="verified_legacy_psx_cache"`,
+`live_fetch_succeeded=false`, `original_provider="psx_dps"`, and
+`legacy_metadata_preserved=true`; it is not described as a successful live
+fetch. Migration rejects missing evidence, invalid prices or volumes,
+duplicate ticker/date rows, wrong or mixed providers, sample/synthetic/fixture/
+mock/test sources, coverage mismatches, non-positive raw counts, and provider
+errors.
 
 The selected CSV and provenance metadata are first copied to an
 invocation-private working snapshot before either validation or training, so
 later changes to the source cache cannot change the run. On success, that exact
-CSV and, for real data, its `pipeline_metadata.json` are retained under the
-published bundle's `input_snapshot/` directory as checksum-inventoried input
-evidence. A model-training run is published only after all four backtests and
-persisted-evidence checks pass. The runner rechecks the trainer's frozen price
-file and all four prediction-file checksums after backtesting and immediately
-before publication, so a callback cannot change the model evidence mid-run; a
-handled late failure rolls back artifacts owned by that invocation. Successful
-outputs are immutable under
+CSV and its `pipeline_metadata.json` are retained under the published bundle's
+`input_snapshot/` directory as checksum-inventoried input evidence. For a
+verified-legacy run, the snapshot also retains `legacy_pipeline_metadata.json`
+and `migration_manifest.json`. A model-training run is published only after
+all four backtests and persisted-evidence checks pass. The runner rechecks the
+trainer's frozen price file and all four prediction-file checksums after
+backtesting and immediately before publication, so a callback cannot change
+the model evidence mid-run; a handled late failure rolls back artifacts owned
+by that invocation. Successful outputs are immutable under
 `artifacts/vertical_slice/<vertical_slice_run_id>/`, and an existing run ID is
 never overwritten. Each completed bundle retains the four full backtesting
 trees under `experiments/<experiment_id>/`; aggregate metrics and curves are
@@ -230,6 +287,11 @@ measures next-session close versus feature-date close, while simulated trades
 execute at the next observed session's open and earn returns from that point
 onward. Prediction quality and simulated portfolio profitability are therefore
 reported separately.
+
+The verified-legacy path establishes a strict internal evidence chain, not
+independent market-data authenticity. Legacy raw captures have no provider
+signature or retained HTTP-response capture, and a SHA-256 digest detects byte
+changes but is not a digital signature. See the runbook for the full limits.
 
 See [the OGDC vertical-slice runbook](docs/OGDC_VERTICAL_SLICE.md) for the exact
 assumptions, fallback rules, artifact tree, report semantics, and limitations.

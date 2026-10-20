@@ -14,6 +14,7 @@ import pytest
 
 from paisa.experiments.evaluation import PREDICTION_COLUMNS
 from paisa.experiments.runner import run_experiment
+from paisa.legacy_cache import migrate_legacy_psx_cache
 from paisa.pipeline import run_v0_pipeline
 from paisa.vertical_slice import (
     PriceAcquisition,
@@ -219,6 +220,60 @@ class CompletedVerticalSlice:
     backtest_calls: tuple[dict[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class CompletedVerifiedLegacySlice:
+    artifact_path: Path
+    output_dir: Path
+    model_output_dir: Path
+    bundle_path: Path
+    summary: dict[str, Any]
+    live_error_text: str
+
+
+def _migrated_legacy_price_bundle(root: Path) -> Path:
+    """Create an old-format PSX cache and migrate it through the public API."""
+
+    processed = root / "legacy" / "data" / "processed"
+    processed.mkdir(parents=True)
+    prices = _price_fixture(source="psx_dps")
+    prices_path = processed / "psx_prices.csv"
+    prices.to_csv(prices_path, index=False)
+    dates = pd.to_datetime(prices["date"], errors="raise")
+    metadata = {
+        "generated_at": "2026-09-15T23:46:30",
+        "provider": "psx_dps",
+        "symbols_requested": ["OGDC"],
+        "raw_row_counts": {"OGDC": len(prices)},
+        "errors": {},
+        "prices_rows": len(prices),
+        "features_rows": len(prices),
+        "ml_dataset_rows": len(prices) - 30,
+        "date_range": {
+            "start": dates.min().strftime("%Y-%m-%d"),
+            "end": dates.max().strftime("%Y-%m-%d"),
+        },
+        "files": {
+            "prices": str(prices_path),
+            "features": str(processed / "psx_features.csv"),
+            "dataset": str(processed / "ml_dataset.csv"),
+            "model_dir": str(root / "legacy" / "models"),
+        },
+        "model_metrics": None,
+    }
+    metadata_path = processed / "pipeline_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    bundle = root / "verified-legacy-cache"
+    migrate_legacy_psx_cache(
+        prices_path,
+        metadata_path,
+        bundle,
+        expected_provider="psx_dps",
+        required_symbol="OGDC",
+    )
+    return bundle
+
+
 @pytest.fixture(scope="module")
 def completed_vertical_slice(tmp_path_factory: pytest.TempPathFactory) -> CompletedVerticalSlice:
     root = tmp_path_factory.mktemp("ogdc-vertical-slice")
@@ -266,6 +321,39 @@ def completed_vertical_slice(tmp_path_factory: pytest.TempPathFactory) -> Comple
         model_output_dir=model_output_dir,
         summary=summary,
         backtest_calls=tuple(calls),
+    )
+
+
+@pytest.fixture(scope="module")
+def completed_verified_legacy_slice(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> CompletedVerifiedLegacySlice:
+    root = tmp_path_factory.mktemp("ogdc-verified-legacy-slice")
+    bundle = _migrated_legacy_price_bundle(root)
+    output_dir = root / "vertical"
+    model_output_dir = root / "model-training"
+    live_error_text = (
+        "PSX DPS request failed with HTTP 404 Not Found for "
+        "https://dps.psx.com.pk/historical; response body: route not found"
+    )
+
+    def live_404(**_: Any) -> PriceAcquisition:
+        raise RuntimeError(live_error_text)
+
+    summary = run_ogdc_vertical_slice(
+        output_dir=output_dir,
+        model_output_dir=model_output_dir,
+        cached_prices_path=bundle / "psx_prices.csv",
+        vertical_slice_run_id="verified-legacy-smoke",
+        acquire_fn=live_404,
+    )
+    return CompletedVerifiedLegacySlice(
+        artifact_path=output_dir / "verified-legacy-smoke",
+        output_dir=output_dir,
+        model_output_dir=model_output_dir,
+        bundle_path=bundle,
+        summary=summary,
+        live_error_text=live_error_text,
     )
 
 
@@ -1000,7 +1088,10 @@ def test_complete_fixture_based_end_to_end_smoke_run(
     assert "not financial advice" in final_summary["disclaimer"].lower()
     assert final_summary["data_source"]["source"] == "deterministic_fixture"
     assert final_summary["data_source"]["mode"] == "fixture_test"
+    assert final_summary["data_source"]["acquisition_mode"] == "fixture_test"
     assert final_summary["data_source"]["is_real_data"] is False
+    assert final_summary["data_source"]["live_fetch_succeeded"] is False
+    assert final_summary["data_source"]["legacy_metadata_preserved"] is False
     assert manifest["status"] == "PASS"
     assert manifest["data"] == final_summary["data_source"]
     assert set(manifest["registered_model_ids"]) == EXPECTED_VARIANTS
@@ -1181,7 +1272,15 @@ def test_pipeline_produced_cached_pair_completes_vertical_slice_offline(
 
     assert summary["status"] == "PASS"
     assert summary["data_source"]["mode"] == "cached_real_fallback"
+    assert summary["data_source"]["acquisition_mode"] == "cached_real_fallback"
     assert summary["data_source"]["is_real_data"] is True
+    assert summary["data_source"]["live_fetch_succeeded"] is False
+    assert summary["data_source"]["original_provider"] == "psx_dps"
+    assert summary["data_source"]["legacy_metadata_preserved"] is False
+    assert summary["data_source"]["producer_component"] == (
+        "paisa.pipeline.run_v0_pipeline"
+    )
+    assert "forced live outage" in summary["data_source"]["live_acquisition_error"]
     assert summary["data_source"]["input_prices_sha256"] == _sha256(cached)
     retained_input = Path(summary["artifact_paths"]["input_snapshot"])
     assert _sha256(retained_input / cached.name) == _sha256(cached)
@@ -1195,6 +1294,113 @@ def test_pipeline_produced_cached_pair_completes_vertical_slice_offline(
         training_reference["frozen_prices_path"]
     )
     assert summary["data_source"]["provenance_sha256"] == _sha256(metadata)
+
+
+def test_verified_legacy_cache_completes_after_live_404_with_truthful_labels(
+    completed_verified_legacy_slice: CompletedVerifiedLegacySlice,
+):
+    run = completed_verified_legacy_slice
+    summary = run.summary
+    artifact = run.artifact_path
+    manifest = json.loads((artifact / "manifest.json").read_text(encoding="utf-8"))
+    training_reference = json.loads(
+        (artifact / "model_training_run_reference.json").read_text(encoding="utf-8")
+    )
+
+    assert summary["status"] == "PASS"
+    data = summary["data_source"]
+    assert data["source"] == "psx_dps"
+    assert data["mode"] == "verified_legacy_psx_cache"
+    assert data["acquisition_mode"] == "verified_legacy_psx_cache"
+    assert data["is_real_data"] is True
+    assert data["live_fetch_succeeded"] is False
+    assert data["original_provider"] == "psx_dps"
+    assert data["legacy_metadata_preserved"] is True
+    assert data["producer_component"] == (
+        "paisa.legacy_cache.migrate_legacy_psx_cache"
+    )
+    assert run.live_error_text in data["live_acquisition_error"]
+    assert "HTTP 404 Not Found" in data["live_acquisition_error"]
+    assert "response body: route not found" in data["live_acquisition_error"]
+
+    assert manifest["status"] == "PASS"
+    assert manifest["data"] == data
+    assert manifest["data"]["mode"] == "verified_legacy_psx_cache"
+    assert manifest["data"]["acquisition_mode"] == "verified_legacy_psx_cache"
+    assert manifest["data"]["live_fetch_succeeded"] is False
+    assert manifest["data"]["original_provider"] == "psx_dps"
+    assert manifest["data"]["legacy_metadata_preserved"] is True
+
+    assert training_reference["acquisition_mode"] == "verified_legacy_psx_cache"
+    assert training_reference["live_fetch_succeeded"] is False
+    assert training_reference["original_provider"] == "psx_dps"
+    assert training_reference["legacy_metadata_preserved"] is True
+    assert training_reference["provenance_producer_component"] == (
+        "paisa.legacy_cache.migrate_legacy_psx_cache"
+    )
+    assert set(training_reference["additional_provenance_sha256"]) == {
+        "legacy_pipeline_metadata",
+        "migration_manifest",
+    }
+
+    expected_bundle_files = {
+        "psx_prices.csv",
+        "pipeline_metadata.json",
+        "legacy_pipeline_metadata.json",
+        "migration_manifest.json",
+    }
+    snapshot = artifact / "input_snapshot"
+    assert {path.name for path in snapshot.iterdir()} == expected_bundle_files
+    for filename in expected_bundle_files:
+        assert _sha256(snapshot / filename) == _sha256(run.bundle_path / filename)
+
+
+@pytest.mark.parametrize(
+    "evidence_filename",
+    ["migration_manifest.json", "legacy_pipeline_metadata.json"],
+)
+def test_mutating_verified_legacy_evidence_during_training_aborts_pass(
+    completed_verified_legacy_slice: CompletedVerifiedLegacySlice,
+    tmp_path: Path,
+    evidence_filename: str,
+):
+    bundle = _migrated_legacy_price_bundle(tmp_path / "source")
+    reference = json.loads(
+        (
+            completed_verified_legacy_slice.artifact_path
+            / "model_training_run_reference.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    def live_404(**_: Any) -> PriceAcquisition:
+        raise RuntimeError("PSX DPS HTTP 404 mutation-test sentinel")
+
+    def mutate_evidence(**kwargs: Any) -> dict[str, Any]:
+        evidence_path = Path(kwargs["prices_path"]).parent / evidence_filename
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["tampered_during_training"] = True
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        return {
+            "run_id": reference["training_run_id"],
+            "invocation_id": reference["training_invocation_id"],
+            "artifact_directory": reference["artifact_directory"],
+            "model_ids": reference["model_ids"],
+            "prediction_paths": reference["prediction_paths"],
+        }
+
+    with pytest.raises(RuntimeError, match="Authenticated .* snapshot changed"):
+        run_ogdc_vertical_slice(
+            output_dir=tmp_path / "vertical",
+            model_output_dir=tmp_path / "models",
+            cached_prices_path=bundle / "psx_prices.csv",
+            vertical_slice_run_id=f"mutated-{Path(evidence_filename).stem}",
+            acquire_fn=live_404,
+            train_fn=mutate_evidence,
+        )
+
+    assert not (tmp_path / "vertical").joinpath(
+        f"mutated-{Path(evidence_filename).stem}"
+    ).exists()
 
 
 def test_corrupt_fourth_experiment_rolls_back_model_and_vertical_publication(

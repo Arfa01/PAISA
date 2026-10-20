@@ -115,6 +115,32 @@ canonical artifact. Existing v0 code may retain its legacy fixed-name behavior
 for compatibility tests, but new registered runs must not use those paths as
 canonical storage.
 
+### Training-run integrity root
+
+Every versioned training-run directory has a `run_manifest.json` integrity
+root. It records the run and invocation IDs plus the run-level `code_version`,
+`dirty_tree`, and `source_fingerprint`; those source fields must exactly match
+every registered model manifest. Its `artifact_inventory` is a sorted,
+duplicate-free array of relative POSIX paths and SHA-256 digests for every
+other regular file in the run. The inventory is exact-set: missing, additional,
+linked, special, or byte-modified artifacts invalidate the run. It covers, at
+minimum, frozen inputs, split and data manifests, reports, each model manifest,
+fitted binary, complete configuration, feature metadata, metrics, and
+prediction files.
+
+Only `run_manifest.json` itself is excluded from its embedded inventory to
+avoid a self-referential digest. A consuming workflow must separately capture
+that root file's SHA-256, validate the complete inventory before use, and
+reassert the unchanged root digest and payload set after delegated processing
+and immediately before publication. The OGDC vertical slice persists the exact
+root digest, source provenance, and inventory in
+`model_training_run_reference.json`. Consumers derive the variant-to-model ID
+mapping and prediction paths from this validated root; a caller-supplied
+summary must match those bindings exactly and cannot redirect reads to an
+external file. A controlled path/provenance rewrite may reseal only an
+orchestrator-owned run that has not been published; an existing or
+caller-supplied run is never silently resealed.
+
 ## A. Model artifact contract
 
 The model artifact is the manifest plus its referenced fitted binary. The

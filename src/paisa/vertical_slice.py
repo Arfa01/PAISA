@@ -29,10 +29,14 @@ from paisa.backtesting.benchmarks import BenchmarkOutcome
 from paisa.backtesting.engine import BacktestOutcome
 from paisa.backtesting.metrics import calculate_drawdowns, calculate_portfolio_metrics
 from paisa.experiments.artifacts import (
+    TrainingRunEvidence,
+    assert_training_run_artifacts_unchanged,
     make_run_id,
+    seal_training_run_artifacts,
     sha256_file,
     to_jsonable,
     utc_now_z,
+    validate_training_run_artifacts,
     write_json,
 )
 from paisa.experiments.evaluation import binary_classification_metrics
@@ -51,6 +55,13 @@ from paisa.experiments.runner import (
     run_experiment,
 )
 from paisa.experiments.trainer import run_training_stage
+from paisa.legacy_cache import (
+    LEGACY_ACQUISITION_MODE,
+    LEGACY_CACHE_PRODUCER,
+    LEGACY_METADATA_FILENAME,
+    MIGRATION_MANIFEST_FILENAME,
+    validate_verified_legacy_bundle,
+)
 from paisa.pipeline import run_v0_pipeline
 from paisa.trading.models import ExperimentConfig
 
@@ -112,6 +123,15 @@ class ValidatedPrices:
     prices_sha256: str
     provenance_path: Path | None = None
     provenance_sha256: str | None = None
+    producer_component: str | None = None
+    acquisition_mode: str | None = None
+    live_fetch_succeeded: bool | None = None
+    original_provider: str | None = None
+    legacy_metadata_preserved: bool = False
+    evidence_files: tuple[tuple[str, Path, str], ...] = ()
+    migration_strategy: str | None = None
+    provenance_strength: str | None = None
+    provenance_limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +240,19 @@ def _snapshot_acquisition(
         provenance_snapshot = _snapshot_file(
             original_provenance, snapshot_dir / "pipeline_metadata.json"
         )
+        try:
+            snapshotted_metadata = _load_json(provenance_snapshot)
+        except (OSError, ValueError, json.JSONDecodeError):
+            # The provenance validator below owns the user-facing diagnostics.
+            # Do not broaden the snapshot based on malformed, untrusted JSON.
+            snapshotted_metadata = {}
+        producer = snapshotted_metadata.get("producer")
+        if isinstance(producer, Mapping) and producer.get("component") == LEGACY_CACHE_PRODUCER:
+            for filename in (LEGACY_METADATA_FILENAME, MIGRATION_MANIFEST_FILENAME):
+                _snapshot_file(
+                    original_provenance.parent / filename,
+                    snapshot_dir / filename,
+                )
     return PriceAcquisition(
         prices_path=prices_snapshot,
         source=acquisition.source,
@@ -244,8 +277,8 @@ def _validate_price_provenance(
     frame: pd.DataFrame,
     prices_sha256: str,
     symbol: str,
-) -> tuple[str, Path, str]:
-    """Authenticate a price CSV against the v0 pipeline's bound metadata."""
+) -> tuple[str, Path, str, dict[str, Any]]:
+    """Authenticate current-pipeline or explicitly migrated legacy evidence."""
 
     metadata_path = (
         Path(provenance_path).expanduser().resolve()
@@ -266,11 +299,56 @@ def _validate_price_provenance(
     if metadata.get("schema_version") != "1.0":
         raise _provenance_error("pipeline metadata must use schema version 1.0")
     producer = _require_mapping(metadata.get("producer"), "pipeline metadata producer")
-    if producer != {
+    current_producer = {
         "component": "paisa.pipeline.run_v0_pipeline",
         "schema_version": "1.0",
         "status": "complete",
-    }:
+    }
+    legacy_producer = {
+        "component": LEGACY_CACHE_PRODUCER,
+        "schema_version": "1.0",
+        "status": "complete",
+    }
+    if producer == legacy_producer:
+        try:
+            legacy = validate_verified_legacy_bundle(
+                prices_path,
+                metadata_path=metadata_path,
+                required_symbol=symbol,
+                frame=frame,
+                prices_sha256=prices_sha256,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise _provenance_error(str(exc)) from exc
+        evidence_files = (
+            (
+                "migration_manifest",
+                Path(legacy["migration_manifest_path"]),
+                str(legacy["migration_manifest_sha256"]),
+            ),
+            (
+                "legacy_pipeline_metadata",
+                Path(legacy["legacy_metadata_path"]),
+                str(legacy["legacy_metadata_sha256"]),
+            ),
+        )
+        return (
+            str(legacy["provider"]),
+            metadata_path,
+            metadata_hash_before,
+            {
+                "producer_component": LEGACY_CACHE_PRODUCER,
+                "acquisition_mode": LEGACY_ACQUISITION_MODE,
+                "live_fetch_succeeded": False,
+                "original_provider": str(legacy["original_provider"]),
+                "legacy_metadata_preserved": True,
+                "evidence_files": evidence_files,
+                "migration_strategy": legacy.get("migration_strategy"),
+                "provenance_strength": legacy.get("provenance_strength"),
+                "provenance_limitations": tuple(legacy.get("limitations", [])),
+            },
+        )
+    if producer != current_producer:
         raise _provenance_error(
             "metadata does not contain a completed PAISA pipeline producer record"
         )
@@ -383,7 +461,22 @@ def _validate_price_provenance(
         "end": dates.max().strftime("%Y-%m-%d"),
     }:
         raise _provenance_error("global date coverage does not match the price CSV")
-    return provider, metadata_path, metadata_hash_before
+    return (
+        provider,
+        metadata_path,
+        metadata_hash_before,
+        {
+            "producer_component": current_producer["component"],
+            "acquisition_mode": None,
+            "live_fetch_succeeded": None,
+            "original_provider": provider,
+            "legacy_metadata_preserved": False,
+            "evidence_files": (),
+            "migration_strategy": None,
+            "provenance_strength": "current_pipeline_checksum_bound_acquisition",
+            "provenance_limitations": (),
+        },
+    )
 
 
 def _inspect_price_file(
@@ -459,8 +552,14 @@ def _inspect_price_file(
         )
     resolved_provenance_path: Path | None = None
     provenance_sha256: str | None = None
+    provenance_details: dict[str, Any] = {}
     if require_real_source:
-        provider, resolved_provenance_path, provenance_sha256 = _validate_price_provenance(
+        (
+            provider,
+            resolved_provenance_path,
+            provenance_sha256,
+            provenance_details,
+        ) = _validate_price_provenance(
             prices_path=source_path,
             provenance_path=provenance_path,
             frame=frame,
@@ -486,6 +585,19 @@ def _inspect_price_file(
         prices_sha256=prices_hash_before,
         provenance_path=resolved_provenance_path,
         provenance_sha256=provenance_sha256,
+        producer_component=provenance_details.get("producer_component"),
+        acquisition_mode=provenance_details.get("acquisition_mode"),
+        live_fetch_succeeded=provenance_details.get("live_fetch_succeeded"),
+        original_provider=provenance_details.get("original_provider"),
+        legacy_metadata_preserved=bool(
+            provenance_details.get("legacy_metadata_preserved", False)
+        ),
+        evidence_files=tuple(provenance_details.get("evidence_files", ())),
+        migration_strategy=provenance_details.get("migration_strategy"),
+        provenance_strength=provenance_details.get("provenance_strength"),
+        provenance_limitations=tuple(
+            provenance_details.get("provenance_limitations", ())
+        ),
     )
 
 
@@ -629,7 +741,7 @@ def _resolve_prices(
         PriceAcquisition(
             prices_path=fallback.path,
             source=fallback.source,
-            mode="cached_real_fallback",
+            mode=fallback.acquisition_mode or "cached_real_fallback",
             date_start=fallback.date_start,
             date_end=fallback.date_end,
             row_count=fallback.row_count,
@@ -686,6 +798,13 @@ def _validate_training_summary(
         )
 
     model_ids = {key: str(model_ids_raw[key]) for key in REQUIRED_VARIANT_IDS}
+    unsafe_model_ids = [
+        model_id for model_id in model_ids.values() if not _SAFE_ID.fullmatch(model_id)
+    ]
+    if unsafe_model_ids:
+        raise ValueError(
+            "Every registered model ID in the training summary must be filesystem-safe"
+        )
     if len(set(model_ids.values())) != len(REQUIRED_VARIANT_IDS):
         raise ValueError("Every trained variant must have a unique registered model ID")
 
@@ -1604,7 +1723,7 @@ def _normalized_price_evidence(
 
 
 def _assert_validated_snapshot_unchanged(validated: ValidatedPrices) -> None:
-    """Fail if either member of an integrity-validated snapshot pair was modified."""
+    """Fail if any member of an integrity-validated snapshot was modified."""
 
     if sha256_file(validated.path) != validated.prices_sha256:
         raise RuntimeError("Authenticated price snapshot changed after validation")
@@ -1613,6 +1732,11 @@ def _assert_validated_snapshot_unchanged(validated: ValidatedPrices) -> None:
             validated.provenance_path
         ) != validated.provenance_sha256:
             raise RuntimeError("Authenticated provenance snapshot changed after validation")
+    for label, path, expected_sha256 in validated.evidence_files:
+        if sha256_file(path) != expected_sha256:
+            raise RuntimeError(
+                f"Authenticated {label} snapshot changed after validation"
+            )
 
 
 def _assert_frozen_prices_match(
@@ -1642,6 +1766,7 @@ def _assert_frozen_prices_match(
 
 def _assert_training_evidence_unchanged(
     *,
+    training_run_evidence: TrainingRunEvidence,
     input_validation: ValidatedPrices,
     frozen_validation: ValidatedPrices,
     prediction_paths: Mapping[str, Path],
@@ -1664,6 +1789,7 @@ def _assert_training_evidence_unchanged(
             raise RuntimeError(
                 f"Training prediction artifact changed after validation: {variant_id}"
             )
+    assert_training_run_artifacts_unchanged(training_run_evidence)
 
 
 def _rewrite_owned_training_paths(
@@ -1699,6 +1825,15 @@ def _rewrite_owned_training_paths(
             "input_snapshot_sha256": validated_prices.prices_sha256,
             "upstream_provenance_sha256": validated_prices.provenance_sha256,
             "vertical_slice_acquisition_mode": acquisition.mode,
+            "live_fetch_succeeded": acquisition.mode == "live_psx_dps",
+            "original_provider": validated_prices.original_provider
+            or validated_prices.source,
+            "legacy_metadata_preserved": validated_prices.legacy_metadata_preserved,
+            "producer_component": validated_prices.producer_component,
+            "additional_provenance_sha256": {
+                label: digest
+                for label, _path, digest in validated_prices.evidence_files
+            },
         }
     )
     data_manifest["acquisition"] = acquisition_details
@@ -1821,6 +1956,31 @@ def run_ogdc_vertical_slice(
                 )
             owned_training_invocation = str(training_summary["invocation_id"])
 
+        training_run_evidence = validate_training_run_artifacts(
+            training_dir,
+            expected_run_id=str(training_summary["run_id"]),
+            expected_invocation_id=str(training_summary["invocation_id"]),
+        )
+        evidence_model_ids = dict(training_run_evidence.model_ids)
+        if model_ids != evidence_model_ids:
+            raise ValueError(
+                "Training summary model IDs do not match the checksum-bound run manifest"
+            )
+        evidence_prediction_paths = {
+            variant_id: (
+                training_run_evidence.run_directory / relative_path
+            ).resolve()
+            for variant_id, relative_path in training_run_evidence.prediction_paths
+        }
+        if prediction_paths != evidence_prediction_paths:
+            raise ValueError(
+                "Training summary prediction paths do not match the registered models' "
+                "checksum-inventoried predictions.csv files"
+            )
+        # Downstream consumers receive only paths derived from validated run
+        # evidence, never caller-selected equivalents outside the run.
+        prediction_paths = evidence_prediction_paths
+
         (
             model_metrics,
             split_counts,
@@ -1862,6 +2022,7 @@ def run_ogdc_vertical_slice(
             for variant_id, path in prediction_paths.items()
         }
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -1882,6 +2043,7 @@ def run_ogdc_vertical_slice(
             backtest_fn=backtesting_callable,
         )
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -1891,6 +2053,36 @@ def run_ogdc_vertical_slice(
         )
         if len({outcome.config.portfolio_id for outcome in outcomes.values()}) != 4:
             raise AssertionError("Each model experiment must have a unique portfolio ID")
+
+        # A default training run is still private here, so the orchestrator may
+        # finalize its owned public-path and acquisition metadata. Resealing is
+        # deliberately restricted to this owned, unpublished run; custom
+        # trainer output is never rewritten or accepted via resealing.
+        if pending_training_root is not None:
+            _rewrite_owned_training_paths(
+                training_dir=training_dir,
+                public_training_dir=final_training_dir,
+                acquisition=acquisition,
+                validated_prices=input_validation,
+            )
+            training_run_evidence = seal_training_run_artifacts(training_dir)
+            if (
+                training_run_evidence.run_id != str(training_summary["run_id"])
+                or training_run_evidence.invocation_id
+                != str(training_summary["invocation_id"])
+            ):
+                raise RuntimeError(
+                    "Resealed training run identity changed during owned metadata finalization"
+                )
+            _assert_training_evidence_unchanged(
+                training_run_evidence=training_run_evidence,
+                input_validation=input_validation,
+                frozen_validation=frozen_validation,
+                prediction_paths=prediction_paths,
+                prediction_sha256=prediction_sha256,
+                symbol=symbol,
+                start=start,
+            )
 
         final_prediction_paths = {
             variant_id: final_training_dir
@@ -1927,13 +2119,37 @@ def run_ogdc_vertical_slice(
             "training_invocation_id": training_summary["invocation_id"],
             "artifact_directory": str(final_training_dir),
             "run_manifest_path": str(final_training_dir / "run_manifest.json"),
-            "run_manifest_sha256": sha256_file(training_dir / "run_manifest.json"),
+            "run_manifest_sha256": training_run_evidence.run_manifest_sha256,
+            "training_source_provenance": {
+                "code_version": training_run_evidence.code_version,
+                "dirty_tree": training_run_evidence.dirty_tree,
+                "source_fingerprint": training_run_evidence.source_fingerprint,
+            },
+            "training_artifact_inventory": {
+                "algorithm": "sha256",
+                "root": ".",
+                "excludes": ["run_manifest.json"],
+                "files": [
+                    {"path": path, "sha256": checksum}
+                    for path, checksum in training_run_evidence.artifact_sha256
+                ],
+            },
             "frozen_prices_path": str(
                 final_training_dir / frozen_prices.relative_to(training_dir)
             ),
             "frozen_prices_sha256": sha256_file(frozen_prices),
             "input_prices_sha256": input_validation.prices_sha256,
             "upstream_provenance_sha256": input_validation.provenance_sha256,
+            "acquisition_mode": acquisition.mode,
+            "live_fetch_succeeded": acquisition.mode == "live_psx_dps",
+            "original_provider": input_validation.original_provider
+            or input_validation.source,
+            "legacy_metadata_preserved": input_validation.legacy_metadata_preserved,
+            "provenance_producer_component": input_validation.producer_component,
+            "additional_provenance_sha256": {
+                label: digest
+                for label, _path, digest in input_validation.evidence_files
+            },
             "model_ids": model_ids,
             "prediction_paths": {
                 key: str(value) for key, value in final_prediction_paths.items()
@@ -1977,10 +2193,18 @@ def run_ogdc_vertical_slice(
             warnings.append(
                 "Live PSX acquisition failed; a separately validated cached real-data file was used."
             )
-            warnings.append(
-                "The cached CSV was accepted only with pipeline acquisition metadata bound "
-                "to its exact checksum, provider, symbol coverage, dates, and row count."
-            )
+            if input_validation.legacy_metadata_preserved:
+                warnings.append(
+                    "The cached input is a verified legacy reconstruction, not a new live "
+                    "fetch. Its original metadata and migration manifest are preserved and "
+                    "checksum-bound to the reconstructed prices."
+                )
+                warnings.extend(input_validation.provenance_limitations)
+            else:
+                warnings.append(
+                    "The cached CSV was accepted only with pipeline acquisition metadata bound "
+                    "to its exact checksum, provider, symbol coverage, dates, and row count."
+                )
         if not acquisition.is_real_data:
             warnings.append(
                 "Fixture-based test run: this output is not a real-data vertical-slice result."
@@ -2017,10 +2241,22 @@ def run_ogdc_vertical_slice(
                 "data_source": {
                     "source": frozen_validation.source,
                     "mode": acquisition.mode,
+                    "acquisition_mode": acquisition.mode,
                     "is_real_data": acquisition.is_real_data,
+                    "live_fetch_succeeded": acquisition.mode == "live_psx_dps",
+                    "original_provider": input_validation.original_provider
+                    or frozen_validation.source,
+                    "legacy_metadata_preserved": input_validation.legacy_metadata_preserved,
+                    "producer_component": input_validation.producer_component,
                     "input_prices_sha256": input_validation.prices_sha256,
                     "frozen_prices_sha256": sha256_file(frozen_prices),
                     "provenance_sha256": input_validation.provenance_sha256,
+                    "additional_provenance_sha256": {
+                        label: digest
+                        for label, _path, digest in input_validation.evidence_files
+                    },
+                    "migration_strategy": input_validation.migration_strategy,
+                    "provenance_strength": input_validation.provenance_strength,
                     "actual_ogdc_date_range": {
                         "start": frozen_validation.date_start,
                         "end": frozen_validation.date_end,
@@ -2111,6 +2347,7 @@ def run_ogdc_vertical_slice(
         write_json(manifest, stage_dir / "manifest.json")
 
         _assert_training_evidence_unchanged(
+            training_run_evidence=training_run_evidence,
             input_validation=input_validation,
             frozen_validation=frozen_validation,
             prediction_paths=prediction_paths,
@@ -2124,12 +2361,6 @@ def run_ogdc_vertical_slice(
                 f"Vertical-slice run already exists; refusing to overwrite: {destination}"
             )
         if pending_training_root is not None:
-            _rewrite_owned_training_paths(
-                training_dir=training_dir,
-                public_training_dir=final_training_dir,
-                acquisition=acquisition,
-                validated_prices=input_validation,
-            )
             if final_training_dir.exists():
                 raise FileExistsError(
                     "Model-training run already exists; refusing to overwrite: "
@@ -2137,6 +2368,20 @@ def run_ogdc_vertical_slice(
                 )
             os.rename(training_dir, final_training_dir)
             published_training_dir = final_training_dir
+            published_evidence = validate_training_run_artifacts(
+                final_training_dir,
+                expected_run_id=training_run_evidence.run_id,
+                expected_invocation_id=training_run_evidence.invocation_id,
+            )
+            if (
+                published_evidence.run_manifest_sha256
+                != training_run_evidence.run_manifest_sha256
+                or published_evidence.artifact_sha256
+                != training_run_evidence.artifact_sha256
+            ):
+                raise RuntimeError(
+                    "Published training run differs from its validated private evidence"
+                )
             if pending_training_root.exists():
                 shutil.rmtree(pending_training_root)
         os.rename(stage_dir, destination)

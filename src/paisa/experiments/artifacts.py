@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 from importlib import metadata
 import json
@@ -774,6 +775,391 @@ def _open_regular_file(path: Path, *, field_name: str):
     except Exception:
         os.close(descriptor)
         raise
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingRunEvidence:
+    """Immutable checksum baseline for one complete training-run directory."""
+
+    run_directory: Path
+    run_id: str
+    invocation_id: str
+    run_manifest_sha256: str
+    artifact_sha256: tuple[tuple[str, str], ...]
+    code_version: str
+    dirty_tree: bool
+    source_fingerprint: str
+    model_ids: tuple[tuple[str, str], ...]
+    prediction_paths: tuple[tuple[str, str], ...]
+
+
+_TRAINING_RUN_MANIFEST = "run_manifest.json"
+_TRAINING_INVENTORY_FIELDS = {"algorithm", "root", "excludes", "files"}
+_TRAINING_INVENTORY_ENTRY_FIELDS = {"path", "sha256"}
+
+
+def _training_run_directory(run_dir: str | Path) -> Path:
+    candidate = Path(run_dir)
+    if candidate.is_symlink():
+        raise ValueError(f"Training-run directory must not be a symlink: {candidate}")
+    try:
+        root = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Training-run directory is missing: {candidate}") from exc
+    if not root.is_dir():
+        raise FileNotFoundError(f"Training-run directory is missing: {candidate}")
+    return root
+
+
+def _regular_file_sha256(path: Path, *, field_name: str) -> str:
+    digest = hashlib.sha256()
+    with _open_regular_file(path, field_name=field_name) as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_regular_json(path: Path, *, field_name: str) -> tuple[dict[str, Any], str]:
+    with _open_regular_file(path, field_name=field_name) as handle:
+        payload = handle.read()
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{field_name} must contain valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return value, hashlib.sha256(payload).hexdigest()
+
+
+def _training_payload_files(root: Path) -> dict[str, Path]:
+    """Return every regular run payload, rejecting links and special files."""
+
+    files: dict[str, Path] = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"Training-run artifacts must not contain symlinks: {relative}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(
+                f"Training-run artifacts must be regular files or directories: {relative}"
+            )
+        if relative == _TRAINING_RUN_MANIFEST:
+            continue
+        files[relative] = path
+    return files
+
+
+def _build_training_inventory(root: Path) -> dict[str, Any]:
+    files = _training_payload_files(root)
+    return {
+        "algorithm": "sha256",
+        "root": ".",
+        "excludes": [_TRAINING_RUN_MANIFEST],
+        "files": [
+            {
+                "path": relative,
+                "sha256": _regular_file_sha256(
+                    files[relative], field_name=f"Training artifact {relative}"
+                ),
+            }
+            for relative in sorted(files)
+        ],
+    }
+
+
+def _validate_run_source_provenance(manifest: Mapping[str, Any]) -> tuple[str, bool, str]:
+    code_version = str(manifest.get("code_version", "")).strip()
+    dirty_tree = manifest.get("dirty_tree")
+    fingerprint = str(manifest.get("source_fingerprint", "")).strip()
+    if not code_version:
+        raise ValueError("Training run code_version must be non-empty")
+    if not isinstance(dirty_tree, bool):
+        raise ValueError("Training run dirty_tree must be boolean")
+    if not fingerprint:
+        raise ValueError("Training run source_fingerprint must be non-empty")
+    if dirty_tree and not _SHA256.fullmatch(fingerprint):
+        raise ValueError(
+            "A dirty training run source_fingerprint must be a lowercase SHA-256 digest"
+        )
+    return code_version, dirty_tree, fingerprint
+
+
+def _parse_training_inventory(manifest: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    inventory = _require_mapping(
+        manifest.get("artifact_inventory"), field_name="artifact_inventory"
+    )
+    if set(inventory) != _TRAINING_INVENTORY_FIELDS:
+        raise ValueError(
+            "artifact_inventory must contain exactly algorithm, root, excludes, and files"
+        )
+    if inventory["algorithm"] != "sha256" or inventory["root"] != ".":
+        raise ValueError("artifact_inventory must use SHA-256 relative to the run root")
+    if inventory["excludes"] != [_TRAINING_RUN_MANIFEST]:
+        raise ValueError("artifact_inventory may exclude only run_manifest.json")
+    raw_files = inventory["files"]
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("artifact_inventory.files must be a non-empty array")
+
+    parsed: list[tuple[str, str]] = []
+    for index, entry in enumerate(raw_files):
+        item = _require_mapping(entry, field_name=f"artifact_inventory.files[{index}]")
+        if set(item) != _TRAINING_INVENTORY_ENTRY_FIELDS:
+            raise ValueError(
+                "Every artifact_inventory file must contain exactly path and sha256"
+            )
+        relative = _safe_relative_path(
+            item["path"], field_name=f"artifact_inventory.files[{index}].path"
+        ).as_posix()
+        if relative == _TRAINING_RUN_MANIFEST:
+            raise ValueError("run_manifest.json must not be included in its own inventory")
+        checksum = str(item["sha256"])
+        if not _SHA256.fullmatch(checksum):
+            raise ValueError(
+                f"artifact_inventory checksum must be lowercase SHA-256: {relative}"
+            )
+        parsed.append((relative, checksum))
+    if parsed != sorted(parsed, key=lambda item: item[0]):
+        raise ValueError("artifact_inventory files must be sorted by path")
+    if len({path for path, _checksum in parsed}) != len(parsed):
+        raise ValueError("artifact_inventory must not contain duplicate paths")
+    return tuple(parsed)
+
+
+def _inventoried_json(
+    root: Path,
+    relative: str,
+    expected_sha256: Mapping[str, str],
+    *,
+    field_name: str,
+) -> dict[str, Any]:
+    path = root.joinpath(*PurePosixPath(relative).parts)
+    value, checksum = _read_regular_json(path, field_name=field_name)
+    if checksum != expected_sha256[relative]:
+        raise ValueError(f"Training artifact checksum mismatch: {relative}")
+    return value
+
+
+def seal_training_run_artifacts(
+    run_dir: str | Path,
+    run_manifest: Mapping[str, Any] | None = None,
+) -> TrainingRunEvidence:
+    """Write the deterministic payload inventory and validate the sealed run.
+
+    Supplying no manifest intentionally reseals an owned, unpublished run after
+    a controlled metadata rewrite. Callers must never use resealing to accept
+    changes made by untrusted callbacks.
+    """
+
+    root = _training_run_directory(run_dir)
+    manifest_path = root / _TRAINING_RUN_MANIFEST
+    if manifest_path.is_symlink():
+        raise ValueError("Training run manifest must not be a symlink")
+    if run_manifest is None:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Training run manifest is missing: {manifest_path}")
+        value, _checksum = _read_regular_json(
+            manifest_path, field_name="Training run manifest"
+        )
+    else:
+        value = deepcopy(dict(run_manifest))
+    _validate_run_source_provenance(value)
+    value["artifact_inventory"] = _build_training_inventory(root)
+    write_json(value, manifest_path)
+    return validate_training_run_artifacts(root)
+
+
+def validate_training_run_artifacts(
+    run_dir: str | Path,
+    *,
+    expected_run_id: str | None = None,
+    expected_invocation_id: str | None = None,
+) -> TrainingRunEvidence:
+    """Validate a complete training run without deserializing executable code."""
+
+    root = _training_run_directory(run_dir)
+    manifest_path = root / _TRAINING_RUN_MANIFEST
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Training run manifest is missing: {manifest_path}")
+    manifest, run_manifest_sha256 = _read_regular_json(
+        manifest_path, field_name="Training run manifest"
+    )
+    if manifest.get("schema_version") != "1.0":
+        raise ValueError("Training run schema_version must be '1.0'")
+    run_id = str(manifest.get("run_id", "")).strip()
+    invocation_id = str(manifest.get("invocation_id", "")).strip()
+    if not _SAFE_ID.fullmatch(run_id):
+        raise ValueError("Training run_id is missing or not filesystem-safe")
+    if not invocation_id:
+        raise ValueError("Training invocation_id must be non-empty")
+    if expected_run_id is not None and run_id != str(expected_run_id):
+        raise ValueError("Training run_id does not match the expected run")
+    if expected_invocation_id is not None and invocation_id != str(
+        expected_invocation_id
+    ):
+        raise ValueError("Training invocation_id does not match the expected invocation")
+    code_version, dirty_tree, fingerprint = _validate_run_source_provenance(manifest)
+
+    inventory = _parse_training_inventory(manifest)
+    expected_sha256 = dict(inventory)
+    actual_files = _training_payload_files(root)
+    expected_paths = set(expected_sha256)
+    actual_paths = set(actual_files)
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        unexpected = sorted(actual_paths - expected_paths)
+        raise ValueError(
+            "Training artifact paths must exactly match the inventory; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for relative, expected in inventory:
+        actual = _regular_file_sha256(
+            actual_files[relative], field_name=f"Training artifact {relative}"
+        )
+        if actual != expected:
+            raise ValueError(
+                f"Training artifact checksum mismatch: {relative}; "
+                f"expected {expected}, got {actual}"
+            )
+
+    for field, required_path in (
+        ("data_manifest", "data_manifest.json"),
+        ("split_manifest", "split_manifest.json"),
+    ):
+        relative = _safe_relative_path(
+            manifest.get(field, ""), field_name=f"Training run {field}"
+        ).as_posix()
+        if relative != required_path or relative not in expected_sha256:
+            raise ValueError(
+                f"Training run {field} must identify its checksum-inventoried root file"
+            )
+
+    models = manifest.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValueError("Training run models must be a non-empty array")
+    registered_manifest_paths: set[str] = set()
+    variants: set[str] = set()
+    registered_ids: set[str] = set()
+    registered_by_variant: dict[str, str] = {}
+    for index, record in enumerate(models):
+        item = _require_mapping(record, field_name=f"models[{index}]")
+        registered_id = str(item.get("model_id", ""))
+        variant_id = str(item.get("variant_id", ""))
+        if not _SAFE_ID.fullmatch(registered_id) or not _SAFE_ID.fullmatch(variant_id):
+            raise ValueError("Training run model and variant IDs must be filesystem-safe")
+        if registered_id in registered_ids or variant_id in variants:
+            raise ValueError("Training run model and variant IDs must be unique")
+        registered_ids.add(registered_id)
+        variants.add(variant_id)
+        registered_by_variant[variant_id] = registered_id
+        if item.get("invocation_id") != invocation_id:
+            raise ValueError("Training model record invocation_id does not match the run")
+        relative = _safe_relative_path(
+            item.get("manifest_path", ""), field_name=f"models[{index}].manifest_path"
+        ).as_posix()
+        expected_relative = f"models/{registered_id}/{MANIFEST_FILENAME}"
+        if relative != expected_relative or relative not in expected_sha256:
+            raise ValueError("Training model manifest path is invalid or not inventoried")
+        registered_manifest_paths.add(relative)
+        model_manifest = validate_model_manifest(
+            _inventoried_json(
+                root,
+                relative,
+                expected_sha256,
+                field_name=f"Model manifest {registered_id}",
+            )
+        )
+        if model_manifest["model_id"] != registered_id:
+            raise ValueError("Training model manifest identity does not match its record")
+        if model_manifest.get("variant_id") != variant_id:
+            raise ValueError("Training model manifest variant does not match its record")
+        if model_manifest.get("invocation_id") != invocation_id:
+            raise ValueError("Training model manifest invocation_id does not match the run")
+        for field, expected in (
+            ("code_version", code_version),
+            ("dirty_tree", dirty_tree),
+            ("source_fingerprint", fingerprint),
+        ):
+            if model_manifest.get(field) != expected:
+                raise ValueError(
+                    f"Training model manifest {field} does not match run-level provenance"
+                )
+        if item.get("artifact_sha256") != model_manifest["artifact_sha256"]:
+            raise ValueError("Training model binary checksum disagrees with its run record")
+        artifact_relative = PurePosixPath(
+            "models", *PurePosixPath(model_manifest["artifact_path"]).parts
+        ).as_posix()
+        if expected_sha256.get(artifact_relative) != model_manifest["artifact_sha256"]:
+            raise ValueError("Training model binary is not transitively checksum-bound")
+
+    observed_manifest_paths = {
+        relative
+        for relative in expected_paths
+        if len(PurePosixPath(relative).parts) == 3
+        and PurePosixPath(relative).parts[0] == "models"
+        and PurePosixPath(relative).name == MANIFEST_FILENAME
+    }
+    if observed_manifest_paths != registered_manifest_paths:
+        raise ValueError("Training model manifests do not exactly match registered models")
+
+    prediction_paths = _require_mapping(
+        manifest.get("prediction_paths"), field_name="prediction_paths"
+    )
+    if set(prediction_paths) != variants:
+        raise ValueError("Training prediction paths must exactly match registered variants")
+    validated_prediction_paths: dict[str, str] = {}
+    for variant_id, raw_path in prediction_paths.items():
+        relative = _safe_relative_path(
+            raw_path, field_name=f"prediction_paths.{variant_id}"
+        ).as_posix()
+        expected_path = (
+            f"models/{registered_by_variant[str(variant_id)]}/predictions.csv"
+        )
+        if relative != expected_path or relative not in expected_sha256:
+            raise ValueError(
+                "Training prediction path does not identify its registered model's "
+                "checksum-inventoried predictions.csv"
+            )
+        validated_prediction_paths[str(variant_id)] = relative
+
+    return TrainingRunEvidence(
+        run_directory=root,
+        run_id=run_id,
+        invocation_id=invocation_id,
+        run_manifest_sha256=run_manifest_sha256,
+        artifact_sha256=inventory,
+        code_version=code_version,
+        dirty_tree=dirty_tree,
+        source_fingerprint=fingerprint,
+        model_ids=tuple(sorted(registered_by_variant.items())),
+        prediction_paths=tuple(sorted(validated_prediction_paths.items())),
+    )
+
+
+def assert_training_run_artifacts_unchanged(evidence: TrainingRunEvidence) -> None:
+    """Reassert a previously captured run checksum baseline without resealing."""
+
+    root = _training_run_directory(evidence.run_directory)
+    manifest_path = root / _TRAINING_RUN_MANIFEST
+    current_manifest_sha256 = _regular_file_sha256(
+        manifest_path, field_name="Training run manifest"
+    )
+    if current_manifest_sha256 != evidence.run_manifest_sha256:
+        raise RuntimeError("Training run manifest changed after validation")
+
+    expected = dict(evidence.artifact_sha256)
+    actual_files = _training_payload_files(root)
+    if set(actual_files) != set(expected):
+        raise RuntimeError("Training run artifact set changed after validation")
+    for relative, expected_sha256 in evidence.artifact_sha256:
+        actual_sha256 = _regular_file_sha256(
+            actual_files[relative], field_name=f"Training artifact {relative}"
+        )
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"Training artifact changed after validation: {relative}"
+            )
 
 
 def _read_registered_manifest(

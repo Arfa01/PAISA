@@ -49,8 +49,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Previously cleaned real PSX file considered only when the live "
             "psx-dps request fails. Its directory must contain the matching "
-            "pipeline_metadata.json whose prices_artifact binds the exact CSV "
-            "checksum, provider, daily frequency, row count, and OGDC coverage. "
+            "schema-1.0 pipeline_metadata.json whose prices_artifact binds the exact "
+            "CSV checksum, provider, daily frequency, row count, and OGDC coverage. "
+            "A verified legacy bundle must also contain its checksum-bound "
+            "migration_manifest.json and preserved legacy_pipeline_metadata.json. "
             "Sample/synthetic/fixture, mixed, blank, or stale provenance is rejected."
         ),
     )

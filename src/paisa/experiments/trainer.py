@@ -34,6 +34,7 @@ from paisa.experiments.artifacts import (
     make_run_id,
     make_zip_from_directory,
     package_versions,
+    seal_training_run_artifacts,
     sha256_file,
     sha256_frame,
     to_jsonable,
@@ -828,6 +829,9 @@ def run_training_stage(
             "run_id": resolved_run_id,
             "invocation_id": invocation_id,
             "created_at": utc_now_z(),
+            "code_version": code_version,
+            "dirty_tree": dirty_tree,
+            "source_fingerprint": source_fingerprint,
             "symbol": prepared.symbol,
             "source_frequency": SOURCE_FREQUENCY,
             "target_definition": TARGET_POSITIVE_CLASS_CONDITION,
@@ -840,7 +844,6 @@ def run_training_stage(
             "prediction_paths": prediction_paths,
             "disclaimer": "Academic model output; not financial advice.",
         }
-        write_json(run_manifest, stage_dir / "run_manifest.json")
 
         persisted_summary = to_jsonable({
             "run_id": resolved_run_id,
@@ -864,6 +867,11 @@ def run_training_stage(
         write_json(
             persisted_summary, stage_dir / "reports" / "final_summary.json"
         )
+
+        # The root manifest is written last because its deterministic inventory
+        # covers every other run payload, including final_summary.json and all
+        # model manifests, metrics, predictions, and configuration files.
+        seal_training_run_artifacts(stage_dir, run_manifest)
 
         stage_dir.rename(final_run_dir)
     except Exception:

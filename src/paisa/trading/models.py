@@ -152,6 +152,19 @@ def _required_class(value: object, field_name: str) -> int:
     return int(parsed)
 
 
+def _integer_value(value: object, field_name: str) -> int:
+    """Parse a canonical integer without accepting booleans or decimal text."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", text):
+        raise ValueError(f"{field_name} must be an integer")
+    return int(text)
+
+
 def _action_value(value: object) -> "Action":
     if isinstance(value, Action):
         return value
@@ -406,6 +419,29 @@ class SignalRecord:
 
         return self.target_date
 
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "SignalRecord":
+        target_allocation = row["target_allocation"]
+        if target_allocation is None or (
+            isinstance(target_allocation, str) and not target_allocation.strip()
+        ):
+            target_allocation = None
+        return cls(
+            schema_version=row["schema_version"],
+            signal_id=row["signal_id"],
+            portfolio_id=row["portfolio_id"],
+            model_id=row["model_id"],
+            ticker=row["ticker"],
+            signal_date=row["signal_date"],
+            target_date=row["target_date"],
+            action=row["action"],
+            probability_up=row["probability_up"],
+            target_allocation=target_allocation,
+            reason=row["reason"],
+        )
+
+    from_dict = from_mapping
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -474,6 +510,27 @@ class TradeRecord:
         object.__setattr__(self, "fee", fee)
         object.__setattr__(self, "cash_after_trade", cash)
 
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "TradeRecord":
+        return cls(
+            schema_version=row["schema_version"],
+            trade_id=row["trade_id"],
+            portfolio_id=row["portfolio_id"],
+            signal_date=row["signal_date"],
+            execution_date=row["execution_date"],
+            action=row["action"],
+            quantity=_integer_value(row["quantity"], "quantity"),
+            reference_price=row["reference_price"],
+            execution_price=row["execution_price"],
+            fee=row["fee"],
+            cash_after_trade=row["cash_after_trade"],
+            shares_after_trade=_integer_value(
+                row["shares_after_trade"], "shares_after_trade"
+            ),
+        )
+
+    from_dict = from_mapping
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -533,6 +590,23 @@ class PortfolioSnapshot:
         object.__setattr__(self, "total_equity", equity)
         object.__setattr__(self, "realized_profit_loss", realized)
         object.__setattr__(self, "unrealized_profit_loss", unrealized)
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "PortfolioSnapshot":
+        return cls(
+            schema_version=row["schema_version"],
+            portfolio_id=row["portfolio_id"],
+            date=row["date"],
+            cash=row["cash"],
+            shares=_integer_value(row["shares"], "shares"),
+            market_price=row["market_price"],
+            position_value=row["position_value"],
+            total_equity=row["total_equity"],
+            realized_profit_loss=row["realized_profit_loss"],
+            unrealized_profit_loss=row["unrealized_profit_loss"],
+        )
+
+    from_dict = from_mapping
 
     def to_dict(self) -> dict[str, Any]:
         return {

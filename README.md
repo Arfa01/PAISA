@@ -174,6 +174,67 @@ See [the backtesting runbook](docs/BACKTESTING.md) for the exact CSV schemas,
 configuration, execution timing, accounting rules, metric formulas, and output
 tree. All backtests are academic simulations and are not financial advice.
 
+## OGDC end-to-end vertical slice
+
+The vertical-slice runner joins the versioned components into one reproducible
+real-data workflow: fetch and clean daily OGDC data, train `M-001` through
+`M-004`, pass each model's untouched test predictions directly to an isolated
+portfolio backtest, calculate cash-only and buy-and-hold benchmarks, and publish
+one comparison report.
+
+Install the normal, machine-learning, backtesting, and test dependencies from
+the aggregate requirements file, then run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+python -m pip check
+python -m pytest
+python scripts/run_ogdc_vertical_slice.py
+```
+
+The live command uses `psx-dps`. It never substitutes the sample provider or
+synthetic data. If the live request fails, it may use
+`data/processed/psx_prices.csv` only when the same directory also contains the
+`pipeline_metadata.json` produced with that exact CSV. The metadata must bind
+the CSV checksum, real provider, daily frequency, row count, and OGDC symbol
+coverage, and record a completed PAISA pipeline producer plus successful raw
+OGDC acquisition with no provider error. Source values in the CSV must also
+agree with that provider. A CSV alone, stale or incomplete metadata, relabelled
+fixture data, or mixed/blank provenance is rejected.
+
+The selected CSV and provenance metadata are first copied to an
+invocation-private working snapshot before either validation or training, so
+later changes to the source cache cannot change the run. On success, that exact
+CSV and, for real data, its `pipeline_metadata.json` are retained under the
+published bundle's `input_snapshot/` directory as checksum-inventoried input
+evidence. A model-training run is published only after all four backtests and
+persisted-evidence checks pass. The runner rechecks the trainer's frozen price
+file and all four prediction-file checksums after backtesting and immediately
+before publication, so a callback cannot change the model evidence mid-run; a
+handled late failure rolls back artifacts owned by that invocation. Successful
+outputs are immutable under
+`artifacts/vertical_slice/<vertical_slice_run_id>/`, and an existing run ID is
+never overwritten. Each completed bundle retains the four full backtesting
+trees under `experiments/<experiment_id>/`; aggregate metrics and curves are
+rebuilt and reconciled from those persisted ledgers rather than trusted only
+from in-memory results.
+
+The common experiment allocates at most 50% of equity to OGDC. That same cap
+also applies to buy-and-hold, so this is a 50%-allocated buy-and-hold benchmark
+with the balance left in cash, not a fully invested benchmark. The model target
+measures next-session close versus feature-date close, while simulated trades
+execute at the next observed session's open and earn returns from that point
+onward. Prediction quality and simulated portfolio profitability are therefore
+reported separately.
+
+See [the OGDC vertical-slice runbook](docs/OGDC_VERTICAL_SLICE.md) for the exact
+assumptions, fallback rules, artifact tree, report semantics, and limitations.
+All outputs are academic simulations and are not financial advice.
+
 ## API endpoints
 
 | Endpoint | Purpose |

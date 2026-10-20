@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,74 @@ from paisa.models.baseline import train_baseline_random_forest
 from paisa.preprocessing import combine_price_frames, standardize_price_frame
 from paisa.providers import get_provider
 from paisa.storage import ensure_dirs, save_csv, save_json
+
+
+PRICE_ARTIFACT_SCHEMA_VERSION = "1.0"
+PIPELINE_METADATA_SCHEMA_VERSION = "1.0"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_prices_artifact(path: Path, *, provider: str) -> dict[str, Any]:
+    """Describe the exact standardized price CSV written by this pipeline run."""
+
+    saved = pd.read_csv(path)
+    required = {"date", "ticker", "source"}
+    missing = sorted(required - set(saved.columns))
+    if missing:
+        raise ValueError(
+            f"Saved price artifact is missing provenance columns: {missing}"
+        )
+    if saved.empty:
+        raise ValueError("Saved price artifact cannot be empty")
+
+    canonical_provider = str(provider).strip().lower()
+    if not canonical_provider:
+        raise ValueError("Price artifact provider cannot be blank")
+
+    source_values = saved["source"].astype("string")
+    invalid_source = source_values.isna() | source_values.str.strip().eq("")
+    if invalid_source.any():
+        invalid_rows = saved.index[invalid_source].tolist()
+        raise ValueError(
+            "Saved price artifact contains blank or null source values at "
+            f"rows: {invalid_rows}"
+        )
+
+    saved["date"] = pd.to_datetime(saved["date"], errors="raise")
+    saved["ticker"] = saved["ticker"].astype(str).str.strip().str.upper()
+    saved["source"] = source_values.str.strip().str.lower()
+    coverage: dict[str, dict[str, Any]] = {}
+    for symbol, rows in saved.groupby("ticker", sort=True):
+        sources = sorted(set(rows["source"].tolist()))
+        if sources != [canonical_provider]:
+            raise ValueError(
+                f"Saved price artifact sources for {symbol} do not match "
+                f"provider {canonical_provider!r}: {sources}"
+            )
+        coverage[str(symbol)] = {
+            "row_count": int(len(rows)),
+            "date_start": rows["date"].min().strftime("%Y-%m-%d"),
+            "date_end": rows["date"].max().strftime("%Y-%m-%d"),
+            "source": canonical_provider,
+        }
+
+    return {
+        "schema_version": PRICE_ARTIFACT_SCHEMA_VERSION,
+        "status": "complete",
+        "path": path.name,
+        "sha256": _sha256_file(path),
+        "provider": canonical_provider,
+        "frequency": "daily",
+        "row_count": int(len(saved)),
+        "symbols": coverage,
+    }
 
 
 def run_v0_pipeline(
@@ -56,7 +125,8 @@ def run_v0_pipeline(
     features = build_features(prices)
     dataset = build_ml_dataset(features)
 
-    save_csv(prices, paths.processed_dir / "psx_prices.csv")
+    prices_path = paths.processed_dir / "psx_prices.csv"
+    save_csv(prices, prices_path)
     save_csv(features, paths.processed_dir / "psx_features.csv")
     save_csv(dataset, paths.processed_dir / "ml_dataset.csv")
 
@@ -65,12 +135,22 @@ def run_v0_pipeline(
         metrics = train_baseline_random_forest(dataset, paths.model_dir)
 
     metadata: dict[str, Any] = {
+        "schema_version": PIPELINE_METADATA_SCHEMA_VERSION,
+        "producer": {
+            "component": "paisa.pipeline.run_v0_pipeline",
+            "schema_version": PIPELINE_METADATA_SCHEMA_VERSION,
+            "status": "complete",
+        },
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "provider": provider.source_name,
         "symbols_requested": [s.upper().strip() for s in symbols],
         "raw_row_counts": raw_row_counts,
         "errors": errors,
         "prices_rows": int(len(prices)),
+        "prices_artifact": _build_prices_artifact(
+            prices_path,
+            provider=provider.source_name,
+        ),
         "features_rows": int(len(features)),
         "ml_dataset_rows": int(len(dataset)),
         "date_range": {

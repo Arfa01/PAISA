@@ -14,9 +14,21 @@ from paisa.backtesting.metrics import (
     calculate_portfolio_metrics,
     calculate_prediction_metrics,
 )
-from paisa.backtesting.reports import write_experiment_report
+from paisa.backtesting.reports import (
+    SIGNAL_FIELDS,
+    SNAPSHOT_FIELDS,
+    TRADE_FIELDS,
+    write_experiment_report,
+)
 from paisa.experiments.portfolio_registry import PortfolioRegistry
-from paisa.trading.models import ExperimentConfig, MarketBar, PredictionRecord
+from paisa.trading.models import (
+    ExperimentConfig,
+    MarketBar,
+    PortfolioSnapshot,
+    PredictionRecord,
+    SignalRecord,
+    TradeRecord,
+)
 from paisa.trading.portfolio import assert_independent_ledgers
 
 
@@ -69,6 +81,23 @@ def _read_rows(path: str | Path, required_columns: set[str]) -> list[dict[str, s
         return [dict(row) for row in reader]
 
 
+def _read_report_rows(
+    path: str | Path, expected_columns: list[str]
+) -> list[dict[str, str]]:
+    """Read an immutable report CSV with its exact ordered schema."""
+
+    source_path = Path(path)
+    with source_path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        actual_columns = tuple(reader.fieldnames or ())
+        expected = tuple(expected_columns)
+        if actual_columns != expected:
+            raise ValueError(
+                f"CSV {source_path} has columns {actual_columns}; expected {expected}"
+            )
+        return [dict(row) for row in reader]
+
+
 def load_predictions(path: str | Path) -> tuple[PredictionRecord, ...]:
     rows = _read_rows(path, PREDICTION_COLUMNS)
     return tuple(PredictionRecord.from_mapping(row) for row in rows)
@@ -77,6 +106,27 @@ def load_predictions(path: str | Path) -> tuple[PredictionRecord, ...]:
 def load_market_bars(path: str | Path) -> tuple[MarketBar, ...]:
     rows = _read_rows(path, PRICE_COLUMNS)
     return tuple(MarketBar.from_mapping(row) for row in rows)
+
+
+def load_signals(path: str | Path) -> tuple[SignalRecord, ...]:
+    """Load and validate a persisted ``signals.csv`` report."""
+
+    rows = _read_report_rows(path, SIGNAL_FIELDS)
+    return tuple(SignalRecord.from_mapping(row) for row in rows)
+
+
+def load_trades(path: str | Path) -> tuple[TradeRecord, ...]:
+    """Load and validate a persisted strategy or benchmark trade ledger."""
+
+    rows = _read_report_rows(path, TRADE_FIELDS)
+    return tuple(TradeRecord.from_mapping(row) for row in rows)
+
+
+def load_portfolio_snapshots(path: str | Path) -> tuple[PortfolioSnapshot, ...]:
+    """Load and validate a persisted portfolio snapshot ledger."""
+
+    rows = _read_report_rows(path, SNAPSHOT_FIELDS)
+    return tuple(PortfolioSnapshot.from_mapping(row) for row in rows)
 
 
 def _metric_options(config: ExperimentConfig) -> dict[str, Any]:

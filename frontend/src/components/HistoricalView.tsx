@@ -6,11 +6,17 @@ import {
   type PaisaApiClient,
 } from "../api/client";
 import type {
+  HistoricalPriceRow,
   HistoricalPricesResponse,
   VerticalSliceDetailResponse,
   VerticalSliceSummaryResponse,
 } from "../api/types";
-import { formatDate, formatInteger, humanize } from "../utils/format";
+import {
+  finiteNumber,
+  formatDate,
+  formatInteger,
+  humanize,
+} from "../utils/format";
 import { Plot } from "./Plot";
 
 interface HistoricalViewProps {
@@ -27,6 +33,38 @@ const chartConfig = {
 
 function isCancelled(error: unknown): boolean {
   return error instanceof ApiError && error.kind === "cancelled";
+}
+
+const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const pricePattern = /^(-?)(\d+)\.(\d{2,18})$/;
+
+interface PricePoint {
+  date: string;
+  label: string;
+  value: number;
+}
+
+function formatPrice(value: string): string {
+  const match = pricePattern.exec(value);
+  if (!match) return "N/A";
+  const sign = match[1] ?? "";
+  const whole = match[2] ?? "";
+  const fraction = match[3] ?? "";
+  return `PKR ${sign}${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${fraction}`;
+}
+
+function pricePoints(
+  rows: HistoricalPriceRow[],
+  getValue: (row: HistoricalPriceRow) => string | null,
+): PricePoint[] {
+  return rows.flatMap((row) => {
+    const rawValue = getValue(row);
+    const value = finiteNumber(rawValue);
+    if (rawValue === null || value === null || !datePattern.test(row.date)) {
+      return [];
+    }
+    return [{ date: row.date, label: formatPrice(rawValue), value }];
+  });
 }
 
 export function HistoricalView({
@@ -48,7 +86,7 @@ export function HistoricalView({
     setPrices(null);
 
     void client
-      .getHistoricalPrices(controller.signal)
+      .getHistoricalPrices(detail.run_id, controller.signal)
       .then((response) => {
         if (current) setPrices(response);
       })
@@ -67,33 +105,87 @@ export function HistoricalView({
     };
   }, [client, detail.run_id, requestVersion]);
 
-  const closeRows = useMemo(
-    () =>
-      (prices?.rows ?? []).filter(
-        (row) => Number.isFinite(row.close) && /^\d{4}-\d{2}-\d{2}/.test(row.date),
-      ),
+  const historicalRows = useMemo(
+    () => [...(prices?.rows ?? [])].sort((left, right) => left.date.localeCompare(right.date)),
     [prices],
+  );
+  const closeRows = useMemo(
+    () => pricePoints(historicalRows, (row) => row.close),
+    [historicalRows],
+  );
+  const highRows = useMemo(
+    () => pricePoints(historicalRows, (row) => row.high),
+    [historicalRows],
+  );
+  const lowRows = useMemo(
+    () => pricePoints(historicalRows, (row) => row.low),
+    [historicalRows],
   );
   const volumeRows = useMemo(
     () =>
-      (prices?.rows ?? []).filter(
+      historicalRows.filter(
         (row) =>
-          typeof row.volume === "number" &&
+          Number.isInteger(row.volume) &&
+          row.volume >= 0 &&
           Number.isFinite(row.volume) &&
-          /^\d{4}-\d{2}-\d{2}/.test(row.date),
+          datePattern.test(row.date),
       ),
-    [prices],
+    [historicalRows],
   );
   const providers = useMemo(
     () =>
       Array.from(
         new Set(
-          (prices?.rows ?? [])
+          historicalRows
             .map((row) => row.source)
             .filter((source): source is string => Boolean(source)),
         ),
       ).sort(),
-    [prices],
+    [historicalRows],
+  );
+
+  const priceTraces = useMemo(
+    () => [
+      {
+        type: "scatter" as const,
+        mode: "lines" as const,
+        name: "OGDC close",
+        x: closeRows.map((row) => row.date),
+        y: closeRows.map((row) => row.value),
+        customdata: closeRows.map((row) => row.label),
+        line: { color: "#285b8f", width: 2 },
+        hovertemplate: "%{x}<br>Close: %{customdata}<extra>OGDC</extra>",
+      },
+      ...(highRows.length > 0
+        ? [
+            {
+              type: "scatter" as const,
+              mode: "lines" as const,
+              name: "OGDC high",
+              x: highRows.map((row) => row.date),
+              y: highRows.map((row) => row.value),
+              customdata: highRows.map((row) => row.label),
+              line: { color: "#2d7d65", dash: "dot" as const, width: 1 },
+              hovertemplate: "%{x}<br>High: %{customdata}<extra>OGDC</extra>",
+            },
+          ]
+        : []),
+      ...(lowRows.length > 0
+        ? [
+            {
+              type: "scatter" as const,
+              mode: "lines" as const,
+              name: "OGDC low",
+              x: lowRows.map((row) => row.date),
+              y: lowRows.map((row) => row.value),
+              customdata: lowRows.map((row) => row.label),
+              line: { color: "#a34a4a", dash: "dot" as const, width: 1 },
+              hovertemplate: "%{x}<br>Low: %{customdata}<extra>OGDC</extra>",
+            },
+          ]
+        : []),
+    ],
+    [closeRows, highRows, lowRows],
   );
 
   return (
@@ -103,17 +195,16 @@ export function HistoricalView({
           <p className="eyebrow">Market history</p>
           <h2 id="historical-heading">Historical OGDC prices</h2>
           <p className="view-description">
-            Daily closing prices and volume returned by the legacy PAISA stock-price
-            API. These observations are shown as source data and are not trading
-            recommendations.
+            Daily closing prices and volume from the selected immutable vertical-slice
+            run. This is an academic simulation and not financial advice.
           </p>
         </div>
       </header>
 
       <div className="card-grid count-grid" aria-label="Historical data context">
         <article className="metric-card">
-          <span className="metric-card__label">Run source mode</span>
-          <strong>{humanize(detail.source_mode)}</strong>
+          <span className="metric-card__label">Price source mode</span>
+          <strong>{humanize(prices?.source_mode ?? detail.source_mode)}</strong>
         </article>
         <article className="metric-card">
           <span className="metric-card__label">Model feature coverage</span>
@@ -158,8 +249,9 @@ export function HistoricalView({
             <h3>Historical price API unavailable</h3>
             <p>{error}</p>
             <p>
-              No fixture or synthetic price series has been substituted. Start the
-              backend with a populated legacy processed-price artifact, then retry.
+              No fixture, sample, or synthetic price series has been substituted.
+              Check that the selected run exposes its immutable historical-price
+              snapshot, then retry.
             </p>
           </div>
           <button
@@ -174,7 +266,8 @@ export function HistoricalView({
 
       {!loading && !error && prices && prices.rows.length === 0 ? (
         <div className="state-panel state-panel--empty" role="status">
-          The stock-price API returned no OGDC observations. No chart can be drawn.
+          The run-scoped price API returned no OGDC observations. No chart can be
+          drawn, and no fixture data has been substituted.
         </div>
       ) : null}
 
@@ -187,21 +280,21 @@ export function HistoricalView({
             </article>
             <article className="metric-card">
               <span className="metric-card__label">Observations returned</span>
-              <strong>{formatInteger(prices.count)}</strong>
+              <strong>{formatInteger(prices.total)}</strong>
             </article>
             <article className="metric-card">
-              <span className="metric-card__label">Price provider</span>
+              <span className="metric-card__label">Price source</span>
               <strong>
                 {providers.length > 0
                   ? providers.map((provider) => humanize(provider)).join(", ")
-                  : humanize(summary.training_data.provider)}
+                  : "N/A"}
               </strong>
             </article>
             <article className="metric-card">
-              <span className="metric-card__label">Run data coverage</span>
+              <span className="metric-card__label">Historical date range</span>
               <strong>
-                {formatDate(detail.data_date_range.start)} –{" "}
-                {formatDate(detail.data_date_range.end)}
+                {formatDate(prices.data_date_range.start)} –{" "}
+                {formatDate(prices.data_date_range.end)}
               </strong>
             </article>
           </div>
@@ -211,24 +304,17 @@ export function HistoricalView({
               <div className="section-heading">
                 <div>
                   <h3 id="close-chart-heading">OGDC daily closing price</h3>
-                  <p>Closing price in Pakistani rupees (PKR).</p>
+                  <p>
+                    Closing price in Pakistani rupees (PKR), with high and low
+                    series only when the source provides them.
+                  </p>
                 </div>
               </div>
               {closeRows.length > 0 ? (
                 <Plot
                   ariaLabel="Line chart of OGDC daily closing prices"
                   config={chartConfig}
-                  data={[
-                    {
-                      type: "scatter",
-                      mode: "lines",
-                      name: "OGDC close",
-                      x: closeRows.map((row) => row.date),
-                      y: closeRows.map((row) => row.close),
-                      line: { color: "#285b8f", width: 2 },
-                      hovertemplate: "%{x}<br>Close: PKR %{y:,.2f}<extra>OGDC</extra>",
-                    },
-                  ]}
+                  data={priceTraces}
                   layout={{
                     autosize: true,
                     height: 390,
@@ -237,9 +323,9 @@ export function HistoricalView({
                     yaxis: {
                       separatethousands: true,
                       tickprefix: "PKR ",
-                      title: { text: "Closing price (PKR)" },
+                      title: { text: "Price (PKR)" },
                     },
-                    showlegend: false,
+                    showlegend: priceTraces.length > 1,
                   }}
                 />
               ) : (
@@ -263,9 +349,10 @@ export function HistoricalView({
                       type: "bar",
                       name: "Volume",
                       x: volumeRows.map((row) => row.date),
-                      y: volumeRows.map((row) => row.volume as number),
+                      y: volumeRows.map((row) => row.volume),
+                      customdata: volumeRows.map((row) => formatInteger(row.volume)),
                       marker: { color: "#7c5cbf" },
-                      hovertemplate: "%{x}<br>Volume: %{y:,.0f}<extra>OGDC</extra>",
+                      hovertemplate: "%{x}<br>Volume: %{customdata}<extra>OGDC</extra>",
                     },
                   ]}
                   layout={{
@@ -276,6 +363,7 @@ export function HistoricalView({
                     yaxis: {
                       rangemode: "tozero",
                       separatethousands: true,
+                      tickformat: ",d",
                       title: { text: "Volume (shares)" },
                     },
                     showlegend: false,

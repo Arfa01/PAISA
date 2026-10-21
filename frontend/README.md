@@ -17,9 +17,8 @@ academic simulations and are not financial advice.
 - The Python environment and backend dependencies documented in the repository
   [`README.md`](../README.md).
 - A completed immutable vertical-slice run and its referenced model-training
-  run under the configured artifact roots.
-- `data/processed/psx_prices.csv` with OGDC observations for the Historical
-  OGDC view.
+  run under the configured artifact roots, including its checksum-verified
+  input snapshot.
 
 ## Install
 
@@ -59,24 +58,18 @@ below select `VSL-20261020-OGDC-main-02`; that run and its referenced training
 run must already exist at those roots. Generated artifacts are intentionally
 not committed to Git.
 
-The Historical OGDC view separately requests:
+The Historical OGDC view uses the currently selected run and requests:
 
 ```text
-GET /stocks/OGDC/prices?limit=5000
+GET /api/v1/vertical-slices/{selected_run_id}/stocks/OGDC/prices
 ```
 
-That legacy route reads `data/processed/psx_prices.csv`; it does not read the
-vertical-slice input snapshot. If the file is absent, the historical view shows
-the API error and does not substitute fixture or synthetic prices. Generate
-the v0 processed data from the repository root when needed:
-
-```bash
-source .venv/bin/activate
-python scripts/run_v0_pipeline.py --provider psx-dps --symbols OGDC HBL MCB --start 2021-01-01 --train
-```
-
-The other dashboard views can still use valid v1 result artifacts if the
-legacy price file is unavailable.
+It retrieves all available rows using the endpoint's documented maximum
+`limit=5000` and continues through additional pages when necessary. The backend
+reads the selected run's immutable, checksum-verified input snapshot through
+the API; the frontend never reads `data/processed` files directly. If the API
+request fails, the historical view shows the error and does not substitute
+fixture, sample, synthetic, or fake prices.
 
 ## Run the integrated demo
 

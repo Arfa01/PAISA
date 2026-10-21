@@ -408,19 +408,29 @@ export interface SourceResponse extends RunContext {
 
 export interface HistoricalPriceRow {
   date: string;
-  ticker: string;
-  open: number | null;
-  high: number | null;
-  low: number | null;
-  close: number;
-  volume: number | null;
-  source: string | null;
+  open: string;
+  high: string | null;
+  low: string | null;
+  close: string;
+  volume: number;
+  source: string;
 }
 
 export interface HistoricalPricesResponse {
+  schema_version: string;
+  run_id: string;
   ticker: string;
-  count: number;
+  source_mode: string;
+  data_date_range: DateRange;
+  total: number;
   rows: HistoricalPriceRow[];
+  warnings: string[];
+  disclaimer: string;
+}
+
+export interface HistoricalPricesPageResponse extends HistoricalPricesResponse {
+  limit: number;
+  offset: number;
 }
 
 export interface CoreRunData {

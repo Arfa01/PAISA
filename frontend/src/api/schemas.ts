@@ -6,6 +6,36 @@ const integer = z.number().int();
 const nonNegativeInteger = integer.nonnegative();
 const text = z.string();
 const money = z.string().regex(/^-?\d+\.\d{2}$/);
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+});
+const positivePrice = z
+  .string()
+  .regex(/^\d{1,100}\.\d{2,18}$/)
+  .refine((value) => /[1-9]/.test(value), {
+    message: "price must be strictly positive",
+  });
+const invalidPriceSources = new Set([
+  "nan",
+  "+nan",
+  "-nan",
+  "inf",
+  "+inf",
+  "-inf",
+  "infinity",
+  "+infinity",
+  "-infinity",
+  "none",
+  "null",
+]);
+const priceSource = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => !invalidPriceSources.has(value.toLowerCase()), {
+    message: "source must identify a real provider",
+  });
 export const ACADEMIC_DISCLAIMER = "Academic simulation; not financial advice.";
 const academicDisclaimer = z.literal(ACADEMIC_DISCLAIMER);
 
@@ -497,20 +527,44 @@ export const sourceSchema = z.object({
 });
 
 export const historicalPricesSchema = z.object({
+  schema_version: text,
+  run_id: text,
   ticker: text,
-  count: nonNegativeInteger,
+  source_mode: text,
+  data_date_range: z.object({ start: isoDate, end: isoDate }),
+  total: nonNegativeInteger.safe(),
+  limit: integer.positive().max(5_000),
+  offset: nonNegativeInteger.safe(),
   rows: z.array(
     z.object({
-      date: text,
-      ticker: text,
-      open: finite.nullable(),
-      high: finite.nullable(),
-      low: finite.nullable(),
-      close: finite,
-      volume: finite.nonnegative().nullable(),
-      source: text.nullable(),
+      date: isoDate,
+      open: positivePrice,
+      high: positivePrice.nullable(),
+      low: positivePrice.nullable(),
+      close: positivePrice,
+      volume: nonNegativeInteger.safe(),
+      source: priceSource,
     }),
   ),
-}).refine((value) => value.count === value.rows.length, {
-  message: "count must equal the number of rows",
+  warnings: z.array(text),
+  disclaimer: academicDisclaimer,
+}).superRefine((value, context) => {
+  if (value.data_date_range.start > value.data_date_range.end) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "data date range must be chronological",
+      path: ["data_date_range"],
+    });
+  }
+  if (
+    value.rows.length > value.limit ||
+    value.offset > value.total ||
+    value.offset + value.rows.length > value.total
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "price page metadata is inconsistent",
+      path: ["rows"],
+    });
+  }
 });

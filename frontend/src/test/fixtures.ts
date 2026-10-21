@@ -647,22 +647,40 @@ export const drawdownRows: DrawdownRow[] = equityRows.map((row) => ({
   drawdown: row.drawdown,
 }));
 
-const historicalPrices: HistoricalPricesResponse = {
-  ticker: "OGDC",
-  count: 1,
-  rows: [
-    {
-      date: "2026-01-05",
-      ticker: "OGDC",
-      open: 101,
-      high: null,
-      low: null,
-      close: 102,
-      volume: 500_000,
-      source: "psx_dps",
-    },
-  ],
-};
+export function makeHistoricalPrices(runId = RUN_ID): HistoricalPricesResponse {
+  return {
+    schema_version: "1.0",
+    run_id: runId,
+    ticker: "OGDC",
+    source_mode: "verified_legacy_psx_cache",
+    data_date_range: { start: "2021-09-16", end: "2026-09-15" },
+    total: 2,
+    rows: [
+      {
+        date: "2021-09-16",
+        open: "88.09",
+        high: null,
+        low: null,
+        close: "89.17",
+        volume: 4_201_784,
+        source: "psx_dps",
+      },
+      {
+        date: "2026-09-15",
+        open: "212.04",
+        high: null,
+        low: null,
+        close: "213.58",
+        volume: 500_000,
+        source: "psx_dps",
+      },
+    ],
+    warnings: [
+      "Historical prices are shown as immutable source observations.",
+    ],
+    disclaimer: DISCLAIMER,
+  };
+}
 
 export function makeMockClient(
   options: {
@@ -678,7 +696,9 @@ export function makeMockClient(
     getCoreRunData: vi.fn().mockResolvedValue(core),
     getAllEquityCurves: vi.fn().mockResolvedValue(equityRows),
     getAllDrawdowns: vi.fn().mockResolvedValue(drawdownRows),
-    getHistoricalPrices: vi.fn().mockResolvedValue(historicalPrices),
+    getHistoricalPrices: vi.fn(
+      async (runId: string) => makeHistoricalPrices(runId),
+    ),
     getExperiment: vi.fn(
       async (runId: string, experimentId: string) =>
         makeExperimentDetail(

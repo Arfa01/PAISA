@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { PaisaApiClient } from "./client";
-import type { EquityCurveRow } from "./types";
+import type {
+  EquityCurveRow,
+  HistoricalPriceRow,
+  HistoricalPricesPageResponse,
+} from "./types";
 import {
   EXPERIMENT_ONE,
   EXPERIMENT_TWO,
   makeCoreRunData,
   makeExperimentDetail,
+  makeHistoricalPrices,
   makeRunList,
   makeRunListItem,
   OTHER_RUN_ID,
@@ -34,6 +39,26 @@ const equityRow: EquityCurveRow = {
   total_equity: "99999.90",
   drawdown: 0.001,
 };
+
+function historicalPricePage(
+  rows: HistoricalPriceRow[],
+  options: {
+    offset?: number;
+    total?: number;
+    runId?: string;
+    ticker?: string;
+  } = {},
+): HistoricalPricesPageResponse {
+  const response = makeHistoricalPrices(options.runId);
+  return {
+    ...response,
+    ticker: options.ticker ?? response.ticker,
+    total: options.total ?? rows.length,
+    limit: 5_000,
+    offset: options.offset ?? 0,
+    rows,
+  };
+}
 
 describe("PaisaApiClient response validation", () => {
   it("fails closed on a malformed API response", async () => {
@@ -204,6 +229,173 @@ describe("PaisaApiClient response validation", () => {
     await expect(client.getAllEquityCurves(RUN_ID)).rejects.toMatchObject({
       kind: "malformed",
       message: "The PAISA API returned duplicate paginated rows.",
+    });
+  });
+
+  it("collects every run-scoped historical-price page without a legacy request", async () => {
+    const history = makeHistoricalPrices();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage([history.rows[0]!], { total: 2 })),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          historicalPricePage([history.rows[1]!], { offset: 1, total: 2 }),
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    const response = await client.getHistoricalPrices(RUN_ID);
+
+    expect(response.rows).toEqual(history.rows);
+    expect(response.total).toBe(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://127.0.0.1:8000/api/v1/vertical-slices/${RUN_ID}/stocks/OGDC/prices?limit=5000&offset=0`,
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://127.0.0.1:8000/api/v1/vertical-slices/${RUN_ID}/stocks/OGDC/prices?limit=5000&offset=1`,
+      expect.any(Object),
+    );
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).startsWith("http://127.0.0.1:8000/stocks/"),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not request a fixture or legacy route when historical prices fail", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "network",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      `http://127.0.0.1:8000/api/v1/vertical-slices/${RUN_ID}/stocks/OGDC/prices?limit=5000&offset=0`,
+    );
+  });
+
+  it("rejects historical prices that are not chronological", async () => {
+    const history = makeHistoricalPrices();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse(historicalPricePage([...history.rows].reverse())),
+      ),
+    );
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned historical prices outside chronological order.",
+    });
+  });
+
+  it("rejects duplicate dates across historical-price pages", async () => {
+    const history = makeHistoricalPrices();
+    const duplicate = { ...history.rows[0]! };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage([history.rows[0]!], { total: 2 })),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage([duplicate], { offset: 1, total: 2 })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned duplicate paginated rows.",
+    });
+  });
+
+  it("rejects historical-price context changes between pages", async () => {
+    const history = makeHistoricalPrices();
+    const changedContext = {
+      ...historicalPricePage([history.rows[1]!], { offset: 1, total: 2 }),
+      source_mode: "changed_source_mode",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage([history.rows[0]!], { total: 2 })),
+      )
+      .mockResolvedValueOnce(jsonResponse(changedContext));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned inconsistent historical-price context.",
+    });
+  });
+
+  it("rejects a historical-price response for the wrong run or ticker", async () => {
+    const history = makeHistoricalPrices();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage(history.rows, { runId: OTHER_RUN_ID })),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(historicalPricePage(history.rows, { ticker: "HBL" })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned inconsistent run identity.",
+    });
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned inconsistent ticker identity.",
+    });
+  });
+
+  it.each([
+    ["NaN close", { close: "NaN" }],
+    ["infinite close", { close: "Infinity" }],
+    ["unsafe volume", { volume: Number.MAX_SAFE_INTEGER + 1 }],
+  ])("rejects %s in historical-price rows", async (_label, mutation) => {
+    const history = makeHistoricalPrices();
+    const row = { ...history.rows[0]!, ...mutation } as HistoricalPriceRow;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse(historicalPricePage([row]))),
+    );
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned data in an unexpected format.",
+    });
+  });
+
+  it("rejects an absolute path in historical-price source data", async () => {
+    const history = makeHistoricalPrices();
+    const row = {
+      ...history.rows[0]!,
+      source: "/srv/paisa/private/prices.csv",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse(historicalPricePage([row]))),
+    );
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API response contained prohibited local-path data.",
     });
   });
 

@@ -221,10 +221,58 @@ describe("PAISA dashboard shell", () => {
       }),
     ).toBeInTheDocument();
     expect(client.getHistoricalPrices).toHaveBeenCalledWith(
+      RUN_ID,
       expect.any(AbortSignal),
     );
     expect(screen.getByText("Observations returned").parentElement).toHaveTextContent(
-      "1",
+      "2",
+    );
+    expect(screen.getByText("Historical date range").parentElement).toHaveTextContent(
+      "16 Sep 2021 – 15 Sep 2026",
+    );
+    expect(screen.getByText("Price source mode").parentElement).toHaveTextContent(
+      "Verified Legacy Psx Cache",
+    );
+    expect(screen.getByText("Price source").parentElement).toHaveTextContent(
+      "Psx Dps",
+    );
+  });
+
+  it("reloads historical prices for the newly selected run", async () => {
+    const user = userEvent.setup();
+    const runList = makeRunList([
+      makeRunListItem(RUN_ID),
+      makeRunListItem(OTHER_RUN_ID),
+    ]);
+    const client = makeMockClient({ runList });
+    vi.mocked(client.getCoreRunData).mockImplementation(async (runId) =>
+      makeCoreRunData(runId),
+    );
+    render(<App client={client} />);
+
+    await screen.findByRole("heading", {
+      name: "PAISA — Predictive AI Stock Assessment",
+    });
+    await user.click(screen.getByRole("button", { name: /Historical OGDC/ }));
+    await waitFor(() =>
+      expect(client.getHistoricalPrices).toHaveBeenCalledWith(
+        RUN_ID,
+        expect.any(AbortSignal),
+      ),
+    );
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Analysis run" }),
+      OTHER_RUN_ID,
+    );
+    await within(screen.getByRole("main")).findByText(OTHER_RUN_ID);
+    await user.click(screen.getByRole("button", { name: /Historical OGDC/ }));
+
+    await waitFor(() =>
+      expect(client.getHistoricalPrices).toHaveBeenLastCalledWith(
+        OTHER_RUN_ID,
+        expect.any(AbortSignal),
+      ),
     );
   });
 
@@ -245,7 +293,7 @@ describe("PAISA dashboard shell", () => {
     expect(alert).toHaveTextContent("Historical price API unavailable");
     expect(alert).toHaveTextContent("The requested PAISA result was not found.");
     expect(alert).toHaveTextContent(
-      "No fixture or synthetic price series has been substituted.",
+      "No fixture, sample, or synthetic price series has been substituted.",
     );
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });

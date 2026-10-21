@@ -26,6 +26,7 @@ import type {
   EquityCurvesResponse,
   ExperimentDetailResponse,
   ExperimentsResponse,
+  HistoricalPricesPageResponse,
   HistoricalPricesResponse,
   LeaderboardResponse,
   ModelsResponse,
@@ -94,6 +95,8 @@ interface PageEnvelope<T> {
   run_id?: string;
 }
 
+const HISTORICAL_PRICE_PAGE_SIZE = 5_000;
+
 function assertRunIdentity(response: { run_id: string }, expectedRunId: string): void {
   if (response.run_id !== expectedRunId) {
     throw new ApiError("The PAISA API returned inconsistent run identity.", "malformed");
@@ -156,7 +159,11 @@ export class PaisaApiClient {
     const controller = new AbortController();
     let timedOut = false;
     const abortFromCaller = () => controller.abort();
-    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (signal?.aborted) {
+      controller.abort();
+    } else {
+      signal?.addEventListener("abort", abortFromCaller, { once: true });
+    }
     const timer = window.setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -363,8 +370,8 @@ export class PaisaApiClient {
     fetchPage: (limit: number, offset: number) => Promise<PageEnvelope<T>>,
     rowKey: (row: T) => string,
     expectedRunId?: string,
+    pageSize = 1000,
   ): Promise<{ rows: T[]; total: number }> {
-    const pageSize = 1000;
     const rows: T[] = [];
     const seenRowKeys = new Set<string>();
     let expectedTotal: number | undefined;
@@ -423,8 +430,96 @@ export class PaisaApiClient {
     return rows;
   }
 
-  getHistoricalPrices(signal?: AbortSignal): Promise<HistoricalPricesResponse> {
-    return this.request("/stocks/OGDC/prices?limit=5000", historicalPricesSchema, signal);
+  private getHistoricalPricePage(
+    runId: string,
+    ticker: string,
+    limit: number,
+    offset: number,
+    signal?: AbortSignal,
+  ): Promise<HistoricalPricesPageResponse> {
+    return this.requestForRun(
+      `/api/v1/vertical-slices/${encodeURIComponent(runId)}/stocks/${encodeURIComponent(ticker)}/prices?limit=${limit}&offset=${offset}`,
+      historicalPricesSchema,
+      runId,
+      signal,
+    );
+  }
+
+  async getHistoricalPrices(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<HistoricalPricesResponse> {
+    const ticker = "OGDC";
+    let firstPage: HistoricalPricesPageResponse | undefined;
+    let contextFingerprint: string | undefined;
+    const { rows, total } = await this.collectPages(
+      async (limit, offset) => {
+        const response = await this.getHistoricalPricePage(
+          runId,
+          ticker,
+          limit,
+          offset,
+          signal,
+        );
+        if (response.ticker !== ticker) {
+          throw new ApiError("The PAISA API returned inconsistent ticker identity.", "malformed");
+        }
+        const fingerprint = JSON.stringify({
+          schema_version: response.schema_version,
+          run_id: response.run_id,
+          ticker: response.ticker,
+          source_mode: response.source_mode,
+          data_date_range: response.data_date_range,
+          warnings: response.warnings,
+          disclaimer: response.disclaimer,
+        });
+        if (contextFingerprint === undefined) {
+          contextFingerprint = fingerprint;
+          firstPage = response;
+        } else if (fingerprint !== contextFingerprint) {
+          throw new ApiError(
+            "The PAISA API returned inconsistent historical-price context.",
+            "malformed",
+          );
+        }
+        return response;
+      },
+      (row) => row.date,
+      runId,
+      HISTORICAL_PRICE_PAGE_SIZE,
+    );
+    if (!firstPage) {
+      throw new ApiError("The PAISA API returned an incomplete paginated result.", "malformed");
+    }
+    for (let index = 1; index < rows.length; index += 1) {
+      if (rows[index - 1]!.date >= rows[index]!.date) {
+        throw new ApiError(
+          "The PAISA API returned historical prices outside chronological order.",
+          "malformed",
+        );
+      }
+    }
+    if (
+      total > 0 &&
+      (rows[0]?.date !== firstPage.data_date_range.start ||
+        rows[rows.length - 1]?.date !== firstPage.data_date_range.end)
+    ) {
+      throw new ApiError(
+        "The PAISA API returned inconsistent historical-price coverage.",
+        "malformed",
+      );
+    }
+    return {
+      schema_version: firstPage.schema_version,
+      run_id: firstPage.run_id,
+      ticker: firstPage.ticker,
+      source_mode: firstPage.source_mode,
+      data_date_range: firstPage.data_date_range,
+      total,
+      rows,
+      warnings: firstPage.warnings,
+      disclaimer: firstPage.disclaimer,
+    };
   }
 
   async getExperiment(

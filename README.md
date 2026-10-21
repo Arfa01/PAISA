@@ -459,14 +459,12 @@ npm run dev
 
 Open `http://127.0.0.1:5173`.
 
-The Historical OGDC view has one additional legacy dependency: the backend
-must have `data/processed/psx_prices.csv`, containing OGDC rows, because that
-view calls `GET /stocks/OGDC/prices?limit=5000`. The immutable vertical-slice
-input snapshot does not replace this v0 API file. Step 4 in
-[`RUN_FROM_GITHUB.md`](RUN_FROM_GITHUB.md) generates it. If the file is absent,
-the historical view reports the API error and does not substitute fake prices;
-the immutable v1 result views can still be used when their artifact roots are
-available.
+The Historical OGDC view uses the currently selected run and requests
+`GET /api/v1/vertical-slices/{selected_run_id}/stocks/OGDC/prices`. It retrieves
+all available rows through documented pages of at most `5000`; the backend
+serves the selected run's immutable, checksum-verified input snapshot rather
+than `data/processed/psx_prices.csv`. API failures remain visible and the
+dashboard does not substitute fixture, sample, synthetic, or fake prices.
 
 Frontend quality and production-build commands are:
 

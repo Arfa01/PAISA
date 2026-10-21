@@ -239,29 +239,25 @@ VITE_PAISA_API_BASE_URL=http://127.0.0.1:8000
 absolute local filesystem path. Local `.env` files are ignored by Git; the
 example file remains committed.
 
-The dashboard consumes completed immutable v1 results and the legacy OGDC
-price endpoint. It does not train, predict, run a backtest, calculate portfolio
-metrics, read artifact files, deserialize model binaries, or execute trades.
-An API failure remains a visible error; the running application never silently
-falls back to fixture data. Test fixtures are limited to automated tests.
+The dashboard consumes completed immutable v1 results, including OGDC prices
+from the selected run's v1 price endpoint. It does not train, predict, run a
+backtest, calculate portfolio metrics, read artifact files, deserialize model
+binaries, or execute trades. An API failure remains a visible error; the
+running application never silently falls back to fixture data. Test fixtures
+are limited to automated tests.
 
 ## 10. Run the integrated dashboard
 
 Before starting the applications, make sure the configured immutable artifact
 roots contain `VSL-20261020-OGDC-main-02` and its referenced model-training run.
-Also make sure this legacy file exists and contains OGDC observations:
-
-```text
-data/processed/psx_prices.csv
-```
 
 The Historical OGDC view calls
-`GET /stocks/OGDC/prices?limit=5000`, whose v0 implementation reads that exact
-processed file. A vertical-slice `input_snapshot/` does not satisfy the legacy
-route. Step 4 generates the required file. If it is missing, the historical
-view shows the backend `404` and does not invent or substitute a price series;
-the v1 overview, model, portfolio, experiment, and provenance views remain
-available when the immutable result roots are valid.
+`GET /api/v1/vertical-slices/{selected_run_id}/stocks/OGDC/prices`, using the
+currently selected run ID. It requests every available page with the documented
+maximum `limit=5000`; the backend reads the immutable run's checksum-verified
+`input_snapshot` through the API, not `data/processed/psx_prices.csv`. A request
+failure remains visible in the view, with no fixture, sample, synthetic, or fake
+price fallback.
 
 From the repository root, start the backend in the first terminal:
 

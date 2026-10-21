@@ -7,9 +7,11 @@ vi.mock("react-plotly.js/factory.js", async () => {
   const React = await import("react");
   return {
     default: () =>
-      ({ data }: { data: unknown[] }) =>
+      ({ data, layout }: { data: unknown[]; layout: unknown }) =>
         React.createElement("div", {
           "data-testid": "plotly-chart",
+          "data-plot-data": JSON.stringify(data),
+          "data-plot-layout": JSON.stringify(layout),
           "data-trace-count": data.length,
         }),
   };

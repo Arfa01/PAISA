@@ -308,6 +308,10 @@ All outputs are academic simulations and are not financial advice.
 
 ## API endpoints
 
+### Existing v0 API
+
+The original v0 routes and their response shapes remain unchanged.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Check whether generated data/model artifacts exist. |
@@ -318,6 +322,79 @@ All outputs are academic simulations and are not financial advice.
 | `GET /stocks/{ticker}/dataset` | Return ML-ready feature + label rows. |
 | `GET /models/baseline/metrics` | Return RandomForest split metrics. |
 | `GET /predict/{ticker}` | Return next-trading-day up/down prediction for latest complete row. |
+
+### Read-only v1 experiment-results API
+
+The additive `/api/v1` API reads completed, immutable vertical-slice artifacts.
+It does not train a model, rerun a backtest, recalculate business metrics, write
+artifacts, perform real trading, or deserialize/serve a fitted model binary.
+
+From the repository root, install and start it with the local real run as the
+explicit default when that uncommitted artifact exists:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+
+PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+`PAISA_VERTICAL_SLICE_ROOT` and `PAISA_MODEL_TRAINING_ROOT` default to the
+values shown. `PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` is optional, but
+`GET /api/v1/leaderboard` returns `409` if it is unset instead of guessing a
+run. Run-specific URLs do not require a default. Configured relative paths are
+resolved from the repository root.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/vertical-slices` | List completed, checksum-valid vertical-slice runs with pagination. |
+| `GET /api/v1/vertical-slices/{run_id}` | Return run identity, dates, models, experiments, and shared assumptions. |
+| `GET /api/v1/vertical-slices/{run_id}/summary` | Return the persisted final summary. |
+| `GET /api/v1/vertical-slices/{run_id}/leaderboard` | Return the combined model/portfolio leaderboard. |
+| `GET /api/v1/leaderboard` | Return the explicitly configured default run's leaderboard. |
+| `GET /api/v1/vertical-slices/{run_id}/models` | Return validation and test model metrics. |
+| `GET /api/v1/vertical-slices/{run_id}/portfolios` | Return strategy, cash-only, and buy-and-hold metrics. |
+| `GET /api/v1/vertical-slices/{run_id}/equity-curves` | Return paginated daily equity rows. |
+| `GET /api/v1/vertical-slices/{run_id}/drawdowns` | Return paginated daily drawdown rows. |
+| `GET /api/v1/vertical-slices/{run_id}/source` | Return filtered input/source provenance. |
+| `GET /api/v1/vertical-slices/{run_id}/experiments` | List experiment configurations and result summaries. |
+| `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}` | Return one persisted configuration and result. |
+| `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/trades` | Return paginated strategy trades. |
+| `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/snapshots` | Return paginated strategy portfolio snapshots. |
+| `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/benchmarks` | Return paginated cash-only and buy-and-hold snapshots and buy-and-hold trades. |
+
+The run listing and large-table endpoints accept `limit` (default `200`,
+maximum `1000`) and `offset` (default `0`) and return `total`, `limit`,
+`offset`, and deterministically ordered `rows`. For example:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/vertical-slices
+curl -s http://127.0.0.1:8000/api/v1/leaderboard
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0"
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0"
+```
+
+All v1 responses use explicit Pydantic schemas and ISO dates. PKR amounts are
+fixed-scale strings such as `"105987.04"`, preserving decimal meaning.
+Undefined metrics are JSON `null`; `NaN` and infinity are never emitted. Every
+run response carries warnings, limitations, and `"Academic simulation; not
+financial advice."` The API explicitly identifies `actual_class` as
+evaluation-only and never uses it for a signal, execution, or accounting.
+
+Run and experiment IDs accept only safe identifier characters. The repository
+rejects traversal, symlink escape, non-`PASS` or incomplete runs, missing or
+extra inventoried files, checksum mismatches, and invalid referenced training
+runs. Clients choose registered IDs, never filenames or filesystem paths, and
+v1 responses do not reveal absolute local paths. See
+[`docs/api_design.md`](docs/api_design.md) for response examples and error
+semantics.
 
 ## Folder structure
 

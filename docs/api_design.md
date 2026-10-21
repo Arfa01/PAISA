@@ -11,7 +11,8 @@ PAISA exposes two additive interfaces:
 - The original unversioned v0 routes provide pipeline and baseline-prediction
   compatibility. Their routes and response shapes are unchanged.
 - `/api/v1` provides read-only access to completed immutable model,
-  experiment, portfolio, benchmark, and vertical-slice results.
+  experiment, portfolio, benchmark, vertical-slice, and run-owned historical
+  price results.
 
 Every prediction, signal, trade, portfolio value, benchmark, and return shown
 by either interface is an academic simulation and is not financial advice.
@@ -70,6 +71,7 @@ All routes below use `GET` and are beneath `/api/v1`.
 | `/vertical-slices` | Paginated completed, checksum-valid `PASS` runs. |
 | `/vertical-slices/{run_id}` | One run's identity, date range, registered models, experiments, and shared assumptions. |
 | `/vertical-slices/{run_id}/summary` | Persisted final model/portfolio summary and interpretation. |
+| `/vertical-slices/{run_id}/stocks/{ticker}/prices` | Chronological daily prices from the run's immutable input snapshot. |
 | `/vertical-slices/{run_id}/leaderboard` | Combined model and strategy-portfolio leaderboard for that run. |
 | `/leaderboard` | Leaderboard for the explicitly configured default run. |
 | `/vertical-slices/{run_id}/models` | Algorithms, registered model IDs, validation/test metrics, and split/class counts. |
@@ -84,7 +86,7 @@ All routes below use `GET` and are beneath `/api/v1`.
 | `/vertical-slices/{run_id}/experiments/{experiment_id}/benchmarks` | Paginated cash-only snapshots, buy-and-hold snapshots, and buy-and-hold trades. |
 
 The API never accepts a client-provided artifact filename or filesystem path.
-`run_id` and `experiment_id` are registry identifiers, not path fragments.
+`run_id`, `experiment_id`, and `ticker` are identifiers, not path fragments.
 
 ## Pagination and deterministic ordering
 
@@ -103,6 +105,11 @@ FastAPI's HTTP `422` validation response. Every paginated collection includes
 `total`, `limit`, `offset`, and `rows`; each of the three benchmark collections
 has its own count and page fields.
 
+`/vertical-slices/{run_id}/stocks/{ticker}/prices` has a route-specific default
+`limit` of `500` and maximum of `5000`. Its `offset` is also non-negative. It
+accepts optional inclusive ISO `start_date` and `end_date`; filters apply first,
+then `total` is calculated, and only then are `offset` and `limit` applied.
+
 Ordering is stable:
 
 - run and experiment listings sort by identifier;
@@ -110,6 +117,7 @@ Ordering is stable:
 - leaderboard rows retain the producer's persisted deterministic validation
   ranking;
 - curves and drawdowns sort by date, series ID, then portfolio ID;
+- historical prices sort chronologically and reject duplicate ticker/date rows;
 - trades sort by execution date, then trade ID; and
 - snapshots sort by date, then portfolio ID.
 
@@ -120,7 +128,7 @@ include this context:
 
 - `schema_version` and `run_id`;
 - `source_mode` and the ISO `data_date_range`;
-- persisted `warnings` plus API-enforced `limitations`; and
+- persisted `warnings` plus API-enforced `limitations` where applicable; and
 - `disclaimer: "Academic simulation; not financial advice."`.
 
 Run details add ISO evaluation dates, registered model IDs and algorithms,
@@ -128,14 +136,63 @@ experiment assumptions, validation/test metrics, portfolio metrics, and
 cash-only and buy-and-hold results as appropriate for the route.
 
 Calendar dates use `YYYY-MM-DD`; timestamps are ISO 8601 strings. Exact PKR
-money and price values are JSON strings with two fractional digits, for example
-`"105987.04"`. They are never converted through binary floating point.
+money values are JSON strings with two fractional digits, for example
+`"105987.04"`. Historical prices preserve the snapshot's exact decimal
+precision and display at least two fractional digits. Neither representation is
+converted through binary floating point.
 Undefined metrics are JSON `null`—for example, a cash-only Sharpe ratio—not
 `NaN`, positive infinity, or negative infinity.
+
+Historical-price rows contain `date`, `open`, nullable `high`, nullable `low`,
+`close`, integer `volume`, and non-empty `source`. Price values are decimal
+strings created directly from the snapshot text rather than binary floats. The
+response `data_date_range` describes the complete validated ticker snapshot;
+`total` describes date-filter matches before pagination. Open and close must be
+positive, supplied high/low values must be positive and finite, and volume must
+be non-negative.
 
 `actual_class` is evaluation-only and is never used for signals, execution, or
 portfolio accounting. The API carries that limitation in responses rather
 than presenting evaluation labels as an input to a simulated decision.
+
+### Run-scoped historical prices
+
+```bash
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/stocks/OGDC/prices?limit=5&offset=0"
+```
+
+An abridged response is:
+
+```json
+{
+  "schema_version": "1.0",
+  "run_id": "VSL-20261020-OGDC-main-02",
+  "ticker": "OGDC",
+  "source_mode": "verified_legacy_psx_cache",
+  "data_date_range": {"start": "2021-09-16", "end": "2026-09-15"},
+  "total": 1239,
+  "limit": 5,
+  "offset": 0,
+  "rows": [
+    {
+      "date": "2021-09-16",
+      "open": "88.09",
+      "high": null,
+      "low": null,
+      "close": "89.17",
+      "volume": 4201784,
+      "source": "psx_dps"
+    }
+  ],
+  "warnings": [
+    "The prediction target is next-session close-to-close direction; simulated portfolio returns begin at the next-session open. These are distinct measurements."
+  ],
+  "disclaimer": "Academic simulation; not financial advice."
+}
+```
+
+The completed vertical slice owns this snapshot. A dashboard must address its
+selected `run_id`; it must not substitute the legacy mutable stock route.
 
 ### Representative completed-run listing
 
@@ -292,11 +349,16 @@ responses contain three separately paginated objects: `cash_only`,
 
 | Condition | Status | Behavior |
 |---|---:|---|
-| Malformed `run_id` or `experiment_id`, including traversal text | `400` | Reject before constructing an artifact path. |
-| Unknown safe run or experiment ID | `404` | Return a clear `detail` message. |
+| Malformed `run_id`, `experiment_id`, or `ticker`, including traversal text | `400` | Reject before constructing an artifact path. |
+| Historical `start_date` later than `end_date` | `400` | Reject the inverted range. |
+| Unknown safe run, experiment ID, or snapshot ticker | `404` | Return a clear `detail` message. |
 | Default leaderboard requested without a configured default | `409` | Do not guess a run. |
-| Incomplete/non-`PASS` run or integrity failure | `409` | Return no result data from that run. |
-| Invalid pagination value | `422` | Standard FastAPI request-validation response. |
+| Incomplete/non-`PASS` run, invalid snapshot values, or integrity failure | `409` | Return no result data from that run. |
+| Invalid ISO query date or pagination bound | `422` | Standard FastAPI request-validation response. |
+
+Malformed identifiers that reach the endpoint return `400`. Encoded traversal
+containing `/` may instead fail route matching and return `404`; neither case is
+allowed to select an artifact.
 
 For example, without `PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID`:
 
@@ -322,6 +384,9 @@ The v1 artifact repository:
   exact inventory, model bindings, and prediction checksums transitively;
 - reads only known JSON/CSV result artifacts and filters source metadata so
   absolute local paths are never returned;
+- selects historical prices only by matching the run manifest's input checksum
+  to exactly one inventoried `input_snapshot` CSV, then verifies the bytes read;
+- never uses `data/processed/psx_prices.csv` for a v1 historical-price request;
 - never deserializes or serves joblib/Keras/XGBoost model binaries;
 - never modifies a model, experiment, portfolio, benchmark, or manifest;
 - never retrains, predicts, reruns a backtest, or recomputes business metrics
@@ -346,11 +411,15 @@ counts, errors, date range, and metrics.
 
 ### `GET /stocks`
 
-Returns available tickers.
+Returns available tickers from `data/processed/psx_prices.csv`. This compatibility
+route returns `404` when that generated file is absent.
 
 ### `GET /stocks/{ticker}/prices`
 
-Returns standardized historical price rows.
+Returns standardized historical price rows from
+`data/processed/psx_prices.csv`. Its response and most-recent-row behavior are
+intentionally unchanged; dashboards backed by completed runs should use the v1
+run-scoped endpoint instead.
 
 ### `GET /stocks/{ticker}/features`
 

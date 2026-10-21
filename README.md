@@ -310,7 +310,10 @@ All outputs are academic simulations and are not financial advice.
 
 ### Existing v0 API
 
-The original v0 routes and their response shapes remain unchanged.
+The original v0 routes and their response shapes remain unchanged. In
+particular, `/stocks` and `/stocks/{ticker}/prices` still depend on the generated
+`data/processed/psx_prices.csv` compatibility file and return `404` when it is
+absent.
 
 | Endpoint | Purpose |
 |---|---|
@@ -328,6 +331,9 @@ The original v0 routes and their response shapes remain unchanged.
 The additive `/api/v1` API reads completed, immutable vertical-slice artifacts.
 It does not train a model, rerun a backtest, recalculate business metrics, write
 artifacts, perform real trading, or deserialize/serve a fitted model binary.
+A completed vertical slice owns its historical-data snapshot; dashboards should
+therefore request prices through that run rather than through a mutable processed
+data path.
 
 From the repository root, install and start it with the local real run as the
 explicit default when that uncommitted artifact exists:
@@ -357,6 +363,7 @@ resolved from the repository root.
 | `GET /api/v1/vertical-slices` | List completed, checksum-valid vertical-slice runs with pagination. |
 | `GET /api/v1/vertical-slices/{run_id}` | Return run identity, dates, models, experiments, and shared assumptions. |
 | `GET /api/v1/vertical-slices/{run_id}/summary` | Return the persisted final summary. |
+| `GET /api/v1/vertical-slices/{run_id}/stocks/{ticker}/prices` | Return historical daily prices from that run's checksum-verified input snapshot. |
 | `GET /api/v1/vertical-slices/{run_id}/leaderboard` | Return the combined model/portfolio leaderboard. |
 | `GET /api/v1/leaderboard` | Return the explicitly configured default run's leaderboard. |
 | `GET /api/v1/vertical-slices/{run_id}/models` | Return validation and test model metrics. |
@@ -377,6 +384,7 @@ maximum `1000`) and `offset` (default `0`) and return `total`, `limit`,
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/vertical-slices
 curl -s http://127.0.0.1:8000/api/v1/leaderboard
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/stocks/OGDC/prices?limit=5&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0"
 ```
@@ -384,15 +392,24 @@ curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/
 All v1 responses use explicit Pydantic schemas and ISO dates. PKR amounts are
 fixed-scale strings such as `"105987.04"`, preserving decimal meaning.
 Undefined metrics are JSON `null`; `NaN` and infinity are never emitted. Every
-run response carries warnings, limitations, and `"Academic simulation; not
-financial advice."` The API explicitly identifies `actual_class` as
-evaluation-only and never uses it for a signal, execution, or accounting.
+applicable run response retains warnings and the `"Academic simulation; not
+financial advice."` disclaimer. The API explicitly identifies `actual_class`
+as evaluation-only and never uses it for a signal, execution, or accounting.
+
+The historical-price endpoint has its own `limit` range (`1` through `5000`,
+default `500`) and accepts `offset`, inclusive `start_date`, and inclusive
+`end_date`. Date filters apply before pagination, `total` is the filtered count
+before pagination, rows are chronological, prices are decimal strings, and
+unavailable `high`/`low` values are JSON `null`. The React dashboard must use
+this run-scoped route, not legacy `/stocks/{ticker}/prices`.
 
 Run and experiment IDs accept only safe identifier characters. The repository
 rejects traversal, symlink escape, non-`PASS` or incomplete runs, missing or
 extra inventoried files, checksum mismatches, and invalid referenced training
 runs. Clients choose registered IDs, never filenames or filesystem paths, and
-v1 responses do not reveal absolute local paths. See
+v1 responses do not reveal absolute local paths. The price route selects only
+the manifest-bound `input_snapshot` CSV; it never reads
+`data/processed/psx_prices.csv` and never loads a model binary. See
 [`docs/api_design.md`](docs/api_design.md) for response examples and error
 semantics.
 

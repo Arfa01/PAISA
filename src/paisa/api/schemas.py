@@ -1,4 +1,4 @@
-"""Explicit response schemas for the read-only PAISA v1 results API."""
+"""Explicit response schemas for PAISA HTTP APIs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,17 @@ from pydantic import BaseModel
 class DateRange(BaseModel):
     start: str
     end: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    data_dir: str
+    model_dir: str
+    prices_ready: bool
+    dataset_ready: bool
+    model_ready: bool
+    price_rows: int | None = None
+    stocks: list[str] | None = None
 
 
 class ErrorResponse(BaseModel):

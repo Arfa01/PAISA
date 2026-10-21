@@ -1193,7 +1193,7 @@ def test_academic_disclaimer_and_actual_class_limitation_are_preserved(
     assert any("actual_class" in item for item in detail["limitations"])
 
 
-def test_legacy_health_endpoint_shape_is_unchanged(
+def test_legacy_health_endpoint_retains_safe_compatibility_shape(
     generated_artifacts: GeneratedArtifacts,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1208,12 +1208,14 @@ def test_legacy_health_endpoint_shape_is_unchanged(
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "data_dir": str(tmp_path / "legacy-data"),
-        "model_dir": str(tmp_path / "legacy-models"),
+        "data_dir": "legacy-v0-data",
+        "model_dir": "legacy-v0-models",
         "prices_ready": False,
         "dataset_ready": False,
         "model_ready": False,
     }
+    assert str(tmp_path) not in response.text
+    assert "/Users/" not in response.text
 
 
 @pytest.mark.parametrize("mutation", ["artifact-bytes", "manifest-checksum"])

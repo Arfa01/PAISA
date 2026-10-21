@@ -118,6 +118,9 @@ npm run test
 # Type-check and create the production bundle in dist/
 npm run build
 
+# Serve the production bundle on http://127.0.0.1:4173
+npm run preview -- --host 127.0.0.1 --port 4173
+
 # Run ESLint with warnings treated as failures
 npm run lint
 ```
@@ -130,6 +133,11 @@ committed.
 - The dashboard uses the API by default; there is no implicit fixture mode.
 - Requests have timeouts, structured error handling, and cancellation or stale
   response protection where applicable.
+- In Vite development, React Strict Mode intentionally replays Effect setup and
+  cleanup. An initial request may therefore appear as cancelled in browser
+  Network tools before the subsequent request completes successfully. Cleanup
+  aborts that stale request; it is ignored rather than shown or logged as an
+  application failure, and it does not create an automatic retry loop.
 - Paginated API collections are fetched through their registered run and
   experiment identifiers, never client-supplied filesystem paths.
 - Exact PKR values remain fixed-scale strings for display. Undefined metrics

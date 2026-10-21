@@ -96,6 +96,34 @@ describe("PaisaApiClient response validation", () => {
     );
   });
 
+  it("classifies caller cancellation without logging or retrying", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+    const controller = new AbortController();
+
+    const request = client.listRuns(controller.signal);
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({
+      kind: "cancelled",
+      message: "The PAISA API request was cancelled.",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
   it("requires the exact academic disclaimer", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({ ...makeRunList(), disclaimer: "" }),

@@ -287,6 +287,12 @@ The development server uses the configured API at
 presents predictions, trades, benchmarks, and portfolio results only as an
 academic simulation, not financial advice.
 
+In Vite development, React Strict Mode may start an Effect request, cancel it
+during its development-only cleanup check, and then issue the successful
+request. The cancelled entry can appear in browser Network tools; it is
+intentionally ignored and is not an application failure or an infinite retry
+loop. Production builds do not perform this development-only Effect replay.
+
 ## 11. Test, lint, and build the frontend
 
 Run each command from `frontend/`:
@@ -295,6 +301,8 @@ Run each command from `frontend/`:
 npm run test
 npm run build
 npm run lint
+VITE_PAISA_API_BASE_URL=http://127.0.0.1:8000 npm run build
+npm run preview -- --host 127.0.0.1 --port 4173
 ```
 
 `npm run build` produces the ignored `frontend/dist/` directory. Do not commit

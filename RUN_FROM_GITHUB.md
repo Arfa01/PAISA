@@ -19,9 +19,9 @@ source .venv/bin/activate
 ## 3. Install dependencies
 
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install -e .
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 The default install supports `psx-dps`, `manual-csv`, and `sample`. To try the
@@ -63,11 +63,31 @@ Expected: all collected tests pass. The count will grow as components are added.
 
 ## 6. Start the API
 
-Use this command:
+Activate the environment and set the v1 artifact roots before starting the
+server. The first two variables below are their repository-relative defaults.
+The third variable selects the only run that the unqualified v1 leaderboard
+may use:
 
 ```bash
+source .venv/bin/activate
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
+
+The local example expects the completed run at
+`artifacts/vertical_slice/VSL-20261020-OGDC-main-02` and its referenced training
+run below `artifacts/model_training`. These generated artifacts are deliberately
+not committed, so generate them with the vertical-slice workflow or copy the
+complete immutable artifact roots to the configured locations before using the
+v1 endpoints. Both roots may instead be absolute paths. Relative paths resolve
+from the repository root, and resolved runs must stay within those roots.
+
+`PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` may be omitted when only explicit
+`/vertical-slices/{run_id}/...` URLs are used. If it is absent,
+`GET /api/v1/leaderboard` returns `409`; it never chooses whichever directory
+happens to be newest or first.
 
 ## 7. Open the API in the browser
 
@@ -81,6 +101,99 @@ http://127.0.0.1:8000/models/baseline/metrics
 http://127.0.0.1:8000/predict/OGDC
 http://127.0.0.1:8000/docs
 ```
+
+These legacy v0 routes and their response shapes are unchanged.
+
+## 8. Open the read-only v1 result API
+
+Use `VSL-20261020-OGDC-main-02` and its first experiment as the local real-run
+example:
+
+```text
+http://127.0.0.1:8000/api/v1/vertical-slices
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/summary
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/leaderboard
+http://127.0.0.1:8000/api/v1/leaderboard
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/models
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/portfolios
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/drawdowns?limit=25&offset=0
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/source
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/snapshots?limit=25&offset=0
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/benchmarks?limit=25&offset=0
+```
+
+Equivalent command-line checks include:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/vertical-slices
+curl -s http://127.0.0.1:8000/api/v1/leaderboard
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0"
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0"
+```
+
+Abridged representative fields from
+`equity-curves?limit=1&offset=0` are:
+
+```json
+{
+  "schema_version": "1.0",
+  "run_id": "VSL-20261020-OGDC-main-02",
+  "source_mode": "verified_legacy_psx_cache",
+  "data_date_range": {"start": "2021-09-16", "end": "2026-09-15"},
+  "warnings": [
+    "The prediction target is next-session close-to-close direction; simulated portfolio returns begin at the next-session open. These are distinct measurements."
+  ],
+  "limitations": [
+    "actual_class is evaluation-only and is never used for signals, execution, or portfolio accounting."
+  ],
+  "disclaimer": "Academic simulation; not financial advice.",
+  "total": 1110,
+  "limit": 1,
+  "offset": 0,
+  "rows": [
+    {
+      "date": "2025-12-15",
+      "series_id": "BUY-AND-HOLD",
+      "portfolio_type": "buy_and_hold",
+      "model_id": null,
+      "portfolio_id": "VSL-20261020-OGDC-main-02-m-001-buy-and-hold",
+      "cash": "100000.00",
+      "shares": 0,
+      "market_price": "278.67",
+      "total_equity": "100000.00",
+      "drawdown": 0.0
+    }
+  ]
+}
+```
+
+`limit` defaults to `200`, must be from `1` through `1000`, and `offset`
+defaults to `0`. Pagination applies to the run listing, equity curves,
+drawdowns, strategy trades, strategy snapshots, and each benchmark series.
+Rows are stable and deterministically ordered, and every paginated object
+reports its full `total`.
+
+Dates are ISO strings. PKR money and price fields are fixed-scale decimal
+strings such as `"100000.00"`, not binary floating-point values. Undefined
+metrics such as a cash-only Sharpe ratio are `null`; the service never emits
+`NaN` or infinity.
+
+Before returning v1 data, PAISA requires a matching safe run ID, a completed
+`PASS` manifest, an exact artifact inventory, valid SHA-256 checksums, and a
+valid referenced model-training integrity root. Traversal, symlink escape,
+unsafe experiment IDs, arbitrary filenames, incomplete/failed runs, or changed
+artifacts are rejected. The v1 routes expose no absolute local paths and never
+load or serve joblib files. They do not retrain, backtest, write artifacts,
+perform real trading, or turn `actual_class` into a decision. Every v1 run
+response retains the academic-simulation disclaimer.
+
+See [`docs/api_design.md`](docs/api_design.md) for the complete endpoint and
+error contract.
 
 ## Current working PSX command
 

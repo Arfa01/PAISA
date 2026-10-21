@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from paisa.config import get_paths
 from paisa.features import FEATURE_COLUMNS
+from paisa.api.router_v1 import router as results_v1_router
 
 paths = get_paths(data_dir=os.getenv("PAISA_DATA_DIR"), model_dir=os.getenv("PAISA_MODEL_DIR"))
 app = FastAPI(title="PAISA v0 API", version="0.1.0")
@@ -171,3 +172,8 @@ def predict(ticker: str) -> dict[str, Any]:
         },
         "disclaimer": "Academic prototype only. This is not financial advice or a buy/sell recommendation.",
     }
+
+
+# The additive v1 router reads immutable result artifacts only.  Legacy routes
+# above deliberately retain their existing behavior and response shapes.
+app.include_router(results_v1_router)

@@ -1,6 +1,7 @@
-# Run PAISA v0 from GitHub
+# Run PAISA from GitHub
 
-These are the exact steps to run the current PAISA v0 backend from a fresh clone.
+These are the exact steps to run the current PAISA backend and read-only results
+dashboard from a fresh clone.
 
 ## 1. Clone the repo
 
@@ -214,6 +215,92 @@ binary for this request.
 
 See [`docs/api_design.md`](docs/api_design.md) for the complete endpoint and
 error contract.
+
+## 9. Install and configure the React dashboard
+
+The dashboard recommends Node.js 22 LTS (22.12 or newer) and also supports
+Node.js 24; Node.js 22.20.0 is the current tested version. From the repository
+root, install the frontend dependencies and copy
+the committed example configuration:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local
+```
+
+`frontend/.env.example` contains:
+
+```text
+VITE_PAISA_API_BASE_URL=http://127.0.0.1:8000
+```
+
+`VITE_PAISA_API_BASE_URL` must be the PAISA HTTP(S) API base URL. Do not use an
+absolute local filesystem path. Local `.env` files are ignored by Git; the
+example file remains committed.
+
+The dashboard consumes completed immutable v1 results, including OGDC prices
+from the selected run's v1 price endpoint. It does not train, predict, run a
+backtest, calculate portfolio metrics, read artifact files, deserialize model
+binaries, or execute trades. An API failure remains a visible error; the
+running application never silently falls back to fixture data. Test fixtures
+are limited to automated tests.
+
+## 10. Run the integrated dashboard
+
+Before starting the applications, make sure the configured immutable artifact
+roots contain `VSL-20261020-OGDC-main-02` and its referenced model-training run.
+
+The Historical OGDC view calls
+`GET /api/v1/vertical-slices/{selected_run_id}/stocks/OGDC/prices`, using the
+currently selected run ID. It requests every available page with the documented
+maximum `limit=5000`; the backend reads the immutable run's checksum-verified
+`input_snapshot` through the API, not `data/processed/psx_prices.csv`. A request
+failure remains visible in the view, with no fixture, sample, synthetic, or fake
+price fallback.
+
+From the repository root, start the backend in the first terminal:
+
+```bash
+source .venv/bin/activate
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Start the frontend in a second terminal:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Open the dashboard at:
+
+```text
+http://127.0.0.1:5173
+```
+
+The development server uses the configured API at
+`http://127.0.0.1:8000`. The dashboard keeps the API disclaimer visible and
+presents predictions, trades, benchmarks, and portfolio results only as an
+academic simulation, not financial advice.
+
+## 11. Test, lint, and build the frontend
+
+Run each command from `frontend/`:
+
+```bash
+npm run test
+npm run build
+npm run lint
+```
+
+`npm run build` produces the ignored `frontend/dist/` directory. Do not commit
+`node_modules/`, `dist/`, local environment files, real model artifacts, or
+real vertical-slice artifacts. See [`frontend/README.md`](frontend/README.md)
+for the frontend-specific runbook.
 
 ## Current working PSX command
 

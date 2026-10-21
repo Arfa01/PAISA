@@ -413,6 +413,72 @@ the manifest-bound `input_snapshot` CSV; it never reads
 [`docs/api_design.md`](docs/api_design.md) for response examples and error
 semantics.
 
+## React results dashboard
+
+The dashboard under [`frontend/`](frontend/) presents the completed OGDC
+vertical slice with React, TypeScript, and Plotly. It reads the PAISA API; it
+does not train models, execute backtests or trades, recompute financial
+metrics, read artifact files directly, or load fitted model binaries. Runtime
+API failures are shown as errors and are never silently replaced with fixture
+data. All results remain academic simulations and are not financial advice.
+
+Node.js 22 LTS is recommended (22.12 or newer; Node.js 24 is also supported).
+The current frontend has been exercised with Node.js 22.20.0. Install and
+configure it from the repository root:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local
+```
+
+The example environment file configures the browser client with:
+
+```text
+VITE_PAISA_API_BASE_URL=http://127.0.0.1:8000
+```
+
+Do not put filesystem paths in this variable; it must be the HTTP(S) base URL
+of the PAISA API. Start the backend from the repository root in one terminal:
+
+```bash
+source .venv/bin/activate
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+The configured immutable vertical-slice and model-training artifact roots must
+already contain that completed run. In a second terminal, start the frontend:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`.
+
+The Historical OGDC view uses the currently selected run and requests
+`GET /api/v1/vertical-slices/{selected_run_id}/stocks/OGDC/prices`. It retrieves
+all available rows through documented pages of at most `5000`; the backend
+serves the selected run's immutable, checksum-verified input snapshot rather
+than `data/processed/psx_prices.csv`. API failures remain visible and the
+dashboard does not substitute fixture, sample, synthetic, or fake prices.
+
+Frontend quality and production-build commands are:
+
+```bash
+cd frontend
+npm run test
+npm run build
+npm run lint
+```
+
+The production build is written to the ignored `frontend/dist/` directory.
+See [`frontend/README.md`](frontend/README.md) for the complete integrated-demo
+workflow and frontend behavior.
+
 ## Folder structure
 
 ```text
@@ -423,6 +489,7 @@ PAISA/
 │   ├── external/     # manually downloaded CSVs
 │   └── metadata/     # stock universe
 ├── docs/
+├── frontend/         # React + TypeScript read-only results dashboard
 ├── models/           # generated model artifacts
 ├── scripts/
 ├── src/paisa/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Callable, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,14 +15,17 @@ from paisa.api.artifact_repository import (
     ArtifactRepository,
     DefaultRunNotConfiguredError,
     ExperimentNotFoundError,
+    InvalidDateRangeError,
     InvalidIdentifierError,
     RunNotCompletedError,
     RunNotFoundError,
+    StockNotFoundError,
     get_artifact_repository,
 )
 from paisa.api.schemas import (
     BenchmarksResponse,
     DrawdownsResponse,
+    ErrorResponse,
     EquityCurvesResponse,
     ExperimentDetailResponse,
     ExperimentsResponse,
@@ -30,6 +34,7 @@ from paisa.api.schemas import (
     PortfoliosResponse,
     SnapshotsResponse,
     SourceResponse,
+    StockPricesResponse,
     TradesResponse,
     VerticalSliceDetailResponse,
     VerticalSliceListResponse,
@@ -39,6 +44,7 @@ from paisa.api.schemas import (
 
 router = APIRouter(prefix="/api/v1", tags=["experiment-results-v1"])
 MAX_TABLE_LIMIT = 1000
+MAX_PRICE_LIMIT = 5000
 T = TypeVar("T")
 _WEB_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _FILE_URI = re.compile(r"\bfile:(?://)?[^\s\"'<>]*", re.IGNORECASE)
@@ -79,9 +85,9 @@ def _repository_call(operation: Callable[[], T]) -> T:
         result = operation()
         _assert_no_absolute_local_paths(result)
         return result
-    except InvalidIdentifierError as exc:
+    except (InvalidIdentifierError, InvalidDateRangeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (RunNotFoundError, ExperimentNotFoundError) as exc:
+    except (RunNotFoundError, ExperimentNotFoundError, StockNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except DefaultRunNotConfiguredError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -144,6 +150,50 @@ def get_vertical_slice_summary(
     repository: ArtifactRepository = Depends(get_artifact_repository),
 ) -> dict[str, Any]:
     return _repository_call(lambda: repository.load_summary(run_id))
+
+
+@router.get(
+    "/vertical-slices/{run_id}/stocks/{ticker}/prices",
+    response_model=StockPricesResponse,
+    responses={
+        400: {
+            "model": ErrorResponse,
+            "description": "Malformed run/ticker identifier or an inverted date range.",
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "The run does not exist or the ticker is absent from its snapshot.",
+        },
+        409: {
+            "model": ErrorResponse,
+            "description": "The run is incomplete, failed, or violates its integrity contract.",
+        },
+        422: {
+            "description": "A query parameter is not a valid ISO date or is out of bounds."
+        },
+    },
+)
+def get_stock_prices(
+    run_id: str,
+    ticker: str,
+    limit: int = Query(default=500, ge=1, le=MAX_PRICE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    """Read historical prices from the completed run's immutable input snapshot."""
+
+    return _repository_call(
+        lambda: repository.load_stock_prices(
+            run_id,
+            ticker,
+            limit=limit,
+            offset=offset,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    )
 
 
 @router.get(

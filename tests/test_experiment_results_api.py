@@ -3,10 +3,12 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import re
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
@@ -167,6 +169,132 @@ def _refresh_vertical_checksum(run_directory: Path, relative_path: str) -> None:
     )
 
 
+def _price_snapshot_relative(run_directory: Path) -> str:
+    manifest = json.loads((run_directory / "manifest.json").read_text(encoding="utf-8"))
+    digest = manifest["data"]["input_prices_sha256"]
+    matches = [
+        item["path"]
+        for item in manifest["artifacts"]
+        if item["sha256"] == digest
+        and item["path"].startswith("input_snapshot/")
+        and item["path"].count("/") == 1
+        and item["path"].lower().endswith(".csv")
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _read_price_snapshot(run_directory: Path) -> tuple[str, list[str], list[dict[str, str]]]:
+    relative = _price_snapshot_relative(run_directory)
+    with (run_directory / relative).open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        assert reader.fieldnames is not None
+        return relative, list(reader.fieldnames), list(reader)
+
+
+def _write_and_reseal_price_snapshot(
+    run_directory: Path,
+    relative: str,
+    fieldnames: list[str],
+    rows: list[dict[str, str]],
+) -> None:
+    snapshot_path = run_directory / relative
+    with snapshot_path.open("w", encoding="utf-8", newline="") as destination:
+        writer = csv.DictWriter(destination, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    snapshot_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+
+    summary_path = run_directory / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["data_source"]["input_prices_sha256"] = snapshot_digest
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    reference_path = run_directory / "model_training_run_reference.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    reference["input_prices_sha256"] = snapshot_digest
+    reference_path.write_text(
+        json.dumps(reference, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    manifest_path = run_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["data"]["input_prices_sha256"] = snapshot_digest
+    updated_digests = {
+        relative: snapshot_digest,
+        "final_summary.json": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+        "model_training_run_reference.json": hashlib.sha256(
+            reference_path.read_bytes()
+        ).hexdigest(),
+    }
+    for item in manifest["artifacts"]:
+        if item["path"] in updated_digests:
+            item["sha256"] = updated_digests[item["path"]]
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _add_pipeline_price_contract(
+    run_directory: Path,
+    *,
+    mutation: str,
+) -> None:
+    relative, _fieldnames, rows = _read_price_snapshot(run_directory)
+    snapshot_path = run_directory / relative
+    snapshot_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    dates = sorted(row["date"] for row in rows)
+    metadata = {
+        "schema_version": "1.0",
+        "prices_artifact": {
+            "schema_version": "1.0",
+            "status": "complete",
+            "frequency": "daily",
+            "path": Path(relative).name,
+            "sha256": snapshot_digest,
+            "row_count": len(rows),
+            "symbols": {
+                "OGDC": {
+                    "row_count": len(rows),
+                    "date_start": dates[0],
+                    "date_end": dates[-1],
+                    "source": "deterministic_fixture",
+                }
+            },
+        },
+    }
+    contract = metadata["prices_artifact"]
+    if mutation == "path-traversal":
+        contract["path"] = "../outside.csv"
+    elif mutation == "checksum":
+        contract["sha256"] = "0" * 64
+    elif mutation == "row-count":
+        contract["row_count"] = len(rows) + 1
+    elif mutation == "symbol-coverage":
+        contract["symbols"]["OGDC"]["date_end"] = dates[-2]
+    elif mutation != "valid":  # pragma: no cover - test helper misuse
+        raise AssertionError(f"unknown pipeline contract mutation: {mutation}")
+
+    metadata_path = run_directory / "input_snapshot" / "pipeline_metadata.json"
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    manifest_path = run_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"].append(
+        {
+            "path": "input_snapshot/pipeline_metadata.json",
+            "sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+        }
+    )
+    manifest["artifacts"].sort(key=lambda item: item["path"])
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def _all_strings(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
@@ -185,6 +313,7 @@ def _endpoint_urls(run_id: str, experiment_id: str) -> tuple[str, ...]:
         "/api/v1/vertical-slices",
         base,
         f"{base}/summary",
+        f"{base}/stocks/OGDC/prices?limit=7&offset=1",
         f"{base}/leaderboard",
         f"{base}/models",
         f"{base}/portfolios",
@@ -215,6 +344,537 @@ def test_fixture_artifacts_support_every_v1_endpoint_without_exposing_paths(
             assert not any(value.startswith("/") for value in _all_strings(payload))
             assert "NaN" not in response.text
             assert "Infinity" not in response.text
+            assert "Traceback" not in response.text
+
+
+def test_run_scoped_price_history_returns_explicit_safe_schema(
+    generated_artifacts: GeneratedArtifacts,
+) -> None:
+    _relative, _fieldnames, source_rows = _read_price_snapshot(
+        generated_artifacts.run_directory
+    )
+    expected = sorted(source_rows, key=lambda row: row["date"])[0]
+    url = f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/ogdc/prices"
+
+    with _api_client(_settings(generated_artifacts)) as client:
+        response = client.get(f"{url}?limit=5&offset=0")
+        default_page = client.get(url)
+
+    assert response.status_code == default_page.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == "1.0"
+    assert payload["run_id"] == FIXTURE_RUN_ID
+    assert payload["ticker"] == "OGDC"
+    assert payload["source_mode"] == "fixture_test"
+    assert payload["data_date_range"] == {
+        "start": min(row["date"] for row in source_rows),
+        "end": max(row["date"] for row in source_rows),
+    }
+    assert payload["total"] == len(source_rows)
+    assert payload["limit"] == 5
+    assert payload["offset"] == 0
+    assert len(payload["rows"]) == 5
+    first = payload["rows"][0]
+    assert first["date"] == expected["date"]
+    assert Decimal(first["open"]) == Decimal(expected["open"])
+    assert Decimal(first["close"]) == Decimal(expected["close"])
+    assert len(first["open"].partition(".")[2]) >= 2
+    assert len(first["close"].partition(".")[2]) >= 2
+    assert first["high"] is None
+    assert first["low"] is None
+    assert isinstance(first["volume"], int)
+    assert first["source"] == "deterministic_fixture"
+    assert payload["disclaimer"] == ACADEMIC_DISCLAIMER
+    assert default_page.json()["limit"] == 500
+    assert "NaN" not in response.text
+    assert "Infinity" not in response.text
+    assert str(generated_artifacts.vertical_root) not in response.text
+    assert str(generated_artifacts.training_root) not in response.text
+    assert not any(value.startswith("/") for value in _all_strings(payload))
+
+
+def test_price_history_is_deterministically_ordered_and_paginated(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "reordered" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative, fieldnames, rows = _read_price_snapshot(copied_run)
+    _write_and_reseal_price_snapshot(
+        copied_run, relative, fieldnames, list(reversed(rows))
+    )
+    base = f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        first = client.get(f"{base}?limit=5000")
+        second = client.get(f"{base}?limit=5000")
+        page = client.get(f"{base}?limit=4&offset=3")
+
+    assert first.status_code == second.status_code == page.status_code == 200
+    full_rows = first.json()["rows"]
+    dates = [row["date"] for row in full_rows]
+    assert dates == sorted(dates)
+    assert len(dates) == len(set(dates))
+    assert second.json()["rows"] == full_rows
+    assert page.json()["total"] == len(full_rows)
+    assert page.json()["rows"] == full_rows[3:7]
+
+
+def test_price_history_applies_inclusive_date_filters_before_pagination(
+    generated_artifacts: GeneratedArtifacts,
+) -> None:
+    base = f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+    with _api_client(_settings(generated_artifacts)) as client:
+        full = client.get(f"{base}?limit=5000")
+        assert full.status_code == 200
+        dates = [row["date"] for row in full.json()["rows"]]
+        start = dates[20]
+        end = dates[39]
+        start_only = client.get(f"{base}?limit=5000&start_date={start}")
+        end_only = client.get(f"{base}?limit=5000&end_date={end}")
+        combined = client.get(
+            f"{base}?limit=5000&start_date={start}&end_date={end}"
+        )
+        paged = client.get(
+            f"{base}?limit=3&offset=2&start_date={start}&end_date={end}"
+        )
+
+    assert start_only.status_code == end_only.status_code == 200
+    assert combined.status_code == paged.status_code == 200
+    assert start_only.json()["total"] == len(dates) - 20
+    assert start_only.json()["rows"][0]["date"] == start
+    assert end_only.json()["total"] == 40
+    assert end_only.json()["rows"][-1]["date"] == end
+    assert combined.json()["total"] == 20
+    assert [row["date"] for row in combined.json()["rows"]] == dates[20:40]
+    assert paged.json()["total"] == 20
+    assert [row["date"] for row in paged.json()["rows"]] == dates[22:25]
+
+
+def test_price_history_query_validation_is_documented_and_stable(
+    generated_artifacts: GeneratedArtifacts,
+) -> None:
+    base = f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+    with _api_client(_settings(generated_artifacts)) as client:
+        invalid_range = client.get(
+            f"{base}?start_date=2025-03-01&end_date=2025-02-01"
+        )
+        invalid_date = client.get(f"{base}?start_date=not-a-date")
+        invalid_limits = [
+            client.get(f"{base}?limit=0"),
+            client.get(f"{base}?limit=5001"),
+            client.get(f"{base}?offset=-1"),
+        ]
+
+    assert invalid_range.status_code == 400
+    assert invalid_range.json()["detail"] == "start_date must be on or before end_date"
+    assert invalid_date.status_code == 422
+    assert all(response.status_code == 422 for response in invalid_limits)
+
+
+def test_price_history_distinguishes_unknown_ticker_run_and_incomplete_runs(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "statuses" / "vertical"
+    _copy_valid_run(generated_artifacts, vertical_root)
+    (vertical_root / "incomplete-run").mkdir()
+    failed = vertical_root / "failed-run"
+    failed.mkdir()
+    (failed / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "vertical_slice_run_id": "failed-run",
+                "status": "FAIL",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        unknown_ticker = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/ZZZZ/prices"
+        )
+        unknown_run = client.get(
+            "/api/v1/vertical-slices/unknown-run/stocks/OGDC/prices"
+        )
+        incomplete = client.get(
+            "/api/v1/vertical-slices/incomplete-run/stocks/OGDC/prices"
+        )
+        failed_response = client.get(
+            "/api/v1/vertical-slices/failed-run/stocks/OGDC/prices"
+        )
+
+    assert unknown_ticker.status_code == unknown_run.status_code == 404
+    assert incomplete.status_code == failed_response.status_code == 409
+    for response in (unknown_ticker, unknown_run, incomplete, failed_response):
+        assert str(vertical_root) not in response.text
+
+
+@pytest.mark.parametrize("mutation", ["snapshot-bytes", "inventory-checksum"])
+def test_price_history_rejects_corruption_and_checksum_mismatch(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    vertical_root = tmp_path / mutation / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative = _price_snapshot_relative(copied_run)
+    if mutation == "snapshot-bytes":
+        snapshot = copied_run / relative
+        snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+    else:
+        manifest_path = copied_run / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        next(
+            item for item in manifest["artifacts"] if item["path"] == relative
+        )["sha256"] = "0" * 64
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert "integrity" in response.json()["detail"].lower()
+    assert str(vertical_root) not in response.text
+
+
+@pytest.mark.parametrize("delete_snapshot", [False, True])
+def test_price_history_rejects_missing_or_uninventoried_snapshot(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    delete_snapshot: bool,
+) -> None:
+    case = "missing-snapshot" if delete_snapshot else "uninventoried-snapshot"
+    vertical_root = tmp_path / case / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative = _price_snapshot_relative(copied_run)
+    if delete_snapshot:
+        (copied_run / relative).unlink()
+    manifest_path = copied_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"] = [
+        item for item in manifest["artifacts"] if item["path"] != relative
+    ]
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert "snapshot" in response.json()["detail"].lower() or "integrity" in response.json()[
+        "detail"
+    ].lower()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["path-traversal", "checksum", "row-count", "symbol-coverage"]
+)
+def test_price_history_rejects_invalid_input_snapshot_contract(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    vertical_root = tmp_path / f"contract-{mutation}" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    _add_pipeline_price_contract(copied_run, mutation=mutation)
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert str(vertical_root) not in response.text
+
+
+def test_price_history_requires_metadata_for_a_real_data_run(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "missing-real-metadata" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    manifest_path = copied_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["data"]["is_real_data"] = True
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert "metadata" in response.json()["detail"].lower()
+
+
+def test_price_history_rejects_internal_and_request_path_traversal(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "traversal" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative = _price_snapshot_relative(copied_run)
+    manifest_path = copied_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    next(item for item in manifest["artifacts"] if item["path"] == relative)[
+        "path"
+    ] = "input_snapshot/../outside.csv"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        internal = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+        request_path = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/"
+            "%2E%2E%2Foutside/prices"
+        )
+        malformed_ticker = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/bad%5Cticker/prices"
+        )
+    assert internal.status_code == 409
+    assert request_path.status_code in {400, 404}
+    assert malformed_ticker.status_code == 400
+    assert "ticker" in malformed_ticker.json()["detail"]
+    assert str(vertical_root) not in internal.text
+    assert str(vertical_root) not in request_path.text
+    assert str(vertical_root) not in malformed_ticker.text
+
+
+def test_price_history_rejects_snapshot_symlink_escape(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "symlink" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative = _price_snapshot_relative(copied_run)
+    snapshot = copied_run / relative
+    external = tmp_path / "outside-prices.csv"
+    external.write_bytes(snapshot.read_bytes())
+    snapshot.unlink()
+    try:
+        snapshot.symlink_to(external)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert str(external) not in response.text
+
+
+def test_inventoried_reader_rejects_parent_symlink_swap(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vertical_root = tmp_path / "symlink-race" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    repository = ArtifactRepository(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    )
+    validated = repository._validate_run(FIXTURE_RUN_ID)
+    relative = _price_snapshot_relative(copied_run)
+
+    snapshot_directory = copied_run / Path(relative).parts[0]
+    held_directory = copied_run / "held-input-snapshot"
+    external_directory = tmp_path / "outside-input-snapshot"
+    external_directory.mkdir()
+    shutil.copy2(
+        copied_run / relative,
+        external_directory / Path(relative).name,
+    )
+
+    real_open = os.open
+    swapped = False
+
+    def swap_parent_before_open(
+        path: Any, flags: int, *args: Any, **kwargs: Any
+    ) -> int:
+        nonlocal swapped
+        path_text = os.fspath(path)
+        if not swapped and (
+            path_text == "input_snapshot" or path_text.endswith(relative)
+        ):
+            snapshot_directory.rename(held_directory)
+            snapshot_directory.symlink_to(external_directory, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_parent_before_open)
+    with pytest.raises(ArtifactIntegrityError):
+        repository._csv_artifact(validated, relative)
+    assert swapped is True
+
+
+def test_inventoried_json_is_rechecked_after_run_validation(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "json-reread" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    _add_pipeline_price_contract(copied_run, mutation="valid")
+    repository = ArtifactRepository(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    )
+    validated = repository._validate_run(FIXTURE_RUN_ID)
+
+    metadata_path = copied_run / "input_snapshot" / "pipeline_metadata.json"
+    metadata_path.write_text(
+        metadata_path.read_text(encoding="utf-8") + " ", encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactIntegrityError):
+        repository._json_artifact(validated, "input_snapshot/pipeline_metadata.json")
+
+
+def test_price_history_rejects_duplicate_ticker_dates(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "duplicate-date" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative, fieldnames, rows = _read_price_snapshot(copied_run)
+    rows[1]["date"] = rows[0]["date"]
+    _write_and_reseal_price_snapshot(copied_run, relative, fieldnames, rows)
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert "absolute" not in response.text.lower()
+
+
+def test_price_history_validates_primary_coverage_for_any_requested_ticker(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+) -> None:
+    vertical_root = tmp_path / "primary-coverage" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative, fieldnames, rows = _read_price_snapshot(copied_run)
+    second_symbol_rows = [dict(row, ticker="HBL") for row in rows]
+    _write_and_reseal_price_snapshot(
+        copied_run, relative, fieldnames, rows + second_symbol_rows
+    )
+
+    manifest_path = copied_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["data"]["row_count"] = 1
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/HBL/prices"
+        )
+    assert response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("date", "not-a-date"),
+        ("open", "0"),
+        ("open", "NaN"),
+        ("open", "1e1000000"),
+        ("close", "-1"),
+        ("close", "Infinity"),
+        ("high", "Infinity"),
+        ("low", "1e-1000000"),
+        ("volume", "-1"),
+        ("volume", "1.5"),
+        ("source", ""),
+    ],
+)
+def test_price_history_rejects_invalid_snapshot_values(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    vertical_root = tmp_path / f"invalid-{field}-{value}" / "vertical"
+    copied_run = _copy_valid_run(generated_artifacts, vertical_root)
+    relative, fieldnames, rows = _read_price_snapshot(copied_run)
+    rows[0][field] = value
+    _write_and_reseal_price_snapshot(copied_run, relative, fieldnames, rows)
+
+    with _api_client(
+        _settings(generated_artifacts, vertical_root=vertical_root)
+    ) as client:
+        response = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices"
+        )
+    assert response.status_code == 409
+    assert "NaN" not in response.text
+    assert "Infinity" not in response.text
+    assert str(vertical_root) not in response.text
+
+
+def test_price_history_never_reads_legacy_prices_or_model_binaries(
+    generated_artifacts: GeneratedArtifacts,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "paths",
+        get_paths(data_dir=tmp_path / "legacy-data", model_dir=tmp_path / "models"),
+    )
+
+    def reject_joblib_load(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("run-scoped price API must not deserialize joblib")
+
+    monkeypatch.setattr("joblib.load", reject_joblib_load)
+    with _api_client(_settings(generated_artifacts)) as client:
+        legacy = client.get("/stocks/OGDC/prices")
+        versioned = client.get(
+            f"/api/v1/vertical-slices/{FIXTURE_RUN_ID}/stocks/OGDC/prices?limit=1"
+        )
+    assert legacy.status_code == 404
+    assert versioned.status_code == 200
+    assert versioned.json()["rows"][0]["source"] == "deterministic_fixture"
+
+
+def test_price_history_openapi_documents_success_and_all_errors() -> None:
+    path = "/api/v1/vertical-slices/{run_id}/stocks/{ticker}/prices"
+    operation = app.openapi()["paths"][path]["get"]
+    assert set(operation["responses"]) == {"200", "400", "404", "409", "422"}
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/StockPricesResponse")
 
 
 def test_lists_only_completed_checksum_valid_pass_runs(
@@ -715,3 +1375,29 @@ def test_local_real_run_all_endpoints_when_available() -> None:
             assert response.status_code == 200, (url, response.text)
             assert response.json()["disclaimer"] == ACADEMIC_DISCLAIMER
             assert str(REPOSITORY_ROOT) not in response.text
+            assert "Traceback" not in response.text
+        first_page = client.get(
+            f"/api/v1/vertical-slices/{REAL_RUN_ID}/stocks/OGDC/prices"
+            "?limit=5&offset=0"
+        )
+        complete = client.get(
+            f"/api/v1/vertical-slices/{REAL_RUN_ID}/stocks/OGDC/prices"
+            "?limit=5000&offset=0"
+        )
+
+    assert first_page.status_code == complete.status_code == 200
+    assert len(first_page.json()["rows"]) == 5
+    payload = complete.json()
+    assert payload["total"] == 1239
+    assert payload["rows"][0]["date"] == "2021-09-16"
+    assert payload["rows"][-1] == {
+        "date": "2026-09-15",
+        "open": "317.00",
+        "high": None,
+        "low": None,
+        "close": "314.87",
+        "volume": 1499010,
+        "source": "psx_dps",
+    }
+    assert all(row["source"] == "psx_dps" for row in payload["rows"])
+    assert all(row["high"] is None and row["low"] is None for row in payload["rows"])

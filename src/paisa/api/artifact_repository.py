@@ -39,6 +39,11 @@ ACTUAL_CLASS_LIMITATION = (
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MONEY = re.compile(r"^-?(?:0|[1-9][0-9]*)\.[0-9]{2}$")
+_SUPPORTS_SECURE_DIR_FD = (
+    hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+)
 _MODEL_VARIANTS = ("M-001", "M-002", "M-003", "M-004")
 _TRADE_COLUMNS = (
     "schema_version",
@@ -81,6 +86,14 @@ class RunNotFoundError(ArtifactRepositoryError):
 
 
 class ExperimentNotFoundError(ArtifactRepositoryError):
+    pass
+
+
+class StockNotFoundError(ArtifactRepositoryError):
+    pass
+
+
+class InvalidDateRangeError(ArtifactRepositoryError):
     pass
 
 
@@ -162,6 +175,36 @@ def _assert_finite_json(value: Any) -> None:
             _assert_finite_json(nested)
 
 
+def _read_regular_descriptor(descriptor: int, *, label: str) -> bytes:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    after = os.fstat(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after:
+        raise ValueError(f"{label} changed while it was being read")
+    return b"".join(chunks)
+
+
 def _open_regular_bytes(path: Path, *, label: str) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -173,39 +216,52 @@ def _open_regular_bytes(path: Path, *, label: str) -> bytes:
     except (FileNotFoundError, OSError) as exc:
         raise ValueError(f"{label} is missing or is not a regular file") from exc
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} must be a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if identity_before != identity_after:
-            raise ValueError(f"{label} changed while it was being read")
-        return b"".join(chunks)
+        return _read_regular_descriptor(descriptor, label=label)
     finally:
         os.close(descriptor)
 
 
-def _read_json(path: Path, *, label: str) -> dict[str, Any]:
-    payload = _open_regular_bytes(path, label=label)
+def _open_regular_bytes_beneath(root: Path, relative: str, *, label: str) -> bytes:
+    """Open a regular file without following any path-component symlink."""
+
+    safe_relative = _safe_relative_path(relative, field="artifact path")
+    parts = PurePosixPath(safe_relative).parts
+    if not _SUPPORTS_SECURE_DIR_FD:  # pragma: no cover - non-POSIX fallback
+        candidate = root
+        for part in parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ValueError(f"{label} has a symbolic-link path component")
+        try:
+            candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(f"{label} escapes its artifact root") from exc
+        return _open_regular_bytes(candidate, label=label)
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        for part in parts[:-1]:
+            current = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        artifact = os.open(parts[-1], file_flags, dir_fd=current)
+        descriptors.append(artifact)
+        return _read_regular_descriptor(artifact, label=label)
+    except (FileNotFoundError, NotADirectoryError, OSError) as exc:
+        raise ValueError(f"{label} is missing or has an unsafe path") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _decode_json(payload: bytes, *, label: str) -> dict[str, Any]:
     try:
         value = json.loads(payload, parse_constant=_reject_json_constant)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -214,6 +270,10 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
         raise ValueError(f"{label} must contain a JSON object")
     _assert_finite_json(value)
     return value
+
+
+def _read_json(path: Path, *, label: str) -> dict[str, Any]:
+    return _decode_json(_open_regular_bytes(path, label=label), label=label)
 
 
 def _sha256(path: Path, *, label: str) -> str:
@@ -461,6 +521,27 @@ def _money(value: Any, *, field: str, nullable: bool = False) -> str | None:
     if not parsed.is_finite():
         raise ValueError(f"{field} must be finite")
     return format(parsed, ".2f")
+
+
+def _positive_decimal(value: Any, *, field: str, nullable: bool = False) -> str | None:
+    text = "" if value is None else str(value).strip()
+    if text.lower() in {"", "nan", "none", "null"}:
+        if nullable:
+            return None
+        raise ValueError(f"{field} is required")
+    if not re.fullmatch(r"[0-9]{1,100}(?:\.[0-9]{1,18})?", text):
+        raise ValueError(
+            f"{field} must be a positive fixed-point decimal with at most "
+            "100 integer digits and 18 decimal places"
+        )
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field} must be a decimal") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"{field} must be a finite, strictly positive decimal")
+    decimal_places = max(2, -parsed.as_tuple().exponent)
+    return format(parsed, f".{decimal_places}f")
 
 
 def _paginate(rows: list[dict[str, Any]], *, limit: int, offset: int) -> dict[str, Any]:
@@ -822,27 +903,23 @@ class ArtifactRepository:
                     f"Vertical-slice run '{safe_id}' failed integrity validation"
                 ) from exc
 
-    def _artifact_path(self, run: ValidatedRun, relative: str) -> Path:
+    def _inventoried_artifact(self, run: ValidatedRun, relative: str) -> tuple[str, str]:
         safe_relative = _safe_relative_path(relative, field="artifact path")
-        if safe_relative not in run.artifact_paths:
+        inventory = dict(_parse_vertical_inventory(run.manifest))
+        expected_digest = inventory.get(safe_relative)
+        if expected_digest is None or safe_relative not in run.artifact_paths:
             raise ArtifactIntegrityError("Requested repository artifact is not inventoried")
-        candidate = run.directory.joinpath(*PurePosixPath(safe_relative).parts)
-        if candidate.is_symlink():
-            raise ArtifactIntegrityError("Repository artifact is a symbolic link")
-        try:
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(run.directory)
-        except (FileNotFoundError, ValueError) as exc:
-            raise ArtifactIntegrityError("Repository artifact escapes its run root") from exc
-        if not resolved.is_file():
-            raise ArtifactIntegrityError("Repository artifact is not a regular file")
-        return resolved
+        return safe_relative, expected_digest
 
     def _json_artifact(self, run: ValidatedRun, relative: str) -> dict[str, Any]:
         try:
-            return _read_json(
-                self._artifact_path(run, relative), label=f"artifact {relative}"
+            safe_relative, expected_digest = self._inventoried_artifact(run, relative)
+            payload = _open_regular_bytes_beneath(
+                run.directory, safe_relative, label=f"artifact {safe_relative}"
             )
+            if hashlib.sha256(payload).hexdigest() != expected_digest:
+                raise ValueError("JSON bytes do not match the manifest checksum")
+            return _decode_json(payload, label=f"artifact {safe_relative}")
         except Exception as exc:
             raise ArtifactIntegrityError(
                 f"Inventoried artifact '{relative}' could not be read safely"
@@ -854,11 +931,17 @@ class ArtifactRepository:
         relative: str,
         *,
         required_columns: Iterable[str] = (),
+        expected_sha256: str | None = None,
     ) -> list[dict[str, str]]:
         try:
-            payload = _open_regular_bytes(
-                self._artifact_path(run, relative), label=f"artifact {relative}"
+            safe_relative, inventory_digest = self._inventoried_artifact(run, relative)
+            if expected_sha256 is not None and expected_sha256 != inventory_digest:
+                raise ValueError("Expected CSV checksum disagrees with the inventory")
+            payload = _open_regular_bytes_beneath(
+                run.directory, safe_relative, label=f"artifact {safe_relative}"
             )
+            if hashlib.sha256(payload).hexdigest() != inventory_digest:
+                raise ValueError("CSV bytes do not match the manifest checksum")
             text = payload.decode("utf-8-sig")
             reader = csv.DictReader(io.StringIO(text, newline=""))
             if reader.fieldnames is None or len(set(reader.fieldnames)) != len(reader.fieldnames):
@@ -914,6 +997,278 @@ class ArtifactRepository:
 
     def get_context(self, run_id: str) -> dict[str, Any]:
         return deepcopy(self._context(self._validate_run(run_id)))
+
+    def _price_snapshot_artifact(
+        self, run: ValidatedRun
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        data = _require_mapping(run.manifest.get("data"), field="manifest data")
+        expected_digest = _sha256_string(
+            data.get("input_prices_sha256"), field="input_prices_sha256"
+        )
+        if expected_digest is None:  # pragma: no cover - non-null contract above
+            raise ValueError("input_prices_sha256 is required")
+
+        summary_data = _require_mapping(
+            run.summary.get("data_source"), field="summary data_source"
+        )
+        reference_digest = _sha256_string(
+            run.training_reference.get("input_prices_sha256"),
+            field="training reference input_prices_sha256",
+        )
+        summary_digest = _sha256_string(
+            summary_data.get("input_prices_sha256"),
+            field="summary input_prices_sha256",
+        )
+        if reference_digest != expected_digest or summary_digest != expected_digest:
+            raise ArtifactIntegrityError(
+                "Price snapshot checksum references are inconsistent"
+            )
+
+        candidates = [
+            (relative, digest)
+            for relative, digest in _parse_vertical_inventory(run.manifest)
+            if len(PurePosixPath(relative).parts) == 2
+            and PurePosixPath(relative).parts[0] == "input_snapshot"
+            and PurePosixPath(relative).suffix.lower() == ".csv"
+            and digest == expected_digest
+        ]
+        if len(candidates) != 1:
+            raise ArtifactIntegrityError(
+                "Run manifest does not identify exactly one immutable price snapshot"
+            )
+        relative, digest = candidates[0]
+
+        pipeline_contract: dict[str, Any] | None = None
+        pipeline_relative = "input_snapshot/pipeline_metadata.json"
+        is_real_data = _boolean(data.get("is_real_data"), field="is_real_data")
+        if pipeline_relative in run.artifact_paths:
+            metadata = self._json_artifact(run, pipeline_relative)
+            _schema_version(
+                metadata.get("schema_version"),
+                field="pipeline metadata schema_version",
+            )
+            pipeline_contract = _require_mapping(
+                metadata.get("prices_artifact"), field="prices_artifact"
+            )
+            _schema_version(
+                pipeline_contract.get("schema_version"),
+                field="prices_artifact schema_version",
+            )
+            if pipeline_contract.get("status") != "complete":
+                raise ValueError("prices_artifact status must be complete")
+            if pipeline_contract.get("frequency") != "daily":
+                raise ValueError("prices_artifact frequency must be daily")
+            declared_name = _safe_relative_path(
+                pipeline_contract.get("path"), field="prices_artifact path"
+            )
+            if len(PurePosixPath(declared_name).parts) != 1:
+                raise ValueError("prices_artifact path must be a filename")
+            if f"input_snapshot/{declared_name}" != relative:
+                raise ValueError("prices_artifact path does not match the run snapshot")
+            if (
+                _sha256_string(
+                    pipeline_contract.get("sha256"), field="prices_artifact sha256"
+                )
+                != digest
+            ):
+                raise ValueError("prices_artifact checksum does not match the run snapshot")
+        elif is_real_data:
+            raise ArtifactIntegrityError(
+                "Real-data run is missing its input snapshot metadata"
+            )
+        return relative, digest, pipeline_contract
+
+    def load_stock_prices(
+        self,
+        run_id: str,
+        ticker: str,
+        *,
+        limit: int,
+        offset: int,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> dict[str, Any]:
+        """Return validated daily prices owned by one completed vertical-slice run."""
+
+        safe_ticker = _validate_identifier(ticker, field="ticker").upper()
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise InvalidDateRangeError("start_date must be on or before end_date")
+
+        run = self._validate_run(run_id)
+        relative, expected_digest, pipeline_contract = self._price_snapshot_artifact(run)
+        raw_rows = self._csv_artifact(
+            run,
+            relative,
+            required_columns=("date", "ticker", "open", "close", "volume", "source"),
+            expected_sha256=expected_digest,
+        )
+
+        observed_keys: set[tuple[str, str]] = set()
+        normalized_rows: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_rows, start=2):
+            raw_ticker = _require_string(raw.get("ticker"), field=f"row {index} ticker")
+            normalized_ticker = raw_ticker.upper()
+            if not _SAFE_ID.fullmatch(normalized_ticker):
+                raise ValueError(f"row {index} ticker is invalid")
+            normalized_date = _iso_date(raw.get("date"), field=f"row {index} date")
+            key = (normalized_ticker, normalized_date)
+            if key in observed_keys:
+                raise ValueError("Price snapshot contains duplicate ticker/date rows")
+            observed_keys.add(key)
+
+            source = _require_string(raw.get("source"), field=f"row {index} source")
+            if source.lower() in {
+                "nan",
+                "+nan",
+                "-nan",
+                "inf",
+                "+inf",
+                "-inf",
+                "infinity",
+                "+infinity",
+                "-infinity",
+                "none",
+                "null",
+            }:
+                raise ValueError(f"row {index} source is invalid")
+            volume = _integer(raw.get("volume"), field=f"row {index} volume")
+            if volume < 0:
+                raise ValueError(f"row {index} volume must be non-negative")
+
+            normalized_rows.append(
+                {
+                    "ticker": normalized_ticker,
+                    "date": normalized_date,
+                    "open": _positive_decimal(
+                        raw.get("open"), field=f"row {index} open"
+                    ),
+                    "high": _positive_decimal(
+                        raw.get("high"), field=f"row {index} high", nullable=True
+                    ),
+                    "low": _positive_decimal(
+                        raw.get("low"), field=f"row {index} low", nullable=True
+                    ),
+                    "close": _positive_decimal(
+                        raw.get("close"), field=f"row {index} close"
+                    ),
+                    "volume": volume,
+                    "source": source,
+                }
+            )
+
+        if pipeline_contract is not None:
+            if _integer(
+                pipeline_contract.get("row_count"), field="prices_artifact row_count"
+            ) != len(normalized_rows):
+                raise ArtifactIntegrityError(
+                    "Price snapshot row count does not match its input contract"
+                )
+            declared_symbols = _require_mapping(
+                pipeline_contract.get("symbols"), field="prices_artifact symbols"
+            )
+            observed_symbols = sorted({row["ticker"] for row in normalized_rows})
+            normalized_declared_symbols = sorted(
+                str(symbol).strip().upper() for symbol in declared_symbols
+            )
+            if normalized_declared_symbols != observed_symbols:
+                raise ArtifactIntegrityError(
+                    "Price snapshot symbols do not match its input contract"
+                )
+            for symbol in observed_symbols:
+                symbol_rows = [
+                    row for row in normalized_rows if row["ticker"] == symbol
+                ]
+                symbol_rows.sort(key=lambda row: row["date"])
+                coverage = _require_mapping(
+                    declared_symbols.get(symbol), field=f"prices_artifact symbols.{symbol}"
+                )
+                declared_source = _require_string(
+                    coverage.get("source"),
+                    field=f"prices_artifact symbols.{symbol}.source",
+                )
+                if (
+                    _integer(
+                        coverage.get("row_count"),
+                        field=f"prices_artifact symbols.{symbol}.row_count",
+                    )
+                    != len(symbol_rows)
+                    or _iso_date(
+                        coverage.get("date_start"),
+                        field=f"prices_artifact symbols.{symbol}.date_start",
+                    )
+                    != symbol_rows[0]["date"]
+                    or _iso_date(
+                        coverage.get("date_end"),
+                        field=f"prices_artifact symbols.{symbol}.date_end",
+                    )
+                    != symbol_rows[-1]["date"]
+                    or any(row["source"] != declared_source for row in symbol_rows)
+                ):
+                    raise ArtifactIntegrityError(
+                        "Price snapshot coverage does not match its input contract"
+                    )
+
+        data = _require_mapping(run.manifest.get("data"), field="manifest data")
+        declared_symbol = _require_string(
+            run.manifest.get("symbol"), field="manifest symbol"
+        ).upper()
+        declared_rows = [
+            row for row in normalized_rows if row["ticker"] == declared_symbol
+        ]
+        declared_rows.sort(key=lambda row: row["date"])
+        expected_range = _require_mapping(
+            data.get("actual_ogdc_date_range"), field="actual_ogdc_date_range"
+        )
+        if (
+            not declared_rows
+            or len(declared_rows)
+            != _integer(data.get("row_count"), field="row_count")
+            or declared_rows[0]["date"]
+            != _iso_date(expected_range.get("start"), field="data date start")
+            or declared_rows[-1]["date"]
+            != _iso_date(expected_range.get("end"), field="data date end")
+        ):
+            raise ArtifactIntegrityError(
+                "Price snapshot coverage does not match the run manifest"
+            )
+
+        ticker_rows = [row for row in normalized_rows if row["ticker"] == safe_ticker]
+        if not ticker_rows:
+            raise StockNotFoundError(
+                f"Ticker '{safe_ticker}' is not present in vertical-slice run '{run.run_id}'"
+            )
+        ticker_rows.sort(key=lambda row: row["date"])
+
+        full_date_range = {
+            "start": ticker_rows[0]["date"],
+            "end": ticker_rows[-1]["date"],
+        }
+        filtered = ticker_rows
+        if start_date is not None:
+            start = start_date.isoformat()
+            filtered = [row for row in filtered if row["date"] >= start]
+        if end_date is not None:
+            end = end_date.isoformat()
+            filtered = [row for row in filtered if row["date"] <= end]
+
+        context = self._context(run)
+        public_rows = [
+            {key: value for key, value in row.items() if key != "ticker"}
+            for row in filtered[offset : offset + limit]
+        ]
+        return {
+            "schema_version": context["schema_version"],
+            "run_id": run.run_id,
+            "ticker": safe_ticker,
+            "source_mode": context["source_mode"],
+            "data_date_range": full_date_range,
+            "total": len(filtered),
+            "limit": limit,
+            "offset": offset,
+            "rows": public_rows,
+            "warnings": context["warnings"],
+            "disclaimer": context["disclaimer"],
+        }
 
     def list_completed_runs(self) -> list[dict[str, Any]]:
         root = self.settings.vertical_slice_root

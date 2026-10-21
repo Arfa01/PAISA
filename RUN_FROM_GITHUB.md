@@ -53,6 +53,10 @@ models/baseline_random_forest.joblib
 models/baseline_metrics.json
 ```
 
+The legacy `GET /stocks` and `GET /stocks/{ticker}/prices` routes read
+`data/processed/psx_prices.csv`. They intentionally return `404` if that v0
+pipeline output is absent; the immutable-run API below does not depend on it.
+
 ## 5. Run tests
 
 ```bash
@@ -102,7 +106,8 @@ http://127.0.0.1:8000/predict/OGDC
 http://127.0.0.1:8000/docs
 ```
 
-These legacy v0 routes and their response shapes are unchanged.
+These legacy v0 routes and their response shapes are unchanged. The two stock
+routes shown above require `data/processed/psx_prices.csv`.
 
 ## 8. Open the read-only v1 result API
 
@@ -113,6 +118,7 @@ example:
 http://127.0.0.1:8000/api/v1/vertical-slices
 http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02
 http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/summary
+http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/stocks/OGDC/prices?limit=5&offset=0
 http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/leaderboard
 http://127.0.0.1:8000/api/v1/leaderboard
 http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/models
@@ -132,6 +138,7 @@ Equivalent command-line checks include:
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/vertical-slices
 curl -s http://127.0.0.1:8000/api/v1/leaderboard
+curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/stocks/OGDC/prices?limit=5&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0"
 ```
@@ -178,10 +185,18 @@ drawdowns, strategy trades, strategy snapshots, and each benchmark series.
 Rows are stable and deterministically ordered, and every paginated object
 reports its full `total`.
 
-Dates are ISO strings. PKR money and price fields are fixed-scale decimal
-strings such as `"100000.00"`, not binary floating-point values. Undefined
-metrics such as a cash-only Sharpe ratio are `null`; the service never emits
-`NaN` or infinity.
+Historical prices are the exception: their `limit` defaults to `500` and may be
+from `1` through `5000`. `offset` is non-negative; optional `start_date` and
+`end_date` are inclusive ISO dates. Filtering happens before pagination, so
+`total` reports all matching rows before `limit` and `offset` are applied. The
+dashboard must use the selected run's v1 price URL rather than the legacy stock
+route.
+
+Dates are ISO strings. PKR money uses fixed two-decimal strings such as
+`"100000.00"`; historical price strings preserve exact source precision with at
+least two fractional digits. Neither is converted through binary floating
+point. Undefined metrics such as a cash-only Sharpe ratio are `null`; the
+service never emits `NaN` or infinity.
 
 Before returning v1 data, PAISA requires a matching safe run ID, a completed
 `PASS` manifest, an exact artifact inventory, valid SHA-256 checksums, and a
@@ -191,6 +206,11 @@ artifacts are rejected. The v1 routes expose no absolute local paths and never
 load or serve joblib files. They do not retrain, backtest, write artifacts,
 perform real trading, or turn `actual_class` into a decision. Every v1 run
 response retains the academic-simulation disclaimer.
+
+For historical prices, the repository identifies the exact CSV through the
+completed run manifest and its checksum-bound `input_snapshot`. It never reads
+`data/processed/psx_prices.csv`, accepts a client filename/path, or loads a model
+binary for this request.
 
 See [`docs/api_design.md`](docs/api_design.md) for the complete endpoint and
 error contract.

@@ -12,6 +12,34 @@ class DateRange(BaseModel):
     end: str
 
 
+class ErrorResponse(BaseModel):
+    detail: str
+
+
+class StockPriceRow(BaseModel):
+    date: str
+    open: str
+    high: str | None
+    low: str | None
+    close: str
+    volume: int
+    source: str
+
+
+class StockPricesResponse(BaseModel):
+    schema_version: str
+    run_id: str
+    ticker: str
+    source_mode: str
+    data_date_range: DateRange
+    total: int
+    limit: int
+    offset: int
+    rows: list[StockPriceRow]
+    warnings: list[str]
+    disclaimer: str
+
+
 class EvaluationDateRange(BaseModel):
     feature_start: str
     feature_end: str

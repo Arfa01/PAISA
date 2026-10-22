@@ -11,15 +11,44 @@ curves, and simulated returns are not financial advice.
 
 ## Preflight before the meeting
 
-Run these checks from the repository root. The real run and its referenced
-training run are generated, ignored artifacts; they are deliberately not stored
-in Git.
+Run the artifact gate first from the repository root. The real run and its
+referenced training run are generated, ignored artifacts; they are deliberately
+not stored in Git. This gate prints every missing required file and exits with a
+non-zero status. Do not continue with the remaining preflight when it fails;
+restore the exact pair using [the team handoff](TEAM_HANDOFF.md).
+
+<!-- BEGIN DEMO_ARTIFACT_GATE -->
+```bash
+set -euo pipefail
+
+missing_demo_artifact=0
+require_demo_file() {
+  if [ ! -f "$1" ]; then
+    printf 'ERROR: required demo artifact is missing: %s\n' "$1" >&2
+    missing_demo_artifact=1
+  fi
+}
+
+require_demo_file artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
+require_demo_file artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
+require_demo_file artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
+
+if [ "$missing_demo_artifact" -ne 0 ]; then
+  printf '%s\n' \
+    'ERROR: restore both checksum-bound run directories using docs/TEAM_HANDOFF.md before continuing.' \
+    >&2
+  exit 1
+fi
+
+printf '%s\n' 'OK: required demo artifact pair is present.'
+```
+<!-- END DEMO_ARTIFACT_GATE -->
+
+Only after the gate prints `OK`, run the environment and repository checks:
 
 ```bash
+set -euo pipefail
 git status --short --branch
-test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
-test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
-test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
 
 source .venv/bin/activate
 python -m pip check
@@ -30,8 +59,10 @@ npm install
 npm run test
 npm run lint
 npm run build
-cp .env.example .env.local
+[ -e .env.local ] || cp .env.example .env.local
 cd ..
+
+git diff --check origin/main...HEAD
 ```
 
 The frontend requires Node.js 22.12 or newer in the Node 22 line; Node 24 is

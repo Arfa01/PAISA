@@ -106,6 +106,146 @@ Other generated roots are `runs/<experiment_id>/` for standalone backtests and
 existing model, experiment, portfolio, or run ID. Do not commit datasets, model
 binaries, run artifacts, `frontend/dist/`, local environments, or secrets.
 
+### Restore the exact supervisor demo pair
+
+The authoritative source for the exact historical demo is the project
+lead/artifact custodian's retained demo checkout. Git does not contain either
+generated root. The custodian must export both roots together and transfer the
+archive plus its checksum sidecar through approved shared storage; transferring
+only the vertical-slice directory leaves its referenced training evidence
+unavailable.
+
+From the retained checkout, create the transfer package without modifying the
+source artifacts. Set the staging directory to approved storage outside the
+repository so the generated archive cannot be mistaken for a Git-tracked
+project file:
+
+<!-- BEGIN DEMO_ARTIFACT_EXPORT -->
+```bash
+set -euo pipefail
+PAISA_DEMO_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+DEMO_ARCHIVE_NAME="PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz"
+DEMO_ARCHIVE="$PAISA_DEMO_TRANSFER_DIR/$DEMO_ARCHIVE_NAME"
+
+test -d "$PAISA_DEMO_TRANSFER_DIR"
+if [ -e "$DEMO_ARCHIVE" ] || [ -L "$DEMO_ARCHIVE" ] || \
+   [ -e "$DEMO_ARCHIVE.sha256" ] || [ -L "$DEMO_ARCHIVE.sha256" ]; then
+  printf 'ERROR: refusing to overwrite an existing transfer package: %s\n' \
+    "$DEMO_ARCHIVE" >&2
+  exit 1
+fi
+
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
+test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
+
+tar -czf "$DEMO_ARCHIVE" \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit
+(
+  cd "$PAISA_DEMO_TRANSFER_DIR"
+  shasum -a 256 "$DEMO_ARCHIVE_NAME" > "$DEMO_ARCHIVE_NAME.sha256"
+)
+```
+<!-- END DEMO_ARTIFACT_EXPORT -->
+
+Transfer both `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz` and
+`PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz.sha256`. From the receiving
+repository root, refuse to overwrite any existing run, verify the archive, and
+then restore it. Point `PAISA_DEMO_TRANSFER_DIR` at the approved storage
+location containing the received files.
+
+<!-- BEGIN DEMO_ARTIFACT_RESTORE -->
+```bash
+set -euo pipefail
+PAISA_DEMO_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+DEMO_ARCHIVE_NAME="PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz"
+DEMO_ARCHIVE="$PAISA_DEMO_TRANSFER_DIR/$DEMO_ARCHIVE_NAME"
+
+require_absent_restore_target() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    printf 'ERROR: refusing to overwrite existing demo artifact path: %s\n' \
+      "$1" >&2
+    return 1
+  fi
+}
+
+require_absent_restore_target artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+require_absent_restore_target artifacts/model_training/TRN-20261020-191815-624662-nogit
+(
+  cd "$PAISA_DEMO_TRANSFER_DIR"
+  shasum -a 256 -c "$DEMO_ARCHIVE_NAME.sha256"
+)
+tar -xzf "$DEMO_ARCHIVE" -C .
+
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
+test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
+```
+<!-- END DEMO_ARTIFACT_RESTORE -->
+
+With the Python environment installed, validate the restored pair through the
+same artifact API used by the demonstration:
+
+```bash
+source .venv/bin/activate
+python -m pytest -q \
+  tests/test_experiment_results_api.py::test_local_real_run_all_endpoints_when_available
+```
+
+This test must pass rather than skip. A checksum failure, missing file, or skip
+means the exact demo pair is not ready.
+
+### Regenerate a replacement run with new IDs
+
+Regeneration is a separate recovery path and cannot reproduce the exact
+historical demo IDs, source provenance, or reported metrics. Use it only to
+produce a newly reviewed replacement run. Never assign the historical run IDs
+to regenerated output.
+
+Start with either a complete verified-cache directory supplied through
+approved shared storage, or the original processed CSV, original pipeline
+metadata, and complete raw captures for every symbol. To build a new verified
+cache from the original evidence:
+
+```bash
+set -euo pipefail
+source .venv/bin/activate
+
+PAISA_LEGACY_REPOSITORY="/absolute/path/to/legacy/paisa-v0"
+PAISA_VERIFIED_CACHE="data/external/verified_legacy_psx_cache-team-handoff-01"
+
+python scripts/migrate_legacy_psx_cache.py \
+  --legacy-prices "$PAISA_LEGACY_REPOSITORY/data/processed/psx_prices.csv" \
+  --legacy-metadata "$PAISA_LEGACY_REPOSITORY/data/processed/pipeline_metadata.json" \
+  --legacy-raw-dir "$PAISA_LEGACY_REPOSITORY/data/raw" \
+  --output-dir "$PAISA_VERIFIED_CACHE"
+```
+
+A transferred verified-cache directory must contain `psx_prices.csv`,
+`pipeline_metadata.json`, `legacy_pipeline_metadata.json`, and
+`migration_manifest.json`. Then publish a new vertical slice and its new
+training run under unused IDs:
+
+```bash
+set -euo pipefail
+source .venv/bin/activate
+
+PAISA_VERIFIED_CACHE="data/external/verified_legacy_psx_cache-team-handoff-01"
+PAISA_NEW_VERTICAL_RUN_ID="VSL-20261022-OGDC-replacement-01"
+
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices "$PAISA_VERIFIED_CACHE/psx_prices.csv" \
+  --output-dir artifacts/vertical_slice \
+  --model-output-dir artifacts/model_training \
+  --run-id "$PAISA_NEW_VERTICAL_RUN_ID"
+```
+
+The runner attempts live PSX-DPS first and uses the verified cache only when
+that attempt fails. Record the new training run ID printed in the result,
+validate the new pair, review all metrics and limitations, and update the local
+`PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` used for the replacement demonstration.
+
 ## Run and inspect the current demo
 
 Terminal 1, from the repository root:

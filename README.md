@@ -4,6 +4,26 @@ PAISA v0 is the first implementation slice of the FYP: a PSX-first stock-data la
 
 This is **not financial advice** and does not produce buy/sell recommendations. It is an academic prototype for data engineering, ML evaluation, and dashboard integration.
 
+## Project documentation
+
+Use the following entry points for the current vertical slice and its evidence.
+[`CURRENT_IMPLEMENTATION_STATUS.md`](docs/CURRENT_IMPLEMENTATION_STATUS.md) is
+the canonical current implementation and evidence inventory;
+[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) is retained only as historical
+proposal and early-v0 context.
+
+| Document | Purpose |
+|---|---|
+| [Current implementation status](docs/CURRENT_IMPLEMENTATION_STATUS.md) | Canonical status of implemented code, retained evidence, and incomplete scope. |
+| [October 2026 progress report](docs/PROGRESS_REPORT_OCTOBER_2026.md) | Dated delivery summary, verified results, test evidence, and next milestones. |
+| [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
+| [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
+| [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
+| [Supervisor demo script](docs/SUPERVISOR_DEMO_SCRIPT.md) | Fail-fast preflight and timed demonstration walkthrough. |
+| [Team handoff](docs/TEAM_HANDOFF.md) | Ownership, exact demo-artifact restore, regeneration, and continuation commands. |
+| [Next-phase plan](docs/NEXT_PHASE_PLAN.md) | Ordered plan for news, sentiment, LSTM, explainability, and expansion. |
+| [Historical project context](PROJECT_CONTEXT.md) | Original proposal and superseded PAISA v0 snapshot; not a current-status source. |
+
 ## What v0 includes
 
 - PSX historical data ingestion through `psx-dps` provider.

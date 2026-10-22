@@ -1,0 +1,376 @@
+# PAISA Team Handoff
+
+This handoff follows the approved proposal responsibilities. All current and
+future predictions, signals, trades, and returns are academic simulations and
+are not financial advice.
+
+## Approved ownership
+
+### Arfa
+
+- Stock-market data collection and integration.
+- Market/news feature engineering, dataset preparation, and label generation.
+- Model training, controlled performance evaluation, and comparative reports.
+- Web-interface design, development, and visualization.
+- Documentation and reporting.
+
+### Waqas
+
+- Financial-news collection and integration.
+- NLP, company/entity extraction and linking.
+- Knowledge-graph and relationship modelling.
+- Machine-learning model development.
+- Backend API design, development, and integration.
+- Documentation and reporting.
+
+### Shared
+
+System tests, integration review, final improvements, supervisor evidence, and
+documentation are shared. The ML boundary is deliberately collaborative: Waqas
+develops the news/NLP and new model components; Arfa owns dataset integration,
+training, evaluation, and result presentation; both review temporal leakage and
+contracts.
+
+## Checkout and environment
+
+Work on a task branch, never directly on `main`:
+
+```bash
+git fetch origin
+git switch main
+git pull --ff-only origin main
+PAISA_TASK_BRANCH="feature/news-ingestion"
+git switch -c "$PAISA_TASK_BRANCH"
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+
+cd frontend
+npm install
+cp .env.example .env.local
+cd ..
+```
+
+The bare `python` command is available after activating `.venv`; on the current
+machine it is not available outside that environment.
+
+## Current component entry points
+
+| Component | Primary entry points |
+|---|---|
+| Providers and legacy data pipeline | `src/paisa/providers/`, `src/paisa/pipeline.py`, `src/paisa/preprocessing.py`, `src/paisa/features.py`, `scripts/run_v0_pipeline.py` |
+| Experiment data and targets | `src/paisa/experiments/training_features.py`, `src/paisa/experiments/training_targets.py`, `src/paisa/splits.py` |
+| Model training and evaluation | `src/paisa/experiments/trainer.py`, `src/paisa/experiments/evaluation.py`, `src/paisa/experiments/artifacts.py`, `src/paisa/experiments/registry.py`, `scripts/train_ogdc_models.py` |
+| Optional LSTM | `src/paisa/experiments/lstm.py`, `notebooks/PAISA_OGDC_LSTM_Training.ipynb` |
+| Decision policy and portfolio | `src/paisa/trading/policy.py`, `src/paisa/trading/execution.py`, `src/paisa/trading/portfolio.py`, `src/paisa/trading/models.py` |
+| Backtesting and benchmarks | `src/paisa/backtesting/engine.py`, `src/paisa/backtesting/metrics.py`, `src/paisa/backtesting/benchmarks.py`, `src/paisa/backtesting/reports.py`, `scripts/run_backtest.py` |
+| End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
+| Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
+| FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
+| React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
+| Tests | `tests/`, `frontend/src/**/*.test.ts`, `frontend/src/**/*.test.tsx` |
+
+New news, sentiment, entity, and relationship modules should be additive under
+`src/paisa/` and should expose explicit artifact contracts before the API or UI
+depends on them. Do not place NLP logic in API handlers or React components.
+
+## Retained artifacts
+
+The supervisor run is generated local content and must not be committed:
+
+```text
+artifacts/vertical_slice/VSL-20261020-OGDC-main-02/
+artifacts/model_training/TRN-20261020-191815-624662-nogit/
+```
+
+Important evidence inside the vertical-slice directory:
+
+```text
+manifest.json
+final_summary.json
+model_metrics.csv
+portfolio_metrics.csv
+combined_leaderboard.csv
+daily_equity_curves.csv
+model_training_run_reference.json
+input_snapshot/
+experiment_configs/
+experiments/<experiment_id>/
+```
+
+Other generated roots are `runs/<experiment_id>/` for standalone backtests and
+`artifacts/lstm/<model_id>/` for optional LSTM registration. Never overwrite an
+existing model, experiment, portfolio, or run ID. Do not commit datasets, model
+binaries, run artifacts, `frontend/dist/`, local environments, or secrets.
+
+### Restore the exact supervisor demo pair
+
+The authoritative source for the exact historical demo is the project
+lead/artifact custodian's retained demo checkout. Git does not contain either
+generated root. The custodian must export both roots together and transfer the
+archive plus its checksum sidecar through approved shared storage; transferring
+only the vertical-slice directory leaves its referenced training evidence
+unavailable.
+
+From the retained checkout, create the transfer package without modifying the
+source artifacts. Set the staging directory to approved storage outside the
+repository so the generated archive cannot be mistaken for a Git-tracked
+project file:
+
+<!-- BEGIN DEMO_ARTIFACT_EXPORT -->
+```bash
+set -euo pipefail
+PAISA_DEMO_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+DEMO_ARCHIVE_NAME="PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz"
+DEMO_ARCHIVE="$PAISA_DEMO_TRANSFER_DIR/$DEMO_ARCHIVE_NAME"
+
+test -d "$PAISA_DEMO_TRANSFER_DIR"
+if [ -e "$DEMO_ARCHIVE" ] || [ -L "$DEMO_ARCHIVE" ] || \
+   [ -e "$DEMO_ARCHIVE.sha256" ] || [ -L "$DEMO_ARCHIVE.sha256" ]; then
+  printf 'ERROR: refusing to overwrite an existing transfer package: %s\n' \
+    "$DEMO_ARCHIVE" >&2
+  exit 1
+fi
+
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
+test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
+
+tar -czf "$DEMO_ARCHIVE" \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit
+(
+  cd "$PAISA_DEMO_TRANSFER_DIR"
+  shasum -a 256 "$DEMO_ARCHIVE_NAME" > "$DEMO_ARCHIVE_NAME.sha256"
+)
+```
+<!-- END DEMO_ARTIFACT_EXPORT -->
+
+Transfer both `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz` and
+`PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz.sha256`. From the receiving
+repository root, refuse to overwrite any existing run, verify the archive, and
+then restore it. Point `PAISA_DEMO_TRANSFER_DIR` at the approved storage
+location containing the received files.
+
+<!-- BEGIN DEMO_ARTIFACT_RESTORE -->
+```bash
+set -euo pipefail
+PAISA_DEMO_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+DEMO_ARCHIVE_NAME="PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz"
+DEMO_ARCHIVE="$PAISA_DEMO_TRANSFER_DIR/$DEMO_ARCHIVE_NAME"
+
+require_absent_restore_target() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    printf 'ERROR: refusing to overwrite existing demo artifact path: %s\n' \
+      "$1" >&2
+    return 1
+  fi
+}
+
+require_absent_restore_target artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+require_absent_restore_target artifacts/model_training/TRN-20261020-191815-624662-nogit
+(
+  cd "$PAISA_DEMO_TRANSFER_DIR"
+  shasum -a 256 -c "$DEMO_ARCHIVE_NAME.sha256"
+)
+tar -xzf "$DEMO_ARCHIVE" -C .
+
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
+test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
+test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
+```
+<!-- END DEMO_ARTIFACT_RESTORE -->
+
+With the Python environment installed, validate the restored pair through the
+same artifact API used by the demonstration:
+
+```bash
+source .venv/bin/activate
+python -m pytest -q \
+  tests/test_experiment_results_api.py::test_local_real_run_all_endpoints_when_available
+```
+
+This test must pass rather than skip. A checksum failure, missing file, or skip
+means the exact demo pair is not ready.
+
+### Regenerate a replacement run with new IDs
+
+Regeneration is a separate recovery path and cannot reproduce the exact
+historical demo IDs, source provenance, or reported metrics. Use it only to
+produce a newly reviewed replacement run. Never assign the historical run IDs
+to regenerated output.
+
+Start with either a complete verified-cache directory supplied through
+approved shared storage, or the original processed CSV, original pipeline
+metadata, and complete raw captures for every symbol. To build a new verified
+cache from the original evidence:
+
+```bash
+set -euo pipefail
+source .venv/bin/activate
+
+PAISA_LEGACY_REPOSITORY="/absolute/path/to/legacy/paisa-v0"
+PAISA_VERIFIED_CACHE="data/external/verified_legacy_psx_cache-team-handoff-01"
+
+python scripts/migrate_legacy_psx_cache.py \
+  --legacy-prices "$PAISA_LEGACY_REPOSITORY/data/processed/psx_prices.csv" \
+  --legacy-metadata "$PAISA_LEGACY_REPOSITORY/data/processed/pipeline_metadata.json" \
+  --legacy-raw-dir "$PAISA_LEGACY_REPOSITORY/data/raw" \
+  --output-dir "$PAISA_VERIFIED_CACHE"
+```
+
+A transferred verified-cache directory must contain `psx_prices.csv`,
+`pipeline_metadata.json`, `legacy_pipeline_metadata.json`, and
+`migration_manifest.json`. Then publish a new vertical slice and its new
+training run under unused IDs:
+
+```bash
+set -euo pipefail
+source .venv/bin/activate
+
+PAISA_VERIFIED_CACHE="data/external/verified_legacy_psx_cache-team-handoff-01"
+PAISA_NEW_VERTICAL_RUN_ID="VSL-20261022-OGDC-replacement-01"
+
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices "$PAISA_VERIFIED_CACHE/psx_prices.csv" \
+  --output-dir artifacts/vertical_slice \
+  --model-output-dir artifacts/model_training \
+  --run-id "$PAISA_NEW_VERTICAL_RUN_ID"
+```
+
+The runner attempts live PSX-DPS first and uses the verified cache only when
+that attempt fails. Record the new training run ID printed in the result,
+validate the new pair, review all metrics and limitations, and update the local
+`PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` used for the replacement demonstration.
+
+## Run and inspect the current demo
+
+Terminal 1, from the repository root:
+
+```bash
+source .venv/bin/activate
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Terminal 2:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Open:
+
+- Swagger/OpenAPI: `http://127.0.0.1:8000/docs`
+- Dashboard: `http://127.0.0.1:5173`
+- Default-run leaderboard: `http://127.0.0.1:8000/api/v1/leaderboard`
+- Run summary: `http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/summary`
+- Source provenance: `http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/source`
+
+The versioned API surface is:
+
+```text
+GET /api/v1/vertical-slices
+GET /api/v1/vertical-slices/{run_id}
+GET /api/v1/vertical-slices/{run_id}/summary
+GET /api/v1/vertical-slices/{run_id}/stocks/{ticker}/prices
+GET /api/v1/vertical-slices/{run_id}/leaderboard
+GET /api/v1/leaderboard
+GET /api/v1/vertical-slices/{run_id}/models
+GET /api/v1/vertical-slices/{run_id}/portfolios
+GET /api/v1/vertical-slices/{run_id}/equity-curves
+GET /api/v1/vertical-slices/{run_id}/drawdowns
+GET /api/v1/vertical-slices/{run_id}/source
+GET /api/v1/vertical-slices/{run_id}/experiments
+GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}
+GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/trades
+GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/snapshots
+GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/benchmarks
+```
+
+The compatibility API remains `/health`, `/pipeline/status`, `/stocks`, the
+stock price/feature/dataset routes, `/models/baseline/metrics`, and
+`/predict/{ticker}`. Do not change their schemas while extending `/api/v1`.
+
+## Task handoff: Arfa
+
+1. Own the price/news feature join and declare publication cutoffs before adding
+   a column to `src/paisa/experiments/training_features.py`.
+2. Keep the current price-only feature set as the control; prepare paired
+   price-only and price-plus-sentiment configurations with identical splits.
+3. Train and evaluate the paired Random Forest/XGBoost/LSTM experiments without
+   using test results for selection.
+4. Add SHAP result views only after Waqas exposes a validated artifact/API
+   schema; explain model behavior, not causality.
+5. Extend dashboard components and client schemas without recalculating backend
+   metrics in React.
+6. Lead additional-stock data quality, evaluation, screenshots, and supervisor
+   reporting.
+
+## Task handoff: Waqas
+
+1. Implement source-attributed financial-news ingestion with offline fixtures
+   and separate provider/network checks.
+2. Build the ticker/company alias registry and reviewable entity-linking output.
+3. Implement pinned FinBERT inference and leakage-safe daily aggregation with
+   publication-time cutoffs.
+4. Develop the LSTM and relationship/knowledge-graph components behind the
+   current prediction and artifact contracts.
+5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
+   and `src/paisa/api/router_v1.py` additively for news, sentiment,
+   explanations, and relationships; keep GET requests read-only.
+6. Provide contract fixtures and API tests for each new result before dashboard
+   integration.
+
+## Commands to continue experiments
+
+```bash
+# Legacy/offline pipeline smoke
+python scripts/run_v0_pipeline.py --provider sample --symbols OGDC HBL MCB --start 2021-01-01 --end 2023-12-31 --train
+
+# Four versioned price-only models from the retained, standardized snapshot
+PAISA_NEW_TRAINING_RUN_ID="TRN-20261022-team-handoff-01"
+python scripts/train_ogdc_models.py \
+  --prices artifacts/vertical_slice/VSL-20261020-OGDC-main-02/input_snapshot/psx_prices.csv \
+  --run-id "$PAISA_NEW_TRAINING_RUN_ID"
+
+# Full OGDC vertical slice with a new immutable ID. The command still attempts
+# live PSX-DPS first, then validates this complete checksum-bound cache bundle.
+PAISA_NEW_VERTICAL_RUN_ID="VSL-20261022-OGDC-team-handoff-01"
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices artifacts/vertical_slice/VSL-20261020-OGDC-main-02/input_snapshot/psx_prices.csv \
+  --run-id "$PAISA_NEW_VERTICAL_RUN_ID"
+
+# Inspect supported overrides before any real run
+python scripts/run_ogdc_vertical_slice.py --help
+python scripts/run_backtest.py --help
+```
+
+The quoted branch and run IDs above are executable examples; replace them with
+unused, task-specific values. Do not rerun with an existing ID. The retained
+supervisor run must remain unchanged.
+
+## Required verification before handoff
+
+From the repository root with `.venv` active:
+
+```bash
+python -m pytest
+python -m pip check
+cd frontend
+npm run test
+npm run lint
+npm run build
+cd ..
+git diff --check
+```
+
+Report the exact pass/fail/skip counts and warnings, branch and commit, generated
+artifact IDs, assumptions, known limitations, and any contract changes. Keep
+provider-dependent network checks separate from the default offline suite.

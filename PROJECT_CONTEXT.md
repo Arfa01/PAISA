@@ -1,5 +1,13 @@
 # PAISA Project Context
 
+> **Historical proposal and PAISA v0 snapshot — not current status.** This file
+> preserves the original proposal and early implementation record. It is not
+> the current implementation inventory, and statements below describing
+> features, provider behavior, or next steps as “current” are historical. Use
+> [PAISA Current Implementation Status](docs/CURRENT_IMPLEMENTATION_STATUS.md)
+> for the canonical current code/evidence inventory and
+> [Known Limitations](docs/KNOWN_LIMITATIONS.md) for the current boundaries.
+
 ## Project name
 
 **PAISA — Predictive AI Stock Assessment**
@@ -138,11 +146,11 @@ Both:
 - final improvements
 - documentation/reporting
 
-## Current implementation status: PAISA v0
+## Historical implementation status: PAISA v0 (superseded)
 
 v0 is the first working implementation slice. It is focused on the stock-data foundation.
 
-Current v0 does the following:
+At the time of this snapshot, v0 did the following:
 
 1. Fetches PSX stock data.
 2. Saves raw ticker data.
@@ -155,11 +163,12 @@ Current v0 does the following:
 9. Saves model metrics and feature importance.
 10. Serves data and predictions through FastAPI.
 
-## Current data source
+## Historical v0 data source
 
 v0 uses the `psx-dps` provider as the main PSX-first source.
 
-The provider currently works with the public PSX DPS time-series endpoint format:
+At the time of this snapshot, the provider worked with the public PSX DPS
+time-series endpoint format:
 
 ```text
 https://dps.psx.com.pk/timeseries/eod/{SYMBOL}
@@ -171,7 +180,7 @@ Observed row format:
 [unix_timestamp, close_price, volume, open_price]
 ```
 
-Because of this, the current v0 reliably uses:
+Because of this, the historical v0 run used:
 
 - date
 - open
@@ -180,7 +189,7 @@ Because of this, the current v0 reliably uses:
 
 High and low may remain empty if the source does not provide them.
 
-## Current successful local run
+## Historical v0 successful local run
 
 The following PSX run worked locally:
 
@@ -201,17 +210,17 @@ date range: 2021-09-14 to 2026-09-11
 errors: {}
 ```
 
-The API endpoints also work when started with:
+The API endpoints also worked when started with:
 
 ```bash
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The `/docs` endpoint shows the FastAPI UI for accessing all other endpoints.
+The `/docs` endpoint showed the FastAPI UI for accessing all other endpoints.
 
-## Current generated files
+## Historical v0 generated files
 
-After running the PSX pipeline, these generated files should exist locally:
+After that historical PSX pipeline run, these generated files existed locally:
 
 ```text
 data/raw/psx/
@@ -225,9 +234,11 @@ models/baseline_feature_importance.csv
 models/baseline_confusion_matrix.csv
 ```
 
-Generated data and model files are intentionally ignored by Git. Teammates should regenerate them locally after cloning.
+Those generated data and model files were intentionally ignored by Git. The
+canonical current workflow and artifact-retention rules are documented in
+[PAISA Current Implementation Status](docs/CURRENT_IMPLEMENTATION_STATUS.md).
 
-## Current API endpoints
+## Historical v0 API endpoints
 
 ```text
 GET /health
@@ -241,11 +252,12 @@ GET /predict/{ticker}
 GET /docs
 ```
 
-## Current model status
+## Historical v0 model status
 
-v0 trains a baseline Random Forest model.
+v0 trained a baseline Random Forest model.
 
-The baseline model is only a first benchmark. It is not expected to be highly accurate yet.
+The baseline model was only a first benchmark and was not expected to be highly
+accurate.
 
 Observed PSX model result:
 
@@ -254,11 +266,12 @@ test accuracy: about 0.517
 test F1: about 0.440
 ```
 
-This means the current model is only a weak baseline. The value of v0 is that the pipeline works end-to-end.
+This meant the v0 model was only a weak baseline. The value of that snapshot
+was that the pipeline worked end-to-end.
 
 ## Important limitations of v0
 
-v0 does not yet include:
+At the time of this snapshot, v0 did not yet include:
 
 - news collection
 - sentiment analysis
@@ -271,7 +284,8 @@ v0 does not yet include:
 - database integration
 - scheduled automatic updates
 
-Current PSX data begins from 2021-09-14 for the tested symbols, not January 2021. This should be documented as a current data-source limitation.
+The historical PSX data began from 2021-09-14 for the tested symbols, not
+January 2021. This was a data-source limitation of that snapshot.
 
 ## Definition of Done for v0
 
@@ -290,7 +304,7 @@ v0 is considered successful when:
 11. `/docs` displays the API UI.
 12. `/predict/{ticker}` returns a prediction JSON.
 
-## Immediate next milestone: v0.1
+## Historical next milestone planned after v0
 
 Before adding sentiment or dashboard, v0 should be hardened.
 
@@ -306,7 +320,7 @@ Recommended next tasks:
 8. Confirm the exact prediction target with the supervisor: next-day up/down or another horizon.
 9. Improve the baseline experiment so results are reproducible and easy to compare.
 
-## Recommended next versions
+## Historically recommended next versions
 
 ### v0.1 — Data quality and larger stock universe
 

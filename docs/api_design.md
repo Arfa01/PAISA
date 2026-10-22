@@ -402,7 +402,27 @@ cache entry.
 
 ### `GET /health`
 
-Confirms whether the v0 data and model artifacts are ready.
+Confirms whether the v0 data and model artifacts are ready without exposing the
+host filesystem. Its HTTP `200` response uses the explicit `HealthResponse`
+schema:
+
+```json
+{
+  "status": "ok",
+  "data_dir": "legacy-v0-data",
+  "model_dir": "legacy-v0-models",
+  "prices_ready": true,
+  "dataset_ready": true,
+  "model_ready": true,
+  "price_rows": 1042,
+  "stocks": ["HBL", "OGDC"]
+}
+```
+
+`data_dir` and `model_dir` are compatibility keys containing stable logical
+labels, never absolute or shortened local paths. `price_rows` and `stocks` are
+omitted when the legacy price CSV is absent. Errors use FastAPI's generic
+server response and do not echo local exception or path details.
 
 ### `GET /pipeline/status`
 

@@ -310,8 +310,11 @@ All outputs are academic simulations and are not financial advice.
 
 ### Existing v0 API
 
-The original v0 routes and their response shapes remain unchanged. In
-particular, `/stocks` and `/stocks/{ticker}/prices` still depend on the generated
+The original v0 routes and field names remain unchanged. The `/health`
+`data_dir` and `model_dir` values are intentionally safe logical labels rather
+than host filesystem paths; readiness booleans, row counts, and available-stock
+reporting are unchanged. In particular, `/stocks` and
+`/stocks/{ticker}/prices` still depend on the generated
 `data/processed/psx_prices.csv` compatibility file and return `404` when it is
 absent.
 
@@ -325,6 +328,12 @@ absent.
 | `GET /stocks/{ticker}/dataset` | Return ML-ready feature + label rows. |
 | `GET /models/baseline/metrics` | Return RandomForest split metrics. |
 | `GET /predict/{ticker}` | Return next-trading-day up/down prediction for latest complete row. |
+
+`GET /health` returns `status`, the logical labels `data_dir: "legacy-v0-data"`
+and `model_dir: "legacy-v0-models"`, and the `prices_ready`, `dataset_ready`,
+and `model_ready` booleans. When the legacy price CSV exists, it also returns
+`price_rows` and sorted `stocks`. It never returns repository, artifact, model,
+or user-directory paths.
 
 ### Read-only v1 experiment-results API
 

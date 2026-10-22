@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -10,19 +11,53 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from paisa.api.router_v1 import router as results_v1_router
+from paisa.api.schemas import HealthResponse
 from paisa.config import get_paths
 from paisa.features import FEATURE_COLUMNS
-from paisa.api.router_v1 import router as results_v1_router
 
 paths = get_paths(data_dir=os.getenv("PAISA_DATA_DIR"), model_dir=os.getenv("PAISA_MODEL_DIR"))
 app = FastAPI(title="PAISA v0 API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+HEALTH_DATA_LABEL = "legacy-v0-data"
+HEALTH_MODEL_LABEL = "legacy-v0-models"
+_SAFE_HEALTH_STOCK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+_MODEL_BINARY_SUFFIXES = (
+    ".joblib",
+    ".pkl",
+    ".pickle",
+    ".keras",
+    ".h5",
+    ".hdf5",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".safetensors",
+)
+
+
+def _safe_health_stock(value: object) -> str | None:
+    ticker = str(value)
+    if not _SAFE_HEALTH_STOCK.fullmatch(ticker):
+        return None
+    if ticker.lower().endswith(_MODEL_BINARY_SUFFIXES):
+        return None
+    return ticker
 
 
 def _path(name: str) -> Path:
@@ -49,24 +84,36 @@ def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return json.loads(frame.replace({pd.NA: None}).to_json(orient="records", date_format="iso"))
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    response_model_exclude_none=True,
+    response_description="Legacy pipeline readiness without local filesystem paths.",
+)
+def health() -> HealthResponse:
     prices_exists = _path("prices").exists()
     dataset_exists = _path("dataset").exists()
     model_exists = _path("model").exists()
-    result: dict[str, Any] = {
-        "status": "ok",
-        "data_dir": str(paths.data_dir),
-        "model_dir": str(paths.model_dir),
-        "prices_ready": prices_exists,
-        "dataset_ready": dataset_exists,
-        "model_ready": model_exists,
-    }
+    price_rows: int | None = None
+    stocks: list[str] | None = None
     if prices_exists:
         prices = pd.read_csv(_path("prices"))
-        result["price_rows"] = int(len(prices))
-        result["stocks"] = sorted(prices["ticker"].dropna().unique().tolist())
-    return result
+        price_rows = int(len(prices))
+        stock_labels = (
+            _safe_health_stock(raw_ticker)
+            for raw_ticker in prices["ticker"].dropna().unique()
+        )
+        stocks = sorted(ticker for ticker in stock_labels if ticker is not None)
+    return HealthResponse(
+        status="ok",
+        data_dir=HEALTH_DATA_LABEL,
+        model_dir=HEALTH_MODEL_LABEL,
+        prices_ready=prices_exists,
+        dataset_ready=dataset_exists,
+        model_ready=model_exists,
+        price_rows=price_rows,
+        stocks=stocks,
+    )
 
 
 @app.get("/pipeline/status")

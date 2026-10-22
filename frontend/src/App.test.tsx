@@ -1,4 +1,5 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -73,6 +74,42 @@ describe("PAISA dashboard shell", () => {
     expect(alert).toHaveTextContent("No fixture data has been substituted.");
     expect(screen.queryByText("M-001")).not.toBeInTheDocument();
     expect(screen.queryByText("PKR 101,250.75")).not.toBeInTheDocument();
+  });
+
+  it("ignores Strict Mode cleanup cancellation and keeps the successful response", async () => {
+    const client = makeMockClient();
+    const signals: AbortSignal[] = [];
+    vi.mocked(client.listRuns).mockImplementation((signal) => {
+      if (!signal) throw new Error("listRuns requires a cancellation signal");
+      signals.push(signal);
+      if (signals.length === 1) {
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new ApiError("cancelled by cleanup", "cancelled")),
+            { once: true },
+          );
+        });
+      }
+      return Promise.resolve(makeRunList());
+    });
+
+    render(
+      <StrictMode>
+        <App client={client} />
+      </StrictMode>,
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "PAISA — Predictive AI Stock Assessment",
+      }),
+    ).toBeInTheDocument();
+    expect(signals).toHaveLength(2);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+    expect(client.listRuns).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("shows an explicit empty-run state and does not fabricate a result", async () => {

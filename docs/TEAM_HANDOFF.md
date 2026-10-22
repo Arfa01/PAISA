@@ -57,6 +57,14 @@ cd ..
 The bare `python` command is available after activating `.venv`; on the current
 machine it is not available outside that environment.
 
+Install the large optional transformer runtime only for sentiment work. The
+pinned FinBERT weights/model are recorded as CC BY-NC-SA 4.0 and PAISA limits
+this configuration to non-commercial academic use:
+
+```bash
+python -m pip install -r requirements-sentiment.txt
+```
+
 ## Current component entry points
 
 | Component | Primary entry points |
@@ -70,6 +78,7 @@ machine it is not available outside that environment.
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
 | Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
 | News acquisition and evidence | `src/paisa/news/`, `scripts/run_news_pipeline.py`, `configs/news/`, `docs/NEWS_*.md` |
+| Article-level sentiment | `src/paisa/sentiment/`, `scripts/run_sentiment_inference.py`, `docs/FINBERT_SENTIMENT.md`, `docs/SENTIMENT_*.md` |
 | FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
 | React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
 | Tests | `tests/`, `frontend/src/**/*.test.ts`, `frontend/src/**/*.test.tsx` |
@@ -103,10 +112,11 @@ experiments/<experiment_id>/
 ```
 
 Other generated roots are `runs/<experiment_id>/` for standalone backtests,
-`artifacts/lstm/<model_id>/` for optional LSTM registration, and
+`artifacts/lstm/<model_id>/` for optional LSTM registration,
 `artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
-news evidence. Never overwrite an existing model, experiment, portfolio, or
-run ID. Do not commit datasets, model binaries, run artifacts,
+news evidence, and `artifacts/sentiment_inference/<run_id>/` for article-level
+sentiment evidence. Never overwrite an existing model, experiment, portfolio,
+or run ID. Do not commit datasets, downloaded transformer weights, model binaries, run artifacts,
 `frontend/dist/`, local environments, or secrets.
 
 The accepted local RSS run `NEWS-20261022-131242-5ddffd2d` is final
@@ -120,6 +130,50 @@ SQLite schema version `3`.
 The duplicate count reflects canonical evidence from retained earlier
 acquisitions, not discarded input; all acquisitions are preserved. Generated
 evidence remains outside Git.
+
+The article-level sentiment implementation pins the model and tokenizer to
+`ProsusAI/finbert@0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` and explicitly
+maps `0=positive`, `1=negative`, and `2=neutral` into PAISA's canonical
+negative/neutral/positive output order. Its weights/model are recorded as CC
+BY-NC-SA 4.0 and are limited here to non-commercial academic work. It owns
+separate immutable `SENT-...` runs and SQLite tables; it does not change news
+evidence, stock models, policy, portfolios, API, or dashboard.
+
+The retained real execution is `SENT-20261022-172211-real0002`, sourced from
+`NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
+`7.116756208240986` seconds against a preserved schema-3 database copy, which
+migrated to schema version `5`.
+It requested and scored all `30` unique canonical articles, with `0` skipped,
+`0` failed, and `any_articles_failed=false`; one scored article was OGDC-linked.
+The label counts were `negative=11`, `neutral=9`, and `positive=10`; `17`
+inputs were truncated, none used title only, and all `30` carried `en-us`
+language evidence. Canonical availability spans `2026-10-22T11:52:32Z` to
+`2026-10-22T13:12:43.088883Z`.
+
+The run used model and tokenizer revision
+`0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` under Python `3.13.7`, PyTorch
+`2.10.0`, Transformers `5.20.2`, Tokenizers `0.23.3`, Hugging Face Hub
+`1.32.0`, and Safetensors `0.8.0`. Its generated, uncommitted artifacts are at
+`artifacts/sentiment_inference/SENT-20261022-172211-real0002`.
+
+Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+The short single-publisher snapshot is insufficient for stock-model integration.
+
+At ingestion completion, the accepted manifest and artifact pack recorded
+schema version `3`; those artifacts remain historical and predate the schema-4
+sealing evidence and current schema-5 layout. Before sentiment execution, the
+working `data/news/paisa_news.sqlite3` also used schema version `3`. The
+compatibility migration accepted only that exact known signature, validated
+the affected rows, transactionally restored the later constraints, verified
+integrity, and advanced through schema 4 to schema 5. The working database is
+now schema version `5`.
+
+The ignored, uncommitted pre-migration copy
+`data/news/backups/paisa_news_schema3_before_sentiment.sqlite3` was verified as
+schema version `3` with `31` canonical articles, `150` article occurrences,
+and an `ok` integrity check. Preserve it and the historical ingestion artifact
+pack, and never describe database compatibility as retroactive artifact
+validation.
 
 ### Restore the exact supervisor demo pair
 
@@ -335,8 +389,10 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    reviewed sources, offline fixtures, and separate provider/network checks.
 2. Expand the current OGDC aliases into a versioned ticker/company registry and
    reviewable entity-linking output.
-3. Implement pinned FinBERT inference and leakage-safe daily aggregation with
-   the `available_at <= decision_cutoff` rule.
+3. Review and operate the pinned FinBERT article-inference foundation; inspect
+   the retained real-run artifacts and audit sample before implementing
+   leakage-safe daily aggregation with the
+   `available_at <= decision_cutoff` rule.
 4. Develop the LSTM and relationship/knowledge-graph components behind the
    current prediction and artifact contracts.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
@@ -358,6 +414,22 @@ python scripts/run_news_pipeline.py \
   --config configs/news/ogdc_sources.example.json \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
+
+# Pinned article-level FinBERT inference. Review the license and CLI first,
+# use a copy of legacy retained storage during migration testing, and never
+# reuse an existing SENT run ID or artifact directory.
+python -m pip install -r requirements-sentiment.txt
+python scripts/run_sentiment_inference.py --help
+python scripts/run_sentiment_inference.py \
+  --source-run-id NEWS-20261022-131242-5ddffd2d \
+  --database data/news/paisa_news.sqlite3 \
+  --output-dir artifacts/sentiment_inference \
+  --model-cache data/sentiment_model_cache \
+  --device cpu \
+  --batch-size 8 \
+  --max-input-characters 4000 \
+  --max-token-length 512 \
+  --max-articles 500
 
 # Four versioned price-only models from the retained, standardized snapshot
 PAISA_NEW_TRAINING_RUN_ID="TRN-20261022-team-handoff-01"

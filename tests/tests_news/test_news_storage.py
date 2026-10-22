@@ -209,6 +209,10 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
         "deduplication_relationships",
         "provider_errors",
         "quality_reports",
+        "sentiment_model_revisions",
+        "sentiment_inference_runs",
+        "article_sentiment_outputs",
+        "sentiment_inference_errors",
     }
     with storage.connection() as connection:
         tables = {
@@ -234,11 +238,11 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
             "SELECT version, name FROM schema_migrations ORDER BY version DESC"
         ).fetchone()
     assert latest["version"] == DATABASE_SCHEMA_VERSION
-    assert latest["name"] == "news_storage_sealed_finalization"
+    assert latest["name"] == "financial_sentiment_foundation"
 
 
-@pytest.mark.parametrize("prior_version", [1, 2, 3])
-def test_initialize_migrates_each_verified_prior_schema_to_v4(
+@pytest.mark.parametrize("prior_version", [1, 2, 3, 4])
+def test_initialize_migrates_each_verified_prior_schema_to_v5(
     tmp_path, prior_version
 ):
     database = tmp_path / f"prior-v{prior_version}.sqlite3"
@@ -256,9 +260,9 @@ def test_initialize_migrates_each_verified_prior_schema_to_v4(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             )
         ]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert "sealed_manifest_sha256" in columns
-    assert versions[-1] == (4, "news_storage_sealed_finalization")
+    assert versions[-1] == (5, "financial_sentiment_foundation")
 
 
 def test_initialize_rejects_malformed_stamped_schema_without_advancing(tmp_path):

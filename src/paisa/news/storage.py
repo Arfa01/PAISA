@@ -24,7 +24,7 @@ import sqlite3
 from typing import Any
 
 
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 NEWS_RECORD_SCHEMA_VERSION = "1.0"
 QUALITY_REPORT_SCHEMA_VERSION = "2.0"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -1149,6 +1149,490 @@ END;
 """ + _SEALED_EVIDENCE_SQL
 
 
+_SCHEMA_V5_SQL = """
+CREATE TABLE sentiment_model_revisions (
+    model_revision_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    model_repository TEXT NOT NULL,
+    model_revision TEXT NOT NULL,
+    tokenizer_repository TEXT NOT NULL,
+    tokenizer_revision TEXT NOT NULL,
+    original_labels_json TEXT NOT NULL,
+    label_mapping_json TEXT NOT NULL,
+    license_identifier TEXT NOT NULL,
+    library_versions_json TEXT NOT NULL,
+    model_config_sha256 TEXT,
+    tokenizer_config_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    CHECK (json_valid(original_labels_json) = 1),
+    CHECK (json_type(original_labels_json) IN ('array', 'object')),
+    CHECK (json_valid(label_mapping_json) = 1),
+    CHECK (json_type(label_mapping_json) = 'object'),
+    CHECK (json_valid(library_versions_json) = 1),
+    CHECK (json_type(library_versions_json) = 'object'),
+    CHECK (
+        model_config_sha256 IS NULL OR length(model_config_sha256) = 64
+    ),
+    CHECK (
+        tokenizer_config_sha256 IS NULL OR length(tokenizer_config_sha256) = 64
+    ),
+    UNIQUE (
+        model_repository,
+        model_revision,
+        tokenizer_repository,
+        tokenizer_revision
+    )
+);
+
+CREATE TABLE sentiment_inference_runs (
+    run_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    source_ingestion_run_id TEXT NOT NULL,
+    model_revision_id TEXT NOT NULL,
+    input_policy_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('RUNNING', 'PASS', 'PARTIAL', 'FAIL')
+    ),
+    device TEXT NOT NULL,
+    batch_size INTEGER NOT NULL CHECK (batch_size > 0),
+    maximum_input_characters INTEGER NOT NULL CHECK (
+        maximum_input_characters > 0
+    ),
+    maximum_sequence_length INTEGER NOT NULL CHECK (
+        maximum_sequence_length > 0
+    ),
+    maximum_articles INTEGER CHECK (
+        maximum_articles IS NULL OR maximum_articles > 0
+    ),
+    timeout_seconds REAL CHECK (
+        timeout_seconds IS NULL OR timeout_seconds > 0
+    ),
+    artifact_directory TEXT NOT NULL,
+    configuration_json TEXT NOT NULL DEFAULT '{}',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    CHECK (json_valid(configuration_json) = 1),
+    CHECK (json_type(configuration_json) = 'object'),
+    CHECK (json_valid(summary_json) = 1),
+    CHECK (json_type(summary_json) = 'object'),
+    FOREIGN KEY (source_ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (model_revision_id)
+        REFERENCES sentiment_model_revisions(model_revision_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_sentiment_runs_source
+ON sentiment_inference_runs(source_ingestion_run_id, run_id);
+
+CREATE TABLE article_sentiment_outputs (
+    sentiment_output_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    inference_run_id TEXT NOT NULL,
+    article_id TEXT NOT NULL,
+    source_ingestion_run_id TEXT NOT NULL,
+    model_revision_id TEXT NOT NULL,
+    input_policy_id TEXT NOT NULL,
+    selected_fields_json TEXT NOT NULL,
+    input_text_sha256 TEXT NOT NULL CHECK (length(input_text_sha256) = 64),
+    character_count INTEGER NOT NULL CHECK (character_count > 0),
+    original_character_count INTEGER NOT NULL CHECK (
+        original_character_count >= character_count
+    ),
+    character_truncation_applied INTEGER NOT NULL CHECK (
+        character_truncation_applied IN (0, 1)
+    ),
+    token_truncation_applied INTEGER NOT NULL CHECK (
+        token_truncation_applied IN (0, 1)
+    ),
+    maximum_input_characters INTEGER NOT NULL CHECK (
+        maximum_input_characters > 0
+    ),
+    tokenizer_token_count INTEGER NOT NULL CHECK (tokenizer_token_count > 0),
+    truncation_applied INTEGER NOT NULL CHECK (truncation_applied IN (0, 1)),
+    maximum_sequence_length INTEGER NOT NULL CHECK (maximum_sequence_length > 0),
+    original_language TEXT,
+    published_at TEXT,
+    available_at TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    class_labels_json TEXT NOT NULL,
+    negative_probability REAL NOT NULL CHECK (
+        negative_probability >= 0.0 AND negative_probability <= 1.0
+    ),
+    neutral_probability REAL NOT NULL CHECK (
+        neutral_probability >= 0.0 AND neutral_probability <= 1.0
+    ),
+    positive_probability REAL NOT NULL CHECK (
+        positive_probability >= 0.0 AND positive_probability <= 1.0
+    ),
+    predicted_label TEXT NOT NULL CHECK (
+        predicted_label IN ('negative', 'neutral', 'positive')
+    ),
+    predicted_probability REAL NOT NULL CHECK (
+        predicted_probability >= 0.0 AND predicted_probability <= 1.0
+    ),
+    inference_timestamp TEXT NOT NULL,
+    device TEXT NOT NULL,
+    batch_size INTEGER NOT NULL CHECK (batch_size > 0),
+    library_versions_json TEXT NOT NULL,
+    warning_codes_json TEXT NOT NULL DEFAULT '[]',
+    error_code TEXT,
+    error_message TEXT,
+    CHECK (json_valid(selected_fields_json) = 1),
+    CHECK (json_type(selected_fields_json) = 'array'),
+    CHECK (json_array_length(selected_fields_json) > 0),
+    CHECK (json_valid(class_labels_json) = 1),
+    CHECK (json_type(class_labels_json) = 'array'),
+    CHECK (json_array_length(class_labels_json) = 3),
+    CHECK (json_extract(class_labels_json, '$[0]') = 'negative'),
+    CHECK (json_extract(class_labels_json, '$[1]') = 'neutral'),
+    CHECK (json_extract(class_labels_json, '$[2]') = 'positive'),
+    CHECK (json_valid(library_versions_json) = 1),
+    CHECK (json_type(library_versions_json) = 'object'),
+    CHECK (json_valid(warning_codes_json) = 1),
+    CHECK (json_type(warning_codes_json) = 'array'),
+    CHECK (character_count <= maximum_input_characters),
+    CHECK (
+        character_truncation_applied = (
+            original_character_count > character_count
+        )
+    ),
+    CHECK (
+        token_truncation_applied = (
+            tokenizer_token_count > maximum_sequence_length
+        )
+    ),
+    CHECK (
+        truncation_applied = (
+            character_truncation_applied OR token_truncation_applied
+        )
+    ),
+    CHECK (
+        abs(
+            negative_probability + neutral_probability + positive_probability
+            - 1.0
+        ) <= 0.000001
+    ),
+    CHECK (
+        (predicted_label = 'negative'
+         AND abs(predicted_probability - negative_probability) <= 0.000001)
+        OR (predicted_label = 'neutral'
+            AND abs(predicted_probability - neutral_probability) <= 0.000001)
+        OR (predicted_label = 'positive'
+            AND abs(predicted_probability - positive_probability) <= 0.000001)
+    ),
+    CHECK (
+        predicted_probability + 0.000001 >= negative_probability
+        AND predicted_probability + 0.000001 >= neutral_probability
+        AND predicted_probability + 0.000001 >= positive_probability
+    ),
+    CHECK (
+        (error_code IS NULL AND error_message IS NULL)
+        OR (error_code IS NOT NULL AND error_message IS NOT NULL)
+    ),
+    UNIQUE (article_id, model_revision_id, input_policy_id),
+    FOREIGN KEY (inference_run_id) REFERENCES sentiment_inference_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (article_id) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (source_ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (model_revision_id)
+        REFERENCES sentiment_model_revisions(model_revision_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_article_sentiment_outputs_run
+ON article_sentiment_outputs(inference_run_id, article_id);
+
+CREATE INDEX ix_article_sentiment_outputs_available
+ON article_sentiment_outputs(available_at, article_id);
+
+CREATE TABLE sentiment_inference_errors (
+    error_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    inference_run_id TEXT NOT NULL,
+    article_id TEXT,
+    source_ingestion_run_id TEXT NOT NULL,
+    model_revision_id TEXT NOT NULL,
+    input_policy_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    error_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    input_text_sha256 TEXT CHECK (
+        input_text_sha256 IS NULL OR length(input_text_sha256) = 64
+    ),
+    selected_fields_json TEXT NOT NULL DEFAULT '[]',
+    original_language TEXT,
+    warning_codes_json TEXT NOT NULL DEFAULT '[]',
+    retryable INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+    details_json TEXT NOT NULL DEFAULT '{}',
+    CHECK (json_valid(selected_fields_json) = 1),
+    CHECK (json_type(selected_fields_json) = 'array'),
+    CHECK (json_valid(warning_codes_json) = 1),
+    CHECK (json_type(warning_codes_json) = 'array'),
+    CHECK (json_valid(details_json) = 1),
+    CHECK (json_type(details_json) = 'object'),
+    FOREIGN KEY (inference_run_id) REFERENCES sentiment_inference_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (article_id) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (source_ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (model_revision_id)
+        REFERENCES sentiment_model_revisions(model_revision_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_sentiment_inference_errors_run
+ON sentiment_inference_errors(inference_run_id, error_id);
+
+CREATE TRIGGER trg_sentiment_model_revisions_immutable_update
+BEFORE UPDATE ON sentiment_model_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment model revisions are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_model_revisions_immutable_delete
+BEFORE DELETE ON sentiment_model_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment model revisions are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_insert_running
+BEFORE INSERT ON sentiment_inference_runs
+WHEN NEW.status <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment inference runs must start as RUNNING');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_completed_source_insert
+BEFORE INSERT ON sentiment_inference_runs
+WHEN NOT EXISTS (
+    SELECT 1 FROM ingestion_runs
+    WHERE run_id = NEW.source_ingestion_run_id
+      AND status IN ('PASS', 'PARTIAL')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment input requires a completed ingestion run');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_protect_finalized_update
+BEFORE UPDATE ON sentiment_inference_runs
+WHEN OLD.status <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized sentiment inference runs are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_protect_finalized_delete
+BEFORE DELETE ON sentiment_inference_runs
+WHEN OLD.status <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized sentiment inference runs are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_configuration_immutable_update
+BEFORE UPDATE OF schema_version, source_ingestion_run_id, model_revision_id,
+                 input_policy_id, started_at, device, batch_size,
+                 maximum_input_characters, maximum_sequence_length,
+                 maximum_articles, timeout_seconds, artifact_directory,
+                 configuration_json
+ON sentiment_inference_runs
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment inference run configuration is immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_runs_final_status_shape
+BEFORE UPDATE OF status ON sentiment_inference_runs
+WHEN NEW.status <> 'RUNNING' AND (
+    NEW.completed_at IS NULL
+    OR (NEW.status = 'PASS' AND (
+        EXISTS (
+            SELECT 1 FROM sentiment_inference_errors
+            WHERE inference_run_id = OLD.run_id
+        )
+        OR EXISTS (
+            SELECT 1 FROM article_sentiment_outputs
+            WHERE inference_run_id = OLD.run_id AND error_code IS NOT NULL
+        )
+    ))
+    OR (NEW.status = 'PARTIAL' AND NOT (
+        EXISTS (
+            SELECT 1 FROM sentiment_inference_errors
+            WHERE inference_run_id = OLD.run_id
+        )
+        OR EXISTS (
+            SELECT 1 FROM article_sentiment_outputs
+            WHERE inference_run_id = OLD.run_id AND error_code IS NOT NULL
+        )
+    ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment final status contradicts persisted evidence');
+END;
+
+CREATE TRIGGER trg_article_sentiment_outputs_context_insert
+BEFORE INSERT ON article_sentiment_outputs
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM sentiment_inference_runs AS run
+    JOIN article_ingestions AS occurrence
+      ON occurrence.ingestion_run_id = run.source_ingestion_run_id
+     AND occurrence.canonical_article_id = NEW.article_id
+    JOIN normalized_articles AS article
+      ON article.article_id = occurrence.canonical_article_id
+    WHERE run.run_id = NEW.inference_run_id
+      AND run.status = 'RUNNING'
+      AND run.source_ingestion_run_id = NEW.source_ingestion_run_id
+      AND run.model_revision_id = NEW.model_revision_id
+      AND run.input_policy_id = NEW.input_policy_id
+      AND article.published_at IS NEW.published_at
+      AND article.available_at = NEW.available_at
+      AND article.fetched_at = NEW.fetched_at
+      AND article.language IS NEW.original_language
+      AND run.maximum_input_characters = NEW.maximum_input_characters
+      AND run.maximum_sequence_length = NEW.maximum_sequence_length
+      AND run.device = NEW.device
+      AND run.batch_size = NEW.batch_size
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment output does not match its run and article evidence');
+END;
+
+CREATE TRIGGER trg_article_sentiment_outputs_immutable_update
+BEFORE UPDATE ON article_sentiment_outputs
+BEGIN
+    SELECT RAISE(ABORT, 'article sentiment outputs are immutable');
+END;
+
+CREATE TRIGGER trg_article_sentiment_outputs_immutable_delete
+BEFORE DELETE ON article_sentiment_outputs
+BEGIN
+    SELECT RAISE(ABORT, 'article sentiment outputs are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_inference_errors_context_insert
+BEFORE INSERT ON sentiment_inference_errors
+WHEN NOT EXISTS (
+    SELECT 1 FROM sentiment_inference_runs AS run
+    WHERE run.run_id = NEW.inference_run_id
+      AND run.status = 'RUNNING'
+      AND run.source_ingestion_run_id = NEW.source_ingestion_run_id
+      AND run.model_revision_id = NEW.model_revision_id
+      AND run.input_policy_id = NEW.input_policy_id
+      AND (
+          NEW.article_id IS NULL OR EXISTS (
+              SELECT 1 FROM article_ingestions AS occurrence
+              WHERE occurrence.ingestion_run_id = run.source_ingestion_run_id
+                AND occurrence.canonical_article_id = NEW.article_id
+          )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment error does not match its running context');
+END;
+
+CREATE TRIGGER trg_sentiment_inference_errors_immutable_update
+BEFORE UPDATE ON sentiment_inference_errors
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment inference errors are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_inference_errors_immutable_delete
+BEFORE DELETE ON sentiment_inference_errors
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment inference errors are immutable');
+END;
+"""
+
+
+# The retained PR #12 database was produced by a short-lived version-3 schema
+# immediately before the final constraint hardening landed.  Its object set,
+# indexes, and triggers match version 3 exactly; only these three table
+# definitions lack constraints that the already-valid retained rows satisfy.
+# Keep the signatures literal so initialization cannot bless arbitrary drift.
+_RECOGNIZED_LEGACY_V3_TABLE_SQL = {
+    "normalized_articles": """
+CREATE TABLE normalized_articles (
+    article_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_url TEXT,
+    canonical_url TEXT,
+    title TEXT,
+    normalized_title TEXT NOT NULL DEFAULT '',
+    summary TEXT,
+    body TEXT,
+    published_at TEXT,
+    published_timezone TEXT,
+    available_at TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    language TEXT,
+    mentioned_tickers_json TEXT NOT NULL DEFAULT '[]',
+    mentioned_companies_json TEXT NOT NULL DEFAULT '[]',
+    mentioned_sectors_json TEXT NOT NULL DEFAULT '[]',
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    duplicate_of TEXT,
+    first_ingestion_run_id TEXT NOT NULL,
+    raw_artifact_reference TEXT NOT NULL,
+    normalization_warnings_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    CHECK (duplicate_of IS NULL OR duplicate_of <> article_id),
+    FOREIGN KEY (duplicate_of) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (first_ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)
+""",
+    "article_ingestions": """
+CREATE TABLE article_ingestions (
+    occurrence_id TEXT PRIMARY KEY,
+    ingestion_run_id TEXT NOT NULL,
+    raw_evidence_id TEXT,
+    candidate_article_id TEXT NOT NULL,
+    canonical_article_id TEXT NOT NULL,
+    duplicate_of TEXT,
+    deduplication_rule TEXT,
+    available_at TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    raw_artifact_reference TEXT NOT NULL,
+    normalized_payload_json TEXT NOT NULL,
+    normalization_warnings_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    CHECK (
+        (duplicate_of IS NULL AND candidate_article_id = canonical_article_id)
+        OR duplicate_of = canonical_article_id
+    ),
+    FOREIGN KEY (ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (raw_evidence_id) REFERENCES raw_source_records(raw_evidence_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (canonical_article_id) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (duplicate_of) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    UNIQUE (ingestion_run_id, candidate_article_id)
+)
+""",
+    "quality_reports": """
+CREATE TABLE quality_reports (
+    ingestion_run_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    quality_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    FOREIGN KEY (ingestion_run_id) REFERENCES ingestion_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)
+""",
+}
+
+
 def utc_now_z() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="auto").replace(
         "+00:00", "Z"
@@ -1195,6 +1679,58 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _positive_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if number <= 0 or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError(f"{field} must be a positive integer")
+    return number
+
+
+def _optional_positive_integer(value: Any, *, field: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_integer(value, field=field)
+
+
+def _optional_positive_number(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive number") from exc
+    if number <= 0:
+        raise ValueError(f"{field} must be a positive number")
+    return number
+
+
+def _boolean_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if value in {0, 1}:
+        return int(value)
+    raise ValueError(f"{field} must be boolean")
+
+
+def _probability(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a probability")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a probability") from exc
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{field} must be between zero and one")
+    return number
 
 
 def _deduplication_rule(value: Any, *, nullable: bool = False) -> str | None:
@@ -1413,11 +1949,20 @@ _MIGRATION_NAMES = {
     2: "news_storage_immutability",
     3: "news_storage_cross_run_integrity",
     4: "news_storage_sealed_finalization",
+    5: "financial_sentiment_foundation",
 }
 
 
 def _normalized_schema_sql(value: str | None) -> str:
-    return " ".join((value or "").split()).casefold()
+    normalized = " ".join((value or "").split()).casefold()
+    # SQLite quotes the destination table name after ALTER TABLE ... RENAME.
+    # Treat that cosmetic rewrite as equivalent while continuing to compare
+    # every column, constraint, index, and trigger token exactly.
+    return re.sub(
+        r'^(create table(?: if not exists)?)\s+"([a-z0-9_]+)"',
+        r"\1 \2",
+        normalized,
+    )
 
 
 def _schema_stage_sql(version: int) -> str:
@@ -1429,6 +1974,8 @@ def _schema_stage_sql(version: int) -> str:
         return _DEDUPLICATION_INTEGRITY_SQL
     elif version == 4:
         return _SCHEMA_V4_SQL
+    elif version == 5:
+        return _SCHEMA_V5_SQL
     raise ValueError(f"Unsupported news schema stage: {version}")
 
 
@@ -1458,6 +2005,169 @@ def _expected_schema_objects(version: int) -> dict[tuple[str, str], str]:
         }
     finally:
         expected.close()
+
+
+def _expected_schema_definitions(
+    version: int,
+) -> list[tuple[str, str, str, str]]:
+    """Return raw expected schema definitions for a verified migration stage."""
+
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.execute("PRAGMA foreign_keys = ON")
+        for stage in range(1, version + 1):
+            _apply_schema_stage(expected, stage)
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+            for row in expected.execute(
+                """
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_master
+                WHERE type IN ('table', 'index', 'trigger')
+                  AND name NOT LIKE 'sqlite_%'
+                  AND sql IS NOT NULL
+                ORDER BY type, name
+                """
+            )
+        ]
+    finally:
+        expected.close()
+
+
+def _is_recognized_legacy_v3_schema(connection: sqlite3.Connection) -> bool:
+    expected = _expected_schema_objects(3)
+    actual = {
+        (str(row[0]), str(row[1])): _normalized_schema_sql(row[2])
+        for row in connection.execute(
+            """
+            SELECT type, name, sql
+            FROM sqlite_master
+            WHERE type IN ('table', 'index', 'trigger')
+              AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
+    if set(actual) != set(expected):
+        return False
+    changed = {
+        key for key in expected if expected[key] != actual[key]
+    }
+    recognized = {
+        ("table", "normalized_articles"),
+        ("table", "article_ingestions"),
+        ("table", "quality_reports"),
+    }
+    if changed != recognized:
+        return False
+    return all(
+        actual[("table", table)] == _normalized_schema_sql(sql)
+        for table, sql in _RECOGNIZED_LEGACY_V3_TABLE_SQL.items()
+    )
+
+
+def _repair_recognized_legacy_v3_schema(connection: sqlite3.Connection) -> None:
+    """Rebuild only the exact retained pre-hardening v3 table signatures."""
+
+    if not _is_recognized_legacy_v3_schema(connection):
+        raise RuntimeError("Refusing to repair an unrecognized news schema")
+
+    invalid_article = connection.execute(
+        """
+        SELECT article_id FROM normalized_articles
+        WHERE julianday(available_at) IS NULL
+           OR julianday(fetched_at) IS NULL
+           OR julianday(available_at) < julianday(fetched_at)
+           OR (
+               published_at IS NOT NULL AND (
+                   julianday(published_at) IS NULL
+                   OR julianday(available_at) < julianday(published_at)
+               )
+           )
+        LIMIT 1
+        """
+    ).fetchone()
+    invalid_occurrence = connection.execute(
+        """
+        SELECT occurrence_id FROM article_ingestions
+        WHERE raw_evidence_id IS NULL
+           OR julianday(available_at) IS NULL
+           OR julianday(fetched_at) IS NULL
+           OR julianday(available_at) < julianday(fetched_at)
+        LIMIT 1
+        """
+    ).fetchone()
+    invalid_quality = connection.execute(
+        """
+        SELECT ingestion_run_id FROM quality_reports
+        WHERE quality_status NOT IN ('PASS', 'WARN', 'FAIL')
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_article is not None or invalid_occurrence is not None or invalid_quality is not None:
+        raise RuntimeError(
+            "Recognized legacy news schema contains rows that violate the hardened contract"
+        )
+
+    targets = tuple(_RECOGNIZED_LEGACY_V3_TABLE_SQL)
+    definitions = _expected_schema_definitions(3)
+    expected_tables = {
+        name: sql
+        for object_type, name, _table, sql in definitions
+        if object_type == "table" and name in targets
+    }
+    secondary = [
+        sql
+        for object_type, _name, table, sql in definitions
+        if object_type == "trigger" or (object_type == "index" and table in targets)
+    ]
+    trigger_names = [
+        name
+        for object_type, name, _table, _sql in definitions
+        if object_type == "trigger"
+    ]
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for trigger in trigger_names:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        for table in targets:
+            repaired = f"{table}__v3_repaired"
+            create_sql = expected_tables[table].replace(
+                f"CREATE TABLE {table}", f"CREATE TABLE {repaired}", 1
+            )
+            connection.execute(create_sql)
+            columns = [
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            ]
+            column_sql = ", ".join(columns)
+            connection.execute(
+                f"INSERT INTO {repaired} ({column_sql}) "
+                f"SELECT {column_sql} FROM {table}"
+            )
+
+        # Restore each public name immediately. SQLite reparses surviving
+        # cross-table triggers during ALTER TABLE and therefore must never see
+        # all three public names absent at the same time.
+        for table in ("normalized_articles", "article_ingestions", "quality_reports"):
+            connection.execute(f"DROP TABLE {table}")
+            connection.execute(
+                f"ALTER TABLE {table}__v3_repaired RENAME TO {table}"
+            )
+        for sql in secondary:
+            connection.execute(sql)
+
+        foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if foreign_key_error is not None or integrity is None or integrity[0] != "ok":
+            raise RuntimeError("Legacy news schema repair failed integrity validation")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _verify_migration_ledger(
@@ -1937,6 +2647,8 @@ class NewsStorage:
                 _bootstrap_schema(connection)
                 current = 1
             else:
+                if current == 3 and _is_recognized_legacy_v3_schema(connection):
+                    _repair_recognized_legacy_v3_schema(connection)
                 _verify_schema(connection, current)
             while current < DATABASE_SCHEMA_VERSION:
                 _migrate_schema(connection, current, current + 1)
@@ -3068,6 +3780,825 @@ class NewsStorage:
             )
             if result.rowcount != 1:
                 raise RuntimeError(f"Could not finalize ingestion run: {identifier}")
+
+    def register_sentiment_model_revision(
+        self, record: Any | None = None, **values: Any
+    ) -> str:
+        """Register one immutable model/tokenizer revision and its label contract."""
+
+        data = _record_mapping(record, values)
+        identifier = _safe_id(
+            _value(data, "model_revision_id", "revision_id"),
+            field="model_revision_id",
+        )
+        repository = _required_text(data, "model_repository", "repository")
+        model_revision = _required_text(data, "model_revision", "revision")
+        tokenizer_repository = _optional_text(data.get("tokenizer_repository")) or repository
+        tokenizer_revision = _optional_text(data.get("tokenizer_revision")) or model_revision
+        model_config_sha256 = _optional_text(data.get("model_config_sha256"))
+        tokenizer_config_sha256 = _optional_text(data.get("tokenizer_config_sha256"))
+        if model_config_sha256 is not None:
+            model_config_sha256 = _sha256(
+                model_config_sha256, field="model_config_sha256"
+            )
+        if tokenizer_config_sha256 is not None:
+            tokenizer_config_sha256 = _sha256(
+                tokenizer_config_sha256, field="tokenizer_config_sha256"
+            )
+        row = {
+            "model_revision_id": identifier,
+            "schema_version": str(data.get("schema_version", "1.0")),
+            "model_repository": repository,
+            "model_revision": model_revision,
+            "tokenizer_repository": tokenizer_repository,
+            "tokenizer_revision": tokenizer_revision,
+            "original_labels_json": _json_text(
+                _value(data, "original_labels", "class_labels"), default=[]
+            ),
+            "label_mapping_json": _json_text(data.get("label_mapping"), default={}),
+            "license_identifier": _required_text(
+                data, "license_identifier", "license"
+            ),
+            "library_versions_json": _json_text(
+                data.get("library_versions"), default={}
+            ),
+            "model_config_sha256": model_config_sha256,
+            "tokenizer_config_sha256": tokenizer_config_sha256,
+            "created_at": _timestamp(
+                data.get("created_at", utc_now_z()), field="created_at"
+            ),
+        }
+        identity_columns = (
+            "model_revision_id",
+            "model_repository",
+            "model_revision",
+            "tokenizer_repository",
+            "tokenizer_revision",
+        )
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM sentiment_model_revisions
+                WHERE model_revision_id = ? OR (
+                    model_repository = ? AND model_revision = ?
+                    AND tokenizer_repository = ? AND tokenizer_revision = ?
+                )
+                """,
+                tuple(row[column] for column in identity_columns),
+            ).fetchone()
+            if existing is not None:
+                comparable = tuple(
+                    column for column in row if column != "created_at"
+                )
+                if any(existing[column] != row[column] for column in comparable):
+                    raise ValueError(
+                        "Sentiment model revision identity already has different metadata"
+                    )
+                return str(existing["model_revision_id"])
+            connection.execute(
+                """
+                INSERT INTO sentiment_model_revisions(
+                    model_revision_id, schema_version, model_repository,
+                    model_revision, tokenizer_repository, tokenizer_revision,
+                    original_labels_json, label_mapping_json, license_identifier,
+                    library_versions_json, model_config_sha256,
+                    tokenizer_config_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(row.values()),
+            )
+        return identifier
+
+    def begin_sentiment_run(
+        self, record: Any | None = None, **values: Any
+    ) -> None:
+        """Begin one immutable sentiment-inference run against completed news."""
+
+        data = _record_mapping(record, values)
+        run_id = _safe_id(
+            _value(data, "run_id", "inference_run_id"), field="run_id"
+        )
+        source_run_id = _safe_id(
+            data.get("source_ingestion_run_id"), field="source_ingestion_run_id"
+        )
+        model_revision_id = _safe_id(
+            data.get("model_revision_id"), field="model_revision_id"
+        )
+        input_policy_id = _safe_id(
+            data.get("input_policy_id"), field="input_policy_id"
+        )
+        maximum_articles = _optional_positive_integer(
+            data.get("maximum_articles"), field="maximum_articles"
+        )
+        timeout_seconds = _optional_positive_number(
+            data.get("timeout_seconds"), field="timeout_seconds"
+        )
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sentiment_inference_runs(
+                    run_id, schema_version, source_ingestion_run_id,
+                    model_revision_id, input_policy_id, started_at, completed_at,
+                    status, device, batch_size, maximum_input_characters,
+                    maximum_sequence_length, maximum_articles, timeout_seconds,
+                    artifact_directory, configuration_json, summary_json,
+                    error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL)
+                """,
+                (
+                    run_id,
+                    str(data.get("schema_version", "1.0")),
+                    source_run_id,
+                    model_revision_id,
+                    input_policy_id,
+                    _timestamp(
+                        data.get("started_at", utc_now_z()), field="started_at"
+                    ),
+                    _required_text(data, "device"),
+                    _positive_integer(data.get("batch_size"), field="batch_size"),
+                    _positive_integer(
+                        data.get("maximum_input_characters"),
+                        field="maximum_input_characters",
+                    ),
+                    _positive_integer(
+                        data.get("maximum_sequence_length"),
+                        field="maximum_sequence_length",
+                    ),
+                    maximum_articles,
+                    timeout_seconds,
+                    _artifact_reference(
+                        data.get("artifact_directory"), field="artifact_directory"
+                    ),
+                    _json_text(data.get("configuration"), default={}),
+                ),
+            )
+
+    def iter_sentiment_input_articles(
+        self,
+        source_ingestion_run_id: str,
+        *,
+        batch_size: int = 100,
+        maximum_articles: int | None = None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield bounded canonical-article batches represented by a completed run."""
+
+        source_run_id = _safe_id(
+            source_ingestion_run_id, field="source_ingestion_run_id"
+        )
+        page_size = _positive_integer(batch_size, field="batch_size")
+        maximum = _optional_positive_integer(
+            maximum_articles, field="maximum_articles"
+        )
+        remaining = maximum
+        last_article_id = ""
+        with self.connection() as connection:
+            source = connection.execute(
+                "SELECT status FROM ingestion_runs WHERE run_id = ?",
+                (source_run_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(f"Unknown ingestion run: {source_run_id}")
+            if source["status"] not in {"PASS", "PARTIAL"}:
+                raise RuntimeError(
+                    "Sentiment input requires a completed PASS or PARTIAL ingestion run"
+                )
+
+            while remaining is None or remaining > 0:
+                limit = page_size if remaining is None else min(page_size, remaining)
+                rows = connection.execute(
+                    """
+                    WITH represented AS (
+                        SELECT canonical_article_id
+                        FROM article_ingestions
+                        WHERE ingestion_run_id = ?
+                        GROUP BY canonical_article_id
+                    )
+                    SELECT
+                        article.article_id,
+                        article.schema_version,
+                        article.provider,
+                        article.source_name,
+                        article.source_type,
+                        article.source_url,
+                        article.canonical_url,
+                        article.title,
+                        article.summary,
+                        article.body,
+                        article.published_at,
+                        article.published_timezone,
+                        article.available_at,
+                        article.fetched_at,
+                        article.language,
+                        article.mentioned_tickers_json,
+                        article.mentioned_companies_json,
+                        article.mentioned_sectors_json,
+                        article.content_sha256,
+                        article.first_ingestion_run_id AS canonical_owner_run_id,
+                        article.raw_artifact_reference,
+                        article.normalization_warnings_json,
+                        owner.data_kind AS data_class,
+                        ? AS source_ingestion_run_id,
+                        EXISTS (
+                            SELECT 1
+                            FROM article_ingestions AS linked_occurrence
+                            JOIN article_company_links AS link
+                              ON link.occurrence_id = linked_occurrence.occurrence_id
+                            WHERE linked_occurrence.ingestion_run_id = ?
+                              AND linked_occurrence.canonical_article_id = article.article_id
+                              AND upper(link.ticker) = 'OGDC'
+                        ) AS ogdc_linked
+                    FROM represented
+                    JOIN normalized_articles AS article
+                      ON article.article_id = represented.canonical_article_id
+                    JOIN ingestion_runs AS owner
+                      ON owner.run_id = article.first_ingestion_run_id
+                    WHERE article.article_id > ?
+                      AND article.duplicate_of IS NULL
+                      AND owner.status IN ('PASS', 'PARTIAL')
+                    ORDER BY article.article_id
+                    LIMIT ?
+                    """,
+                    (
+                        source_run_id,
+                        source_run_id,
+                        source_run_id,
+                        last_article_id,
+                        limit,
+                    ),
+                ).fetchall()
+                if not rows:
+                    return
+                batch: list[dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    for stored, public in (
+                        ("mentioned_tickers_json", "mentioned_tickers"),
+                        ("mentioned_companies_json", "mentioned_companies"),
+                        ("mentioned_sectors_json", "mentioned_sectors"),
+                        ("normalization_warnings_json", "normalization_warnings"),
+                    ):
+                        item[public] = json.loads(str(item.pop(stored)))
+                    item["ogdc_linked"] = bool(item["ogdc_linked"])
+                    batch.append(item)
+                yield batch
+                last_article_id = str(rows[-1]["article_id"])
+                if remaining is not None:
+                    remaining -= len(rows)
+
+    def get_article_sentiment(
+        self,
+        article_id: str,
+        model_revision_id: str,
+        input_policy_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the immutable result for one idempotency triple, if present."""
+
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM article_sentiment_outputs
+                WHERE article_id = ? AND model_revision_id = ?
+                  AND input_policy_id = ?
+                """,
+                (
+                    _safe_id(article_id, field="article_id"),
+                    _safe_id(model_revision_id, field="model_revision_id"),
+                    _safe_id(input_policy_id, field="input_policy_id"),
+                ),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def save_article_sentiment(
+        self, record: Any | None = None, **values: Any
+    ) -> tuple[str, bool]:
+        """Persist one output, returning ``(output_id, inserted)`` idempotently."""
+
+        data = _record_mapping(record, values)
+        run_id = _safe_id(
+            _value(data, "inference_run_id", "run_id"), field="inference_run_id"
+        )
+        article_id = _safe_id(data.get("article_id"), field="article_id")
+        with self.transaction() as connection:
+            run = connection.execute(
+                "SELECT * FROM sentiment_inference_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown sentiment inference run: {run_id}")
+            if run["status"] != "RUNNING":
+                raise RuntimeError(f"Sentiment inference run is finalized: {run_id}")
+            source_run_id = _safe_id(
+                data.get("source_ingestion_run_id", run["source_ingestion_run_id"]),
+                field="source_ingestion_run_id",
+            )
+            model_revision_id = _safe_id(
+                data.get("model_revision_id", run["model_revision_id"]),
+                field="model_revision_id",
+            )
+            input_policy_id = _safe_id(
+                data.get("input_policy_id", run["input_policy_id"]),
+                field="input_policy_id",
+            )
+            run_context = {
+                "source_ingestion_run_id": source_run_id,
+                "model_revision_id": model_revision_id,
+                "input_policy_id": input_policy_id,
+            }
+            for field, supplied in run_context.items():
+                if supplied != run[field]:
+                    raise ValueError(
+                        f"{field} does not match the sentiment inference run"
+                    )
+            article = connection.execute(
+                "SELECT * FROM normalized_articles WHERE article_id = ?",
+                (article_id,),
+            ).fetchone()
+            if article is None:
+                raise KeyError(f"Unknown canonical article: {article_id}")
+            represented = connection.execute(
+                """
+                SELECT 1 FROM article_ingestions
+                WHERE ingestion_run_id = ? AND canonical_article_id = ?
+                LIMIT 1
+                """,
+                (source_run_id, article_id),
+            ).fetchone()
+            if represented is None:
+                raise ValueError(
+                    "Article is not represented by the sentiment source ingestion run"
+                )
+
+            probabilities = {
+                "negative": _probability(
+                    data.get("negative_probability"), field="negative_probability"
+                ),
+                "neutral": _probability(
+                    data.get("neutral_probability"), field="neutral_probability"
+                ),
+                "positive": _probability(
+                    data.get("positive_probability"), field="positive_probability"
+                ),
+            }
+            if abs(sum(probabilities.values()) - 1.0) > 0.000001:
+                raise ValueError("Sentiment probabilities must sum to one")
+            predicted_label = _required_text(data, "predicted_label").lower()
+            if predicted_label not in probabilities:
+                raise ValueError(
+                    "predicted_label must be negative, neutral, or positive"
+                )
+            predicted_probability = _probability(
+                data.get("predicted_probability"), field="predicted_probability"
+            )
+            if abs(predicted_probability - probabilities[predicted_label]) > 0.000001:
+                raise ValueError(
+                    "predicted_probability must match the predicted label probability"
+                )
+            if predicted_probability + 0.000001 < max(probabilities.values()):
+                raise ValueError("predicted_label must identify a maximum probability")
+
+            selected_fields_json = _json_text(
+                data.get("selected_fields"), default=[]
+            )
+            class_labels = data.get("class_labels")
+            if list(class_labels or ()) != ["negative", "neutral", "positive"]:
+                raise ValueError(
+                    "class_labels must be negative, neutral, positive in canonical order"
+                )
+            class_labels_json = _json_text(class_labels, default=[])
+            library_versions_json = _json_text(
+                data.get("library_versions"), default={}
+            )
+            warning_codes_json = _json_text(
+                _value(data, "warning_codes", "warnings", default=[]), default=[]
+            )
+            input_digest = _sha256(
+                data.get("input_text_sha256"), field="input_text_sha256"
+            )
+            maximum_sequence_length = _positive_integer(
+                data.get(
+                    "maximum_sequence_length", run["maximum_sequence_length"]
+                ),
+                field="maximum_sequence_length",
+            )
+            if maximum_sequence_length != run["maximum_sequence_length"]:
+                raise ValueError(
+                    "maximum_sequence_length does not match the sentiment run"
+                )
+            maximum_input_characters = _positive_integer(
+                data.get(
+                    "maximum_input_characters",
+                    run["maximum_input_characters"],
+                ),
+                field="maximum_input_characters",
+            )
+            if maximum_input_characters != run["maximum_input_characters"]:
+                raise ValueError(
+                    "maximum_input_characters does not match the sentiment run"
+                )
+            character_count = _positive_integer(
+                data.get("character_count"), field="character_count"
+            )
+            original_character_count = _positive_integer(
+                data.get("original_character_count", character_count),
+                field="original_character_count",
+            )
+            if original_character_count < character_count:
+                raise ValueError(
+                    "original_character_count cannot be smaller than character_count"
+                )
+            if character_count > maximum_input_characters:
+                raise ValueError(
+                    "character_count cannot exceed maximum_input_characters"
+                )
+            character_truncation_applied = _boolean_integer(
+                data.get("character_truncation_applied", False),
+                field="character_truncation_applied",
+            )
+            token_truncation_applied = _boolean_integer(
+                data.get("token_truncation_applied", False),
+                field="token_truncation_applied",
+            )
+            if character_truncation_applied != int(
+                original_character_count > character_count
+            ):
+                raise ValueError(
+                    "character_truncation_applied must match the character counts"
+                )
+            tokenizer_token_count = _positive_integer(
+                data.get("tokenizer_token_count"),
+                field="tokenizer_token_count",
+            )
+            if token_truncation_applied != int(
+                tokenizer_token_count > maximum_sequence_length
+            ):
+                raise ValueError(
+                    "token_truncation_applied must match the tokenizer count and limit"
+                )
+            truncation_applied = _boolean_integer(
+                data.get("truncation_applied"), field="truncation_applied"
+            )
+            if truncation_applied != int(
+                bool(character_truncation_applied or token_truncation_applied)
+            ):
+                raise ValueError(
+                    "truncation_applied must combine character and token truncation"
+                )
+            semantic_values = {
+                "input_text_sha256": input_digest,
+                "selected_fields_json": selected_fields_json,
+                "character_count": character_count,
+                "original_character_count": original_character_count,
+                "character_truncation_applied": character_truncation_applied,
+                "token_truncation_applied": token_truncation_applied,
+                "maximum_input_characters": maximum_input_characters,
+                "tokenizer_token_count": tokenizer_token_count,
+                "truncation_applied": truncation_applied,
+                "maximum_sequence_length": maximum_sequence_length,
+                "class_labels_json": class_labels_json,
+                "negative_probability": probabilities["negative"],
+                "neutral_probability": probabilities["neutral"],
+                "positive_probability": probabilities["positive"],
+                "predicted_label": predicted_label,
+                "predicted_probability": predicted_probability,
+            }
+            existing = connection.execute(
+                """
+                SELECT * FROM article_sentiment_outputs
+                WHERE article_id = ? AND model_revision_id = ?
+                  AND input_policy_id = ?
+                """,
+                (article_id, model_revision_id, input_policy_id),
+            ).fetchone()
+            if existing is not None:
+                for field, expected in semantic_values.items():
+                    observed = existing[field]
+                    if isinstance(expected, float):
+                        if abs(float(observed) - expected) > 0.000001:
+                            raise RuntimeError(
+                                "Idempotent sentiment output disagrees with persisted evidence"
+                            )
+                    elif observed != expected:
+                        raise RuntimeError(
+                            "Idempotent sentiment output disagrees with persisted evidence"
+                        )
+                return str(existing["sentiment_output_id"]), False
+
+            output_id = _safe_id(
+                data.get("sentiment_output_id")
+                or _deterministic_id(
+                    "SENTOUT", article_id, model_revision_id, input_policy_id
+                ),
+                field="sentiment_output_id",
+            )
+            published_at = _timestamp(
+                data.get("published_at", article["published_at"]),
+                field="published_at",
+                nullable=True,
+            )
+            available_at = _timestamp(
+                data.get("available_at", article["available_at"]),
+                field="available_at",
+            )
+            fetched_at = _timestamp(
+                data.get("fetched_at", article["fetched_at"]), field="fetched_at"
+            )
+            assert available_at is not None and fetched_at is not None
+            _validate_availability(
+                available_at=available_at,
+                fetched_at=fetched_at,
+                published_at=published_at,
+            )
+            error_code = _optional_text(data.get("error_code"))
+            error_message = _optional_text(data.get("error_message"))
+            if (error_code is None) != (error_message is None):
+                raise ValueError("error_code and error_message must be supplied together")
+            connection.execute(
+                """
+                INSERT INTO article_sentiment_outputs(
+                    sentiment_output_id, schema_version, inference_run_id,
+                    article_id, source_ingestion_run_id, model_revision_id,
+                    input_policy_id, selected_fields_json, input_text_sha256,
+                    character_count, original_character_count,
+                    character_truncation_applied, token_truncation_applied,
+                    maximum_input_characters, tokenizer_token_count,
+                    truncation_applied, maximum_sequence_length,
+                    original_language, published_at, available_at, fetched_at,
+                    class_labels_json,
+                    negative_probability, neutral_probability,
+                    positive_probability, predicted_label,
+                    predicted_probability, inference_timestamp, device,
+                    batch_size, library_versions_json, warning_codes_json,
+                    error_code, error_message
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    output_id,
+                    str(data.get("schema_version", "1.0")),
+                    run_id,
+                    article_id,
+                    source_run_id,
+                    model_revision_id,
+                    input_policy_id,
+                    selected_fields_json,
+                    input_digest,
+                    semantic_values["character_count"],
+                    semantic_values["original_character_count"],
+                    semantic_values["character_truncation_applied"],
+                    semantic_values["token_truncation_applied"],
+                    semantic_values["maximum_input_characters"],
+                    semantic_values["tokenizer_token_count"],
+                    semantic_values["truncation_applied"],
+                    maximum_sequence_length,
+                    _optional_text(data.get("original_language")),
+                    published_at,
+                    available_at,
+                    fetched_at,
+                    class_labels_json,
+                    probabilities["negative"],
+                    probabilities["neutral"],
+                    probabilities["positive"],
+                    predicted_label,
+                    predicted_probability,
+                    _timestamp(
+                        data.get("inference_timestamp", utc_now_z()),
+                        field="inference_timestamp",
+                    ),
+                    _required_text(data, "device")
+                    if "device" in data
+                    else str(run["device"]),
+                    _positive_integer(
+                        data.get("batch_size", run["batch_size"]),
+                        field="batch_size",
+                    ),
+                    library_versions_json,
+                    warning_codes_json,
+                    error_code,
+                    error_message,
+                ),
+            )
+        return output_id, True
+
+    def save_sentiment_error(
+        self, record: Any | None = None, **values: Any
+    ) -> str:
+        """Persist one structured, redacted inference error for a running run."""
+
+        data = _record_mapping(record, values)
+        run_id = _safe_id(
+            _value(data, "inference_run_id", "run_id"), field="inference_run_id"
+        )
+        with self.transaction() as connection:
+            run = connection.execute(
+                "SELECT * FROM sentiment_inference_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown sentiment inference run: {run_id}")
+            if run["status"] != "RUNNING":
+                raise RuntimeError(f"Sentiment inference run is finalized: {run_id}")
+            article_id = _optional_text(data.get("article_id"))
+            if article_id is not None:
+                article_id = _safe_id(article_id, field="article_id")
+            stage = _required_text(data, "stage")
+            error_type = _required_text(data, "error_type")
+            message = _required_text(data, "message")
+            error_id = _safe_id(
+                data.get("error_id")
+                or _deterministic_id(
+                    "SENTERR", run_id, article_id, stage, error_type, message
+                ),
+                field="error_id",
+            )
+            input_digest = _optional_text(data.get("input_text_sha256"))
+            if input_digest is not None:
+                input_digest = _sha256(
+                    input_digest, field="input_text_sha256"
+                )
+            connection.execute(
+                """
+                INSERT INTO sentiment_inference_errors(
+                    error_id, schema_version, inference_run_id, article_id,
+                    source_ingestion_run_id, model_revision_id, input_policy_id,
+                    stage, error_type, message, occurred_at, input_text_sha256,
+                    selected_fields_json, original_language, warning_codes_json,
+                    retryable, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    error_id,
+                    str(data.get("schema_version", "1.0")),
+                    run_id,
+                    article_id,
+                    _safe_id(
+                        data.get(
+                            "source_ingestion_run_id",
+                            run["source_ingestion_run_id"],
+                        ),
+                        field="source_ingestion_run_id",
+                    ),
+                    _safe_id(
+                        data.get("model_revision_id", run["model_revision_id"]),
+                        field="model_revision_id",
+                    ),
+                    _safe_id(
+                        data.get("input_policy_id", run["input_policy_id"]),
+                        field="input_policy_id",
+                    ),
+                    stage,
+                    error_type,
+                    message,
+                    _timestamp(
+                        data.get("occurred_at", utc_now_z()), field="occurred_at"
+                    ),
+                    input_digest,
+                    _json_text(data.get("selected_fields"), default=[]),
+                    _optional_text(data.get("original_language")),
+                    _json_text(
+                        _value(data, "warning_codes", "warnings", default=[]),
+                        default=[],
+                    ),
+                    _boolean_integer(
+                        data.get("retryable", False), field="retryable"
+                    ),
+                    _json_text(data.get("details"), default={}),
+                ),
+            )
+        return error_id
+
+    def finalize_sentiment_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        completed_at: str | datetime | None = None,
+        summary: Mapping[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Finalize a sentiment run without permitting an error-bearing PASS."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        final_status = str(status).strip().upper()
+        if final_status not in {"PASS", "PARTIAL", "FAIL"}:
+            raise ValueError("Final sentiment status must be PASS, PARTIAL, or FAIL")
+        with self.transaction() as connection:
+            current = connection.execute(
+                "SELECT status FROM sentiment_inference_runs WHERE run_id = ?",
+                (identifier,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown sentiment inference run: {identifier}")
+            if current["status"] != "RUNNING":
+                raise RuntimeError(
+                    f"Sentiment inference run is already finalized: {identifier}"
+                )
+            error_count = int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM sentiment_inference_errors
+                    WHERE inference_run_id = ?
+                    """,
+                    (identifier,),
+                ).fetchone()[0]
+            )
+            output_error_count = int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM article_sentiment_outputs
+                    WHERE inference_run_id = ? AND error_code IS NOT NULL
+                    """,
+                    (identifier,),
+                ).fetchone()[0]
+            )
+            error_count += output_error_count
+            if final_status == "PASS" and error_count:
+                raise RuntimeError("A PASS sentiment run cannot contain errors")
+            if final_status == "PARTIAL" and not error_count:
+                raise RuntimeError("A PARTIAL sentiment run requires retained errors")
+            result = connection.execute(
+                """
+                UPDATE sentiment_inference_runs
+                SET completed_at = ?, status = ?, summary_json = ?, error_message = ?
+                WHERE run_id = ? AND status = 'RUNNING'
+                """,
+                (
+                    _timestamp(
+                        completed_at or utc_now_z(), field="completed_at"
+                    ),
+                    final_status,
+                    _json_text(summary, default={}),
+                    _optional_text(error_message),
+                    identifier,
+                ),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    f"Could not finalize sentiment inference run: {identifier}"
+                )
+
+    def get_sentiment_model_revision(
+        self, model_revision_id: str
+    ) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM sentiment_model_revisions
+                WHERE model_revision_id = ?
+                """,
+                (_safe_id(model_revision_id, field="model_revision_id"),),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def get_sentiment_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM sentiment_inference_runs WHERE run_id = ?",
+                (_safe_id(run_id, field="run_id"),),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def get_article_sentiment_by_id(
+        self, sentiment_output_id: str
+    ) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM article_sentiment_outputs
+                WHERE sentiment_output_id = ?
+                """,
+                (
+                    _safe_id(
+                        sentiment_output_id, field="sentiment_output_id"
+                    ),
+                ),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def list_article_sentiments_for_run(
+        self, run_id: str
+    ) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM article_sentiment_outputs
+                WHERE inference_run_id = ? ORDER BY article_id
+                """,
+                (_safe_id(run_id, field="run_id"),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_sentiment_errors(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sentiment_inference_errors
+                WHERE inference_run_id = ? ORDER BY error_id
+                """,
+                (_safe_id(run_id, field="run_id"),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:

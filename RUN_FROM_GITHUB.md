@@ -37,6 +37,15 @@ python -c "import pypsx_toolkit"
 package can install successfully but fail to import on some platforms. A failed
 optional-provider install or import does not block the standard PAISA workflow.
 
+Article-level FinBERT inference is also an optional, separate runtime. Its
+pinned weights are large and recorded as CC BY-NC-SA 4.0, so PAISA limits this
+configuration to non-commercial academic use. Install it only when running the
+sentiment stage:
+
+```bash
+python -m pip install -r requirements-sentiment.txt
+```
+
 ## 4. Generate PSX data, features, dataset, and baseline model
 
 ```bash
@@ -89,6 +98,84 @@ and locations. `FAIL` exits non-zero. Existing run IDs are never overwritten,
 provider failures never fall back to fixtures, and generated
 databases/artifacts remain outside Git. See
 [`docs/NEWS_INGESTION.md`](docs/NEWS_INGESTION.md) before configuring a source.
+
+## 4b. Run article-level FinBERT sentiment inference
+
+This stage reads canonical normalized articles from one completed news run. It
+does not fetch publishers, aggregate daily sentiment, join stock prices,
+retrain a stock model, produce a trading signal, or update the dashboard.
+
+The default model and tokenizer are both pinned to
+`ProsusAI/finbert@0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031`.
+The upstream output indices are mapped explicitly as `0=positive`,
+`1=negative`, and `2=neutral`; persisted PAISA probabilities use the canonical
+order `negative`, `neutral`, `positive`.
+
+Inspect all resource and device controls first:
+
+```bash
+python scripts/run_sentiment_inference.py --help
+```
+
+Then run a bounded CPU invocation against the accepted PR #12 news run:
+
+```bash
+python scripts/run_sentiment_inference.py \
+  --source-run-id NEWS-20261022-131242-5ddffd2d \
+  --database data/news/paisa_news.sqlite3 \
+  --output-dir artifacts/sentiment_inference \
+  --model-cache data/sentiment_model_cache \
+  --device cpu \
+  --batch-size 8 \
+  --max-input-characters 4000 \
+  --max-token-length 512 \
+  --max-articles 500
+```
+
+The exact `SENT-...` run ID and body-free summary print on completion. The
+destination is immutable: never reuse an existing run ID or directory.
+Downloaded model files, SQLite state, and generated artifacts remain ignored by
+Git. Public manifests contain portable cache/database labels, not absolute
+private paths or credentials. A failed model download/load exits non-zero and
+never silently selects another classifier.
+
+The accepted PR #12 ingestion manifest and artifact pack record schema version
+`3`; those historical artifacts predate the schema-4 sealing evidence and
+cannot be passed off as current news verification evidence. Before the
+retained sentiment execution, the working `data/news/paisa_news.sqlite3` also
+used schema version `3`. The migration repaired only the exact recognized
+legacy signature after validating every affected row, then applied schemas 4
+and 5; all other drift fails closed. The working database is now schema version
+`5`. Its ignored, uncommitted pre-migration copy is
+`data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified at
+schema version `3` with `31` canonical articles, `150` article occurrences,
+and an `ok` integrity check. Do not describe database compatibility as
+retroactive artifact certification.
+
+The retained final-code reference execution is
+`SENT-20261022-172211-real0002`, sourced from
+`NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
+`7.116756208240986` seconds against a preserved schema-3 database copy, which
+migrated to schema version `5`.
+It requested and scored `30` unique canonical articles, skipped `0`, failed
+`0`, and recorded `any_articles_failed=false`. One scored article was linked
+to OGDC. The label counts were `negative=11`, `neutral=9`, and `positive=10`;
+`17` inputs were truncated, `0` used title only, and all `30` carried `en-us`
+language evidence. The canonical availability range was
+`2026-10-22T11:52:32Z` through `2026-10-22T13:12:43.088883Z`.
+
+That run used the pinned model and tokenizer revision above under Python
+`3.13.7`, PyTorch `2.10.0`, Transformers `5.20.2`, Tokenizers `0.23.3`,
+Hugging Face Hub `1.32.0`, and Safetensors `0.8.0`. Its generated artifact
+directory is
+`artifacts/sentiment_inference/SENT-20261022-172211-real0002`; it is not
+committed.
+
+Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+This short snapshot is insufficient for stock-model integration. See
+[`docs/FINBERT_SENTIMENT.md`](docs/FINBERT_SENTIMENT.md),
+[`docs/SENTIMENT_DATA_CONTRACT.md`](docs/SENTIMENT_DATA_CONTRACT.md), and
+[`docs/SENTIMENT_TIME_ALIGNMENT.md`](docs/SENTIMENT_TIME_ALIGNMENT.md).
 
 ## 5. Run tests
 

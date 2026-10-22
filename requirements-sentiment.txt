@@ -1,0 +1,7 @@
+# Optional, reproducible runtime for article-level FinBERT inference.
+# The default offline unit suite injects a mock backend and does not download a model.
+torch==2.10.0
+transformers==5.20.2
+tokenizers==0.23.3
+huggingface-hub==1.32.0
+safetensors==0.8.0

@@ -1,8 +1,9 @@
 # PAISA v0 — Predictive AI Stock Assessment
 
-PAISA began as a PSX-first stock-data layer and now also includes an additive,
-reproducible financial-news ingestion foundation. The price/model/backtest/API
-and dashboard contracts remain separate from news acquisition and evidence.
+PAISA began as a PSX-first stock-data layer and now also includes additive,
+reproducible financial-news ingestion and article-level financial-sentiment
+inference foundations. The price/model/backtest/API and dashboard contracts
+remain separate from news acquisition and sentiment evidence.
 
 This is **not financial advice** and does not produce buy/sell recommendations. It is an academic prototype for data engineering, ML evaluation, and dashboard integration.
 
@@ -27,6 +28,9 @@ proposal and early-v0 context.
 | [News ingestion runbook](docs/NEWS_INGESTION.md) | RSS/manual acquisition, immutable artifacts, quality policy, and reproduction commands. |
 | [News data contract](docs/NEWS_DATA_CONTRACT.md) | Versioned normalized record, provider evidence, deduplication, entity-link, and SQLite semantics. |
 | [News time alignment](docs/NEWS_TIME_ALIGNMENT.md) | Publication/acquisition/availability rules and the future-feature cutoff boundary. |
+| [FinBERT sentiment runbook](docs/FINBERT_SENTIMENT.md) | Pinned model/license, deterministic text policy, resource controls, artifacts, and execution commands. |
+| [Sentiment data contract](docs/SENTIMENT_DATA_CONTRACT.md) | Article-level probabilities, model/input identity, immutable artifacts, and SQLite semantics. |
+| [Sentiment time alignment](docs/SENTIMENT_TIME_ALIGNMENT.md) | Inherited news time, decision-cutoff filtering, and future aggregation boundary. |
 | [Historical project context](PROJECT_CONTEXT.md) | Original proposal and superseded PAISA v0 snapshot; not a current-status source. |
 
 ## What v0 includes
@@ -45,6 +49,9 @@ proposal and early-v0 context.
 - Separate RSS/Atom and manual-CSV news adapters with immutable raw evidence.
 - Versioned normalized news records, deterministic deduplication, first-stage
   OGDC alias linking, SQLite persistence, and quality/coverage reports.
+- Reproducible article-level FinBERT inference with immutable model/tokenizer
+  revisions, explicit class mapping, bounded batching, SQLite persistence, and
+  leakage-safe availability filtering.
 
 ## Recommended first run
 
@@ -132,9 +139,9 @@ Accepted column variants include `date`, `open`, `open_price`, `close`, `close_p
 
 ## Financial-news ingestion foundation
 
-News acquisition is an explicit, separate workflow. It does not run FinBERT,
-add sentiment to a stock dataset, retrain a model, or change any API/dashboard
-result. The RSS adapter requests explicitly configured publisher feed URLs,
+News acquisition is an explicit, separate workflow. The ingestion command does
+not run FinBERT, add sentiment to a stock dataset, retrain a model, or change
+any API/dashboard result. The RSS adapter requests explicitly configured publisher feed URLs,
 rejects redirects, and never fetches linked article pages. Relative entry links
 are resolved against the feed URL while the unresolved value remains in raw
 evidence:
@@ -183,6 +190,63 @@ See the
 [news runbook](docs/NEWS_INGESTION.md),
 [record contract](docs/NEWS_DATA_CONTRACT.md), and
 [time-alignment contract](docs/NEWS_TIME_ALIGNMENT.md).
+
+## Article-level FinBERT sentiment foundation
+
+Sentiment inference is a separate, downstream workflow. It reads canonical
+normalized articles represented by a completed news run, never fetches article
+pages, and does not modify news availability time. The default is the exact
+`ProsusAI/finbert` model and tokenizer revision
+`0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031`. Its original labels are mapped
+explicitly from `0=positive`, `1=negative`, and `2=neutral` into PAISA's
+canonical `negative`, `neutral`, `positive` output order.
+
+The pinned weights/model are recorded as CC BY-NC-SA 4.0 and are restricted in
+PAISA to non-commercial academic use. Install the separate runtime and inspect
+the bounded CLI before downloading the model:
+
+```bash
+python -m pip install -r requirements-sentiment.txt
+python scripts/run_sentiment_inference.py --help
+```
+
+An example CPU run against the accepted news evidence is:
+
+```bash
+python scripts/run_sentiment_inference.py \
+  --source-run-id NEWS-20261022-131242-5ddffd2d \
+  --database data/news/paisa_news.sqlite3 \
+  --output-dir artifacts/sentiment_inference \
+  --model-cache data/sentiment_model_cache \
+  --device cpu \
+  --batch-size 8 \
+  --max-input-characters 4000 \
+  --max-token-length 512 \
+  --max-articles 500
+```
+
+Every `SENT-...` directory is collision-refusing and contains the pinned model
+and input manifests, article probabilities, structured errors, deterministic
+audit sample, quality report, checksummed run manifest, and final summary. The
+pipeline stores input hashes and source references instead of another copy of
+article bodies. CPU is the default; an explicitly available CUDA or Apple Metal
+device is recorded when selected. A model/download failure is non-zero and is
+never replaced with a generic classifier.
+
+The loader verifies reviewed SHA-256 hashes for the configuration, safetensors
+weights, tokenizer configuration, vocabulary, and special-token map before and
+after model loading. SQLite schema `6` records those hashes, ordered input and
+generated/reused/error associations, post-truncation token counts, and both
+artifact recovery seals before `PASS` is allowed. An interrupted `RUNNING` run
+is never reused globally. After confirming it is stale, retry its exact
+`--run-id` with `--discard-stale-running`; finalized runs cannot be discarded.
+
+The current stage emits article-level sentiment only. It does not aggregate by
+day, join prices, retrain a stock model, emit a trading signal, or alter the API
+or dashboard. A later consumer must first enforce `available_at <=
+decision_cutoff`. See the [FinBERT runbook](docs/FINBERT_SENTIMENT.md),
+[sentiment record contract](docs/SENTIMENT_DATA_CONTRACT.md), and
+[sentiment time contract](docs/SENTIMENT_TIME_ALIGNMENT.md).
 
 ## Versioned OGDC model experiments
 

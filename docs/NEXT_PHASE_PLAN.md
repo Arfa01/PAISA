@@ -32,15 +32,46 @@ unresolved entities, and effective-date changes without future leakage.
 
 ### 3. FinBERT sentiment
 
-Apply a pinned FinBERT model to linked articles. Record the exact model/revision,
-tokenization and truncation settings, label mapping, probabilities, runtime
-versions, and content hash. Treat FinBERT output as a feature source, not as a
-trading signal.
+**Article-level foundation implemented; real CPU execution retained.** The
+implementation pins the `ProsusAI/finbert` model and tokenizer to immutable
+revision `0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031`, records its CC BY-NC-SA 4.0
+license/non-commercial academic-use boundary, maps the original
+`0=positive`, `1=negative`, `2=neutral` ordering explicitly, and persists
+canonical negative/neutral/positive probabilities. It records deterministic
+text selection, hashes, character/token counts, truncation, inherited timing,
+runtime versions, resource settings, structured errors, SQLite identities, and
+immutable run artifacts. The reusable cutoff filter performs no aggregation.
 
-Acceptance gate: deterministic fixtures and a retained manifest prove model,
-input, and output identity; unavailable or truncated text is explicit.
+Run `SENT-20261022-172211-real0002` completed with `PASS` on CPU against
+`NEWS-20261022-131242-5ddffd2d`: all `30` requested unique canonical articles
+were scored, none were skipped or failed, one was OGDC-linked, the label counts
+were `negative=11`, `neutral=9`, and `positive=10`, and `17` inputs were
+truncated. Its retained execution used schema version `5`; current code targets
+schema `6`. Generated artifacts remain
+outside Git at
+`artifacts/sentiment_inference/SENT-20261022-172211-real0002`.
+
+Remaining gate: review the retained audit sample and outputs before defining
+daily aggregation. The accepted ingestion artifacts still record their
+historical schema version `3`, while the working
+`data/news/paisa_news.sqlite3` was retained at schema version `5` and is
+upgraded to `6` by current code. Preserve the ignored,
+uncommitted pre-migration copy at
+`data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified as
+schema version `3` with `31` canonical articles, `150` article occurrences,
+and an `ok` integrity check. The narrow compatibility path is not retroactive
+news verification.
+Deterministic fixtures and the retained sentiment manifest must prove model,
+input, output, and timing identity.
+
+Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+This short snapshot is insufficient for stock-model integration. FinBERT
+output remains a feature source, not a trading signal or an accuracy claim.
 
 ### 4. Daily sentiment aggregation
+
+**Not implemented.** Begin only after the article-level real run and audit
+sample have been reviewed.
 
 Aggregate article-level scores by ticker and trading date using only information
 available by the declared feature cutoff. Define after-close and non-trading-day
@@ -116,6 +147,8 @@ the feature date, and tested for ambiguous, conflicting, and expired evidence.
   chronologically by target date.
 - Preserve price-only baselines and use immutable experiment/model IDs; never
   overwrite `VSL-20261020-OGDC-main-02` or its referenced artifacts.
+- Preserve sentiment model/output identities; never replace results created by
+  a different model/tokenizer revision or text-policy configuration.
 - Keep models, policies, portfolios, APIs, and dashboard presentation separate.
 - Keep bulk data, fitted binaries, secrets, and run outputs out of Git.
 - Document missing data, negative findings, and provider failures explicitly.

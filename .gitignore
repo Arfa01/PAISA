@@ -31,6 +31,12 @@ models/**/*.joblib
 models/**/*.pkl
 models/**/*.json
 models/**/*.csv
+models/**/*.bin
+models/**/*.safetensors
+models/**/*.pt
+models/**/*.pth
+data/sentiment_model_cache/**
+**/.cache/huggingface/**
 /runs/**
 /artifacts/**
 !data/**/.gitkeep

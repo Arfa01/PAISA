@@ -85,9 +85,13 @@ class ManualCsvNewsProvider(NewsProvider):
         self.csv_path = Path(csv_path)
         self.source_name = source_name or self.csv_path.stem
         self.default_language = _optional_text(default_language)
+        self.configured_source = f"manual-csv:{self.csv_path.name}"
         self.clock = clock
         self.configured_sources = (
-            {"path": str(self.csv_path), "source_name": self.source_name},
+            {
+                "configured_source": self.configured_source,
+                "source_name": self.source_name,
+            },
         )
         self.effective_config = {
             "source_name": self.source_name,
@@ -95,7 +99,7 @@ class ManualCsvNewsProvider(NewsProvider):
         }
 
     def fetch(self, *, fetched_at: datetime | None = None) -> ProviderFetchResult:
-        configured_source = str(self.csv_path)
+        configured_source = self.configured_source
         capture_id = "manual-csv-input"
         try:
             payload = self.csv_path.read_bytes()
@@ -111,7 +115,7 @@ class ManualCsvNewsProvider(NewsProvider):
                         provider_id=self.provider_id,
                         configured_source=configured_source,
                         error_type="file_read_error",
-                        message=str(exc),
+                        message=f"Manual CSV could not be read ({type(exc).__name__})",
                         occurred_at=acquisition_time,
                     ),
                 ),

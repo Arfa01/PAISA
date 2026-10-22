@@ -54,18 +54,21 @@ def deduplicate_articles(
 ) -> tuple[list[NormalizedNewsArticle], list[DuplicateRelationship]]:
     """Apply ordered deterministic rules while retaining every occurrence."""
 
-    by_url: dict[str, str] = {}
-    by_hash: dict[str, str] = {}
-    by_title_time: dict[tuple[str, str, str], str] = {}
+    by_url: dict[str, tuple[str, str]] = {}
+    by_hash: dict[str, tuple[str, str]] = {}
+    by_title_time: dict[tuple[str, str, str], tuple[str, str]] = {}
 
     def index(article: NormalizedNewsArticle) -> None:
+        if article.duplicate_of is not None:
+            return
         canonical_id = article.duplicate_of or article.article_id
+        canonical = (canonical_id, article.ingestion_run_id)
         if article.canonical_url:
-            by_url.setdefault(article.canonical_url, canonical_id)
-        by_hash.setdefault(article.content_sha256, canonical_id)
+            by_url.setdefault(article.canonical_url, canonical)
+        by_hash.setdefault(article.content_sha256, canonical)
         title_key = _article_title_source_time_key(article)
         if title_key:
-            by_title_time.setdefault(title_key, canonical_id)
+            by_title_time.setdefault(title_key, canonical)
 
     for existing in existing_articles:
         if existing.duplicate_of is None:
@@ -74,21 +77,28 @@ def deduplicate_articles(
     resolved: list[NormalizedNewsArticle] = []
     relationships: list[DuplicateRelationship] = []
     for article in articles:
-        duplicate_of: str | None = None
+        duplicate_match: tuple[str, str] | None = None
         rule: str | None = None
         if article.canonical_url and article.canonical_url in by_url:
-            duplicate_of = by_url[article.canonical_url]
+            duplicate_match = by_url[article.canonical_url]
             rule = "canonical_url"
         elif article.content_sha256 in by_hash:
-            duplicate_of = by_hash[article.content_sha256]
+            duplicate_match = by_hash[article.content_sha256]
             rule = "content_sha256"
         else:
             title_key = _article_title_source_time_key(article)
             if title_key and title_key in by_title_time:
-                duplicate_of = by_title_time[title_key]
+                duplicate_match = by_title_time[title_key]
                 rule = "title_source_time"
 
+        duplicate_of = duplicate_match[0] if duplicate_match is not None else None
         if duplicate_of is not None and duplicate_of != article.article_id:
+            canonical_owner_run_id = duplicate_match[1]
+            duplicate_scope = (
+                "within_run"
+                if canonical_owner_run_id == article.ingestion_run_id
+                else "historical"
+            )
             duplicate = replace(article, duplicate_of=duplicate_of)
             resolved.append(duplicate)
             relationships.append(
@@ -96,6 +106,8 @@ def deduplicate_articles(
                     article_id=article.article_id,
                     canonical_article_id=duplicate_of,
                     rule=rule,  # type: ignore[arg-type]
+                    duplicate_scope=duplicate_scope,
+                    canonical_owner_run_id=canonical_owner_run_id,
                 )
             )
         else:

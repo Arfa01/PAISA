@@ -10,6 +10,7 @@ NEWS_SCHEMA_VERSION = "1.0"
 DataClass = Literal["real", "imported", "fixture"]
 RunStatus = Literal["PASS", "PARTIAL", "FAIL"]
 QualityStatus = Literal["PASS", "WARN", "FAIL"]
+DuplicateScope = Literal["within_run", "historical"]
 
 
 def utc_iso(value: datetime | None) -> str | None:
@@ -241,12 +242,29 @@ class DuplicateRelationship:
     article_id: str
     canonical_article_id: str
     rule: Literal["canonical_url", "content_sha256", "title_source_time"]
+    duplicate_scope: DuplicateScope | None = None
+    canonical_owner_run_id: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
+    def __post_init__(self) -> None:
+        if self.duplicate_scope not in {None, "within_run", "historical"}:
+            raise ValueError(f"Unsupported duplicate scope: {self.duplicate_scope}")
+        if (self.duplicate_scope is None) != (self.canonical_owner_run_id is None):
+            raise ValueError(
+                "duplicate_scope and canonical_owner_run_id must be supplied together"
+            )
+        if (
+            self.canonical_owner_run_id is not None
+            and not self.canonical_owner_run_id.strip()
+        ):
+            raise ValueError("canonical_owner_run_id cannot be blank")
+
+    def to_dict(self) -> dict[str, str | None]:
         return {
             "article_id": self.article_id,
             "duplicate_of": self.canonical_article_id,
             "deduplication_rule": self.rule,
+            "duplicate_scope": self.duplicate_scope,
+            "canonical_owner_run_id": self.canonical_owner_run_id,
         }
 
 
@@ -268,6 +286,75 @@ class PipelineSummary:
     artifact_directory: str
     database_path: str
     limitations: tuple[str, ...] = ()
+    normalized_occurrence_count: int | None = None
+    new_canonical_article_count: int | None = None
+    matched_existing_canonical_count: int | None = None
+    within_run_duplicate_count: int | None = None
+    historical_duplicate_count: int | None = None
+    represented_canonical_count: int | None = None
+    deduplication_rule_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        named_counts = {
+            "normalized_occurrence_count": self.normalized_occurrence_count,
+            "new_canonical_article_count": self.new_canonical_article_count,
+            "matched_existing_canonical_count": self.matched_existing_canonical_count,
+            "within_run_duplicate_count": self.within_run_duplicate_count,
+            "historical_duplicate_count": self.historical_duplicate_count,
+            "represented_canonical_count": self.represented_canonical_count,
+        }
+        for name, value in named_counts.items():
+            if value is not None and value < 0:
+                raise ValueError(f"{name} cannot be negative")
+
+        complete_counts = all(value is not None for value in named_counts.values())
+        if complete_counts:
+            assert self.normalized_occurrence_count is not None
+            assert self.new_canonical_article_count is not None
+            assert self.matched_existing_canonical_count is not None
+            assert self.within_run_duplicate_count is not None
+            assert self.historical_duplicate_count is not None
+            assert self.represented_canonical_count is not None
+            if self.normalized_occurrence_count != self.normalized_record_count:
+                raise ValueError(
+                    "normalized occurrence count must equal normalized record count"
+                )
+            if (
+                self.within_run_duplicate_count
+                + self.historical_duplicate_count
+                != self.duplicate_count
+            ):
+                raise ValueError(
+                    "within-run and historical duplicate counts must sum to "
+                    "duplicate_count"
+                )
+            if self.matched_existing_canonical_count != self.historical_duplicate_count:
+                raise ValueError(
+                    "matched existing canonical count must equal historical "
+                    "duplicate count"
+                )
+            if (
+                self.new_canonical_article_count + self.duplicate_count
+                != self.normalized_occurrence_count
+            ):
+                raise ValueError(
+                    "new canonical and duplicate counts must cover all normalized "
+                    "occurrences"
+                )
+            if not (
+                self.new_canonical_article_count
+                <= self.represented_canonical_count
+                <= self.normalized_occurrence_count
+            ):
+                raise ValueError(
+                    "represented canonical count is outside the possible range"
+                )
+        if self.deduplication_rule_counts and (
+            sum(self.deduplication_rule_counts.values()) != self.duplicate_count
+        ):
+            raise ValueError(
+                "deduplication rule counts must sum to duplicate_count"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

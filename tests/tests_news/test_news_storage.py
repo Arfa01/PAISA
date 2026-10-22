@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 
 import pytest
 
+from paisa.news import storage as storage_module
 from paisa.news.storage import DATABASE_SCHEMA_VERSION, NewsStorage
 
 
@@ -83,6 +85,119 @@ def _article(
     }
 
 
+def _quality_payload(
+    storage: NewsStorage,
+    run_id: str,
+    *,
+    quality_status: str | None = None,
+) -> dict[str, object]:
+    snapshot = storage.get_run_evidence_snapshot(run_id)
+    return {
+        "schema_version": "2.0",
+        "quality_status": quality_status or snapshot["expected_quality_status"],
+        "total_raw_records": snapshot["raw_record_count"],
+        "total_normalized_records": snapshot["normalized_occurrence_count"],
+        "normalized_occurrence_count": snapshot["normalized_occurrence_count"],
+        "new_canonical_article_count": snapshot["new_canonical_article_count"],
+        "matched_existing_canonical_count": snapshot[
+            "matched_existing_canonical_count"
+        ],
+        "within_run_duplicate_count": snapshot["within_run_duplicate_count"],
+        "historical_duplicate_count": snapshot["historical_duplicate_count"],
+        "represented_canonical_count": snapshot["represented_canonical_count"],
+        "duplicate_relationship_count": snapshot[
+            "duplicate_relationship_count"
+        ],
+        "duplicate_count": snapshot["duplicate_relationship_count"],
+        "deduplication_rule_counts": snapshot["deduplication_rule_counts"],
+        "provider_error_count": snapshot["provider_error_count"],
+        "rejected_record_count": snapshot["rejected_record_count"],
+        "missing_title_count": snapshot["missing_title_count"],
+        "missing_publication_time_count": snapshot[
+            "missing_publication_time_count"
+        ],
+        "missing_body_count": snapshot["missing_body_count"],
+        "invalid_url_count": snapshot["invalid_url_count"],
+        "ogdc_linked_article_count": snapshot["ogdc_linked_article_count"],
+    }
+
+
+def _seal(
+    storage: NewsStorage,
+    run_id: str,
+    *,
+    manifest_sha256: str = "2" * 64,
+    completion_marker_sha256: str = "3" * 64,
+) -> dict[str, object]:
+    return storage.seal_run(
+        run_id,
+        artifact_inventory=[
+            {
+                "path": "normalized_articles.csv",
+                "sha256": "1" * 64,
+                "size_bytes": 1,
+            }
+        ],
+        manifest_sha256=manifest_sha256,
+        completion_marker_sha256=completion_marker_sha256,
+        expected_counts=storage.get_run_evidence_snapshot(run_id),
+    )
+
+
+def _save_quality_and_seal(
+    storage: NewsStorage,
+    run_id: str,
+    *,
+    quality_status: str | None = None,
+) -> dict[str, object]:
+    report = _quality_payload(storage, run_id, quality_status=quality_status)
+    storage.save_quality(
+        ingestion_run_id=run_id,
+        quality_status=report["quality_status"],
+        report=report,
+    )
+    return _seal(storage, run_id)
+
+
+def _finalize_valid_run(
+    storage: NewsStorage,
+    run_id: str,
+    *,
+    status: str = "PASS",
+) -> None:
+    quality_status = "PASS" if status == "PASS" else "WARN"
+    binding = _save_quality_and_seal(
+        storage, run_id, quality_status=quality_status
+    )
+    storage.finalize_run(
+        run_id,
+        status=status,
+        expected_manifest_sha256=binding["manifest_sha256"],
+        expected_inventory_sha256=binding["artifact_inventory_sha256"],
+        expected_completion_sha256=binding["completion_marker_sha256"],
+    )
+
+
+def _create_versioned_database(path, version: int) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        for stage in range(1, version + 1):
+            storage_module._apply_schema_stage(connection, stage)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (?, ?, ?)
+                """,
+                (stage, storage_module._MIGRATION_NAMES[stage], NOW),
+            )
+            connection.execute(f"PRAGMA user_version = {stage}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorage):
     expected_tables = {
         "schema_migrations",
@@ -119,97 +234,48 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
             "SELECT version, name FROM schema_migrations ORDER BY version DESC"
         ).fetchone()
     assert latest["version"] == DATABASE_SCHEMA_VERSION
-    assert latest["name"] == "news_storage_cross_run_integrity"
+    assert latest["name"] == "news_storage_sealed_finalization"
 
 
-def test_initialize_refreshes_prior_schema_v3_dedup_identity_triggers(tmp_path):
-    storage = NewsStorage(tmp_path / "prior-v3.sqlite3").initialize()
-    with storage.connection() as connection:
-        connection.executescript(
-            """
-            DROP TRIGGER trg_deduplication_relationships_occurrence_identity_insert;
-            DROP TRIGGER trg_deduplication_relationships_occurrence_identity_update;
+@pytest.mark.parametrize("prior_version", [1, 2, 3])
+def test_initialize_migrates_each_verified_prior_schema_to_v4(
+    tmp_path, prior_version
+):
+    database = tmp_path / f"prior-v{prior_version}.sqlite3"
+    _create_versioned_database(database, prior_version)
 
-            CREATE TRIGGER
-            trg_deduplication_relationships_occurrence_identity_insert
-            BEFORE INSERT ON deduplication_relationships
-            WHEN NOT EXISTS (
-                SELECT 1 FROM article_ingestions
-                WHERE occurrence_id = NEW.occurrence_id
-                  AND ingestion_run_id = NEW.ingestion_run_id
-                  AND duplicate_of IS NOT NULL
-                  AND candidate_article_id =
-                      NEW.duplicate_candidate_article_id
-                  AND canonical_article_id = NEW.canonical_article_id
-                  AND duplicate_of = NEW.duplicate_of
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT,
-                    'deduplication relationship must exactly match a duplicate article occurrence'
-                );
-            END;
-
-            CREATE TRIGGER
-            trg_deduplication_relationships_occurrence_identity_update
-            BEFORE UPDATE OF ingestion_run_id, occurrence_id,
-                             duplicate_candidate_article_id,
-                             canonical_article_id, duplicate_of
-            ON deduplication_relationships
-            WHEN NOT EXISTS (
-                SELECT 1 FROM article_ingestions
-                WHERE occurrence_id = NEW.occurrence_id
-                  AND ingestion_run_id = NEW.ingestion_run_id
-                  AND duplicate_of IS NOT NULL
-                  AND candidate_article_id =
-                      NEW.duplicate_candidate_article_id
-                  AND canonical_article_id = NEW.canonical_article_id
-                  AND duplicate_of = NEW.duplicate_of
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT,
-                    'deduplication relationship must exactly match a duplicate article occurrence'
-                );
-            END;
-            """
-        )
-        prior_insert_sql = connection.execute(
-            """
-            SELECT sql FROM sqlite_master
-            WHERE type = 'trigger'
-              AND name =
-                  'trg_deduplication_relationships_occurrence_identity_insert'
-            """
-        ).fetchone()["sql"]
-    assert "deduplication_rule = NEW.deduplication_rule" not in prior_insert_sql
-
-    storage.initialize()
+    storage = NewsStorage(database).initialize()
 
     with storage.connection() as connection:
-        triggers = {
-            row["name"]: " ".join(row["sql"].split())
-            for row in connection.execute(
-                """
-                SELECT name, sql FROM sqlite_master
-                WHERE type = 'trigger'
-                  AND name LIKE '%dedup%identity%'
-                """
-            )
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(ingestion_runs)")
         }
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
-    assert (
-        "deduplication_rule = NEW.deduplication_rule"
-        in triggers[
-            "trg_deduplication_relationships_occurrence_identity_insert"
+        versions = [
+            (row["version"], row["name"])
+            for row in connection.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            )
         ]
-    )
-    assert (
-        "duplicate_of, deduplication_rule"
-        in triggers[
-            "trg_deduplication_relationships_occurrence_identity_update"
-        ]
-    )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert "sealed_manifest_sha256" in columns
+    assert versions[-1] == (4, "news_storage_sealed_finalization")
+
+
+def test_initialize_rejects_malformed_stamped_schema_without_advancing(tmp_path):
+    database = tmp_path / "malformed-v1.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE ingestion_runs(run_id TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 1")
+
+    with pytest.raises(RuntimeError, match="schema verification failed"):
+        NewsStorage(database).initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ingestion_runs)")
+        }
+    assert columns == {"run_id"}
 
 
 def test_round_trip_run_evidence_and_duplicate_candidate_lookup(storage: NewsStorage):
@@ -231,10 +297,27 @@ def test_round_trip_run_evidence_and_duplicate_candidate_lookup(storage: NewsSto
     )
     assert link_id.startswith("link-")
 
+    assert storage.find_duplicate_candidates(
+        canonical_url="https://news.example.test/ogdc-discovery"
+    ) == []
+
+    binding = _save_quality_and_seal(storage, run_id)
+    storage.finalize_run(
+        run_id,
+        status="PASS",
+        completed_at="2026-10-22T10:01:00Z",
+        summary={"normalized_record_count": 1},
+        expected_manifest_sha256=binding["manifest_sha256"],
+        expected_inventory_sha256=binding["artifact_inventory_sha256"],
+        expected_completion_sha256=binding["completion_marker_sha256"],
+    )
+
     candidates = storage.find_duplicate_candidates(
         canonical_url="https://news.example.test/ogdc-discovery"
     )
     assert [row["article_id"] for row in candidates] == ["article-1"]
+    assert candidates[0]["first_ingestion_run_id"] == run_id
+    assert candidates[0]["owner_manifest_sha256"] == "2" * 64
     assert storage.find_duplicate_candidates(content_sha256="a" * 64)
     assert storage.find_duplicate_candidates(
         title="  OGDC   ANNOUNCES DISCOVERY ",
@@ -256,18 +339,6 @@ def test_round_trip_run_evidence_and_duplicate_candidate_lookup(storage: NewsSto
             time_tolerance_seconds=-1,
         )
 
-    storage.save_quality(
-        ingestion_run_id=run_id,
-        quality_status="PASS",
-        report={"total_raw_records": 1, "total_normalized_records": 1},
-    )
-    storage.finalize_run(
-        run_id,
-        status="PASS",
-        completed_at="2026-10-22T10:01:00Z",
-        summary={"normalized_record_count": 1},
-    )
-
     persisted_run = storage.get_run(run_id)
     assert persisted_run is not None
     assert persisted_run["status"] == "PASS"
@@ -276,7 +347,10 @@ def test_round_trip_run_evidence_and_duplicate_candidate_lookup(storage: NewsSto
     assert article is not None
     assert article["published_at"] == "2026-10-22T04:00:00Z"
     assert article["normalized_title"] == "ogdc announces discovery"
-    assert storage.list_canonical_articles()[0]["content_sha256"] == "a" * 64
+    canonical = storage.list_canonical_articles()[0]
+    assert canonical["content_sha256"] == "a" * 64
+    assert canonical["first_ingestion_run_id"] == run_id
+    assert canonical["owner_manifest_sha256"] == "2" * 64
     report = storage.get_quality_report(run_id)
     assert report is not None
     assert json.loads(report["report_json"])["total_raw_records"] == 1
@@ -288,6 +362,7 @@ def test_repeat_ingestion_preserves_raw_and_occurrence_evidence(storage: NewsSto
     _begin(storage, first_run)
     first_raw = _raw(storage, first_run, raw_record_id="shared/source-id")
     storage.save_article(_article(first_run, first_raw))
+    _finalize_valid_run(storage, first_run)
 
     _begin(storage, second_run)
     second_raw = _raw(storage, second_run, raw_record_id="shared/source-id")
@@ -328,6 +403,7 @@ def test_cross_run_evidence_associations_are_rejected_by_api_and_triggers(
     _begin(storage, first_run)
     first_raw = _raw(storage, first_run, raw_record_id="owner-one")
     storage.save_article(_article(first_run, first_raw))
+    _finalize_valid_run(storage, first_run)
 
     _begin(storage, second_run)
     second_raw = _raw(storage, second_run, raw_record_id="owner-two")
@@ -336,7 +412,9 @@ def test_cross_run_evidence_associations_are_rejected_by_api_and_triggers(
         second_raw,
         article_id="article-2",
         canonical_url="https://news.example.test/second-article",
+        title="Second OGDC article",
     )
+    second_article["content_sha256"] = "c" * 64
     storage.save_article(second_article)
     second_occurrence = next(
         row
@@ -415,7 +493,7 @@ def test_cross_run_evidence_associations_are_rejected_by_api_and_triggers(
                 ),
             )
 
-    with pytest.raises(sqlite3.IntegrityError, match="deduplication relationship"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
         with storage.transaction() as connection:
             connection.execute(
                 """
@@ -814,26 +892,42 @@ def test_constraints_and_transaction_rollback(storage: NewsStorage):
         storage.save_article(invalid)
     assert storage.get_article("article-foreign-key") is None
 
-    with pytest.raises(RuntimeError, match="quality report"):
+    with pytest.raises(RuntimeError, match="sealed"):
         storage.finalize_run(run_id, status="PASS")
     assert storage.get_run(run_id)["status"] == "RUNNING"
 
-    rolled_back = "NEWS-20261022-100000-rolled-back"
     with pytest.raises(RuntimeError, match="force rollback"):
         with storage.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO ingestion_runs(
-                    run_id, schema_version, provider_id, provider_mode,
-                    configured_source, data_kind, started_at, status,
-                    summary_json
-                ) VALUES (?, '1.0', 'manual', 'manual-csv', NULL,
-                          'imported', ?, 'RUNNING', '{}')
+                INSERT INTO provider_errors(
+                    error_id, ingestion_run_id, provider_id, occurred_at,
+                    error_type, message, retryable, details_json
+                ) VALUES ('rollback-error', ?, 'manual', ?,
+                          'test', 'must roll back', 0, '{}')
                 """,
-                (rolled_back, NOW),
+                (run_id, NOW),
             )
             raise RuntimeError("force rollback")
-    assert storage.get_run(rolled_back) is None
+    with storage.connection() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM provider_errors WHERE error_id = 'rollback-error'"
+        ).fetchone()[0] == 0
+
+    with pytest.raises(KeyboardInterrupt):
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE raw_source_records SET payload_json = '{}' "
+                "WHERE raw_evidence_id = ?",
+                (raw_evidence_id,),
+            )
+            raise KeyboardInterrupt
+    with storage.connection() as connection:
+        payload = connection.execute(
+            "SELECT payload_json FROM raw_source_records WHERE raw_evidence_id = ?",
+            (raw_evidence_id,),
+        ).fetchone()[0]
+    assert payload != "{}"
 
 
 def test_missing_title_is_stored_for_quality_reporting(storage: NewsStorage):
@@ -857,6 +951,8 @@ def test_missing_title_is_stored_for_quality_reporting(storage: NewsStorage):
 def test_provider_error_and_partial_run_round_trip(storage: NewsStorage):
     run_id = "NEWS-20261022-100000-provider-error"
     _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
     error_id = storage.save_error(
         ingestion_run_id=run_id,
         provider_id="permitted-rss",
@@ -868,15 +964,14 @@ def test_provider_error_and_partial_run_round_trip(storage: NewsStorage):
         details={"credential_present": False},
         occurred_at=NOW,
     )
-    storage.save_quality(
-        ingestion_run_id=run_id,
-        quality_status="WARN",
-        report={"provider_error_count": 1},
-    )
+    binding = _save_quality_and_seal(storage, run_id, quality_status="WARN")
     storage.finalize_run(
         run_id,
         status="PARTIAL",
         error_message="One configured source failed",
+        expected_manifest_sha256=binding["manifest_sha256"],
+        expected_inventory_sha256=binding["artifact_inventory_sha256"],
+        expected_completion_sha256=binding["completion_marker_sha256"],
     )
     with storage.connection() as connection:
         error = connection.execute(
@@ -923,14 +1018,16 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
         for row in storage.list_article_ingestions(run_id)
         if row["candidate_article_id"] == "finalized-duplicate-candidate"
     )["occurrence_id"]
-    storage.save_quality(
+    storage.save_dedup(
         ingestion_run_id=run_id,
-        quality_status="PASS",
-        report={"quality_status": "PASS"},
+        occurrence_id=duplicate_occurrence,
+        duplicate_candidate_article_id="finalized-duplicate-candidate",
+        canonical_article_id="article-1",
+        deduplication_rule="canonical_url",
     )
-    storage.finalize_run(run_id, status="PASS")
+    _finalize_valid_run(storage, run_id)
 
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_raw(
             ingestion_run_id=run_id,
             raw_record_id="late-raw",
@@ -946,9 +1043,9 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
         article_id="late-article",
         canonical_url="https://news.example.test/late",
     )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_article(late_article)
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_article_ingestion(
             ingestion_run_id=run_id,
             raw_evidence_id=raw_evidence_id,
@@ -961,7 +1058,7 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
             raw_artifact_reference="raw/item-1.json",
             normalized_payload={"title": "late"},
         )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_link(
             occurrence_id=occurrence_id,
             ticker="OGDC",
@@ -971,7 +1068,7 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
             match_location="summary",
             confidence="exact",
         )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_dedup(
             ingestion_run_id=run_id,
             occurrence_id=duplicate_occurrence,
@@ -979,14 +1076,14 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
             canonical_article_id="article-1",
             deduplication_rule="canonical_url",
         )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         storage.save_error(
             ingestion_run_id=run_id,
             provider_id="permitted-rss",
             error_type="late_error",
             message="must not be appended",
         )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(RuntimeError, match="finalized"):
         storage.save_quality(
             ingestion_run_id=run_id,
             quality_status="PASS",
@@ -1013,14 +1110,14 @@ def test_finalized_run_rejects_all_evidence_writes_updates_and_deletes(
         assert f"trg_{table}_update_running" in triggers
         assert f"trg_{table}_delete_running" in triggers
 
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         with storage.transaction() as connection:
             connection.execute(
                 "UPDATE raw_source_records SET payload_json = '{}' "
                 "WHERE raw_evidence_id = ?",
                 (raw_evidence_id,),
             )
-    with pytest.raises(sqlite3.IntegrityError, match="finalized"):
+    with pytest.raises(sqlite3.IntegrityError, match="sealed|finalized"):
         with storage.transaction() as connection:
             connection.execute(
                 "DELETE FROM article_company_links WHERE occurrence_id = ?",
@@ -1044,11 +1141,7 @@ def test_final_status_must_agree_with_quality_and_provider_errors(
 ):
     failed_quality = "NEWS-20261022-120000-failed-quality"
     _begin(storage, failed_quality)
-    storage.save_quality(
-        ingestion_run_id=failed_quality,
-        quality_status="FAIL",
-        report={"quality_status": "FAIL"},
-    )
+    _save_quality_and_seal(storage, failed_quality, quality_status="FAIL")
     with pytest.raises(RuntimeError, match="PASS quality"):
         storage.finalize_run(failed_quality, status="PASS")
     assert storage.get_run(failed_quality)["status"] == "RUNNING"
@@ -1058,32 +1151,44 @@ def test_final_status_must_agree_with_quality_and_provider_errors(
                 "UPDATE ingestion_runs SET status = 'PASS' WHERE run_id = ?",
                 (failed_quality,),
             )
+    storage.finalize_run(failed_quality, status="FAIL")
 
     provider_error_run = "NEWS-20261022-120000-provider-error-pass"
     _begin(storage, provider_error_run)
+    raw_evidence_id = _raw(storage, provider_error_run)
+    storage.save_article(_article(provider_error_run, raw_evidence_id))
     storage.save_error(
         ingestion_run_id=provider_error_run,
         provider_id="permitted-rss",
         error_type="network_error",
         message="one source failed",
     )
-    storage.save_quality(
-        ingestion_run_id=provider_error_run,
-        quality_status="PASS",
-        report={"quality_status": "PASS"},
-    )
-    with pytest.raises(RuntimeError, match="provider errors"):
-        storage.finalize_run(provider_error_run, status="PASS")
+    with pytest.raises(ValueError, match="more optimistic"):
+        storage.save_quality(
+            ingestion_run_id=provider_error_run,
+            quality_status="PASS",
+            report=_quality_payload(
+                storage, provider_error_run, quality_status="PASS"
+            ),
+        )
+    storage.finalize_run(provider_error_run, status="FAIL")
 
     partial_run = "NEWS-20261022-120000-partial-quality"
     _begin(storage, partial_run)
-    storage.save_quality(
-        ingestion_run_id=partial_run,
-        quality_status="PASS",
-        report={"quality_status": "PASS"},
+    raw_evidence_id = _raw(storage, partial_run)
+    article = _article(
+        partial_run,
+        raw_evidence_id,
+        article_id="partial-quality-article",
+        canonical_url="https://news.example.test/partial-quality",
+        title="Partial quality article",
     )
+    article["content_sha256"] = "c" * 64
+    storage.save_article(article)
+    _save_quality_and_seal(storage, partial_run, quality_status="PASS")
     with pytest.raises(RuntimeError, match="WARN quality"):
         storage.finalize_run(partial_run, status="PARTIAL")
+    storage.finalize_run(partial_run, status="FAIL")
 
     invalid_quality = "NEWS-20261022-120000-invalid-quality"
     _begin(storage, invalid_quality)
@@ -1216,3 +1321,548 @@ def test_subsecond_timestamps_are_preserved_exactly(storage: NewsStorage):
     assert saved["published_at"] == "2026-10-22T09:00:00.111111Z"
     assert saved["available_at"] == "2026-10-22T10:00:00.654321Z"
     assert saved["fetched_at"] == "2026-10-22T10:00:00.654320Z"
+
+
+def test_direct_sql_cannot_insert_completed_or_bless_empty_run(
+    storage: NewsStorage,
+):
+    with pytest.raises(sqlite3.IntegrityError, match="inserted as RUNNING"):
+        with storage.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO ingestion_runs(
+                    run_id, schema_version, provider_id, provider_mode,
+                    data_kind, started_at, status, summary_json
+                ) VALUES ('direct-pass', '1.0', 'manual', 'manual-csv',
+                          'fixture', ?, 'PASS', '{}')
+                """,
+                (NOW,),
+            )
+
+    run_id = "NEWS-20261022-130000-empty-pass"
+    _begin(storage, run_id)
+    with pytest.raises(ValueError, match="more optimistic"):
+        storage.save_quality(
+            ingestion_run_id=run_id,
+            quality_status="PASS",
+            report=_quality_payload(storage, run_id, quality_status="PASS"),
+        )
+
+    with storage.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO quality_reports(
+                ingestion_run_id, schema_version, quality_status,
+                created_at, report_json
+            ) VALUES (?, '1.0', 'PASS', ?, ?)
+            """,
+            (
+                run_id,
+                NOW,
+                json.dumps(
+                    {
+                        "quality_status": "PASS",
+                        "total_raw_records": 0,
+                        "total_normalized_records": 0,
+                        "duplicate_count": 0,
+                        "provider_error_count": 0,
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE ingestion_runs
+            SET prepared_at = ?, sealed_artifact_inventory_json = '[]',
+                sealed_artifact_inventory_sha256 = ?,
+                sealed_manifest_sha256 = ?, sealed_completion_sha256 = ?
+            WHERE run_id = ?
+            """,
+            (NOW, "1" * 64, "2" * 64, "3" * 64, run_id),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="nonempty"):
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE ingestion_runs SET status = 'PASS' WHERE run_id = ?",
+                (run_id,),
+            )
+    assert storage.get_run(run_id)["status"] == "RUNNING"
+
+
+def test_public_quality_report_requires_every_database_verifiable_v2_count(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-quality-v2-required"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    report = _quality_payload(storage, run_id)
+    report.pop("within_run_duplicate_count")
+
+    with pytest.raises(ValueError, match="within_run_duplicate_count"):
+        storage.save_quality(
+            ingestion_run_id=run_id,
+            quality_status="PASS",
+            report=report,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("within_run_duplicate_count", None),
+        ("new_canonical_article_count", 99),
+        ("missing_body_count", 99),
+        ("deduplication_rule_counts", {"canonical_url": 99}),
+    ),
+)
+def test_direct_sql_cannot_finalize_with_incomplete_or_false_v2_quality(
+    storage: NewsStorage,
+    field: str,
+    replacement: object,
+):
+    run_id = f"NEWS-20261022-130000-direct-quality-{field.replace('_', '-')}"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    report = _quality_payload(storage, run_id)
+    if replacement is None:
+        report.pop(field)
+    else:
+        report[field] = replacement
+
+    with storage.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO quality_reports(
+                ingestion_run_id, schema_version, quality_status,
+                created_at, report_json
+            ) VALUES (?, '2.0', 'PASS', ?, ?)
+            """,
+            (run_id, NOW, json.dumps(report, sort_keys=True)),
+        )
+        connection.execute(
+            """
+            UPDATE ingestion_runs
+            SET prepared_at = ?, sealed_artifact_inventory_json = '[]',
+                sealed_artifact_inventory_sha256 = ?,
+                sealed_manifest_sha256 = ?, sealed_completion_sha256 = ?
+            WHERE run_id = ?
+            """,
+            (NOW, "1" * 64, "2" * 64, "3" * 64, run_id),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="internally consistent"):
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE ingestion_runs SET status = 'PASS' WHERE run_id = ?",
+                (run_id,),
+            )
+    assert storage.get_run(run_id)["status"] == "RUNNING"
+
+
+@pytest.mark.parametrize(
+    ("column_schema_version", "report_schema_version"),
+    (("1.0", "2.0"), ("2.0", "1.0")),
+)
+def test_direct_sql_completion_requires_current_quality_schema_identity(
+    storage: NewsStorage,
+    column_schema_version: str,
+    report_schema_version: str,
+):
+    run_id = "NEWS-20261022-130000-direct-quality-schema"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    report = _quality_payload(storage, run_id)
+    report["schema_version"] = report_schema_version
+
+    with storage.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO quality_reports(
+                ingestion_run_id, schema_version, quality_status,
+                created_at, report_json
+            ) VALUES (?, ?, 'PASS', ?, ?)
+            """,
+            (
+                run_id,
+                column_schema_version,
+                NOW,
+                json.dumps(report, sort_keys=True),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE ingestion_runs
+            SET prepared_at = ?, sealed_artifact_inventory_json = '[]',
+                sealed_artifact_inventory_sha256 = ?,
+                sealed_manifest_sha256 = ?, sealed_completion_sha256 = ?
+            WHERE run_id = ?
+            """,
+            (NOW, "1" * 64, "2" * 64, "3" * 64, run_id),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="internally consistent"):
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE ingestion_runs SET status = 'PASS' WHERE run_id = ?",
+                (run_id,),
+            )
+
+
+def test_direct_sql_partial_rejects_more_occurrences_than_raw_records(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-negative-rejected-count"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    duplicate = _article(
+        run_id,
+        raw_evidence_id,
+        article_id="same-raw-second-occurrence",
+        canonical_url="https://news.example.test/same-raw-second-occurrence",
+    )
+    duplicate.update(
+        {
+            "duplicate_of": "article-1",
+            "deduplication_rule": "canonical_url",
+            "raw_artifact_reference": "raw/same-record-again.json",
+        }
+    )
+    storage.save_article(duplicate)
+    duplicate_occurrence = next(
+        row
+        for row in storage.list_article_ingestions(run_id)
+        if row["candidate_article_id"] == "same-raw-second-occurrence"
+    )
+    storage.save_dedup(
+        ingestion_run_id=run_id,
+        occurrence_id=duplicate_occurrence["occurrence_id"],
+        duplicate_candidate_article_id="same-raw-second-occurrence",
+        canonical_article_id="article-1",
+        deduplication_rule="canonical_url",
+    )
+    report = {
+        "schema_version": "2.0",
+        "quality_status": "WARN",
+        "total_raw_records": 1,
+        "total_normalized_records": 2,
+        "normalized_occurrence_count": 2,
+        "new_canonical_article_count": 1,
+        "matched_existing_canonical_count": 0,
+        "within_run_duplicate_count": 1,
+        "historical_duplicate_count": 0,
+        "represented_canonical_count": 1,
+        "duplicate_relationship_count": 1,
+        "duplicate_count": 1,
+        "deduplication_rule_counts": {
+            "canonical_url": 1,
+            "content_sha256": 0,
+            "title_source_time": 0,
+        },
+        "provider_error_count": 0,
+        "rejected_record_count": -1,
+        "missing_title_count": 0,
+        "missing_publication_time_count": 0,
+        "missing_body_count": 2,
+        "invalid_url_count": 0,
+        "ogdc_linked_article_count": 0,
+    }
+    with storage.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO quality_reports(
+                ingestion_run_id, schema_version, quality_status,
+                created_at, report_json
+            ) VALUES (?, '2.0', 'WARN', ?, ?)
+            """,
+            (run_id, NOW, json.dumps(report, sort_keys=True)),
+        )
+        connection.execute(
+            """
+            UPDATE ingestion_runs
+            SET prepared_at = ?, sealed_artifact_inventory_json = '[]',
+                sealed_artifact_inventory_sha256 = ?,
+                sealed_manifest_sha256 = ?, sealed_completion_sha256 = ?
+            WHERE run_id = ?
+            """,
+            (NOW, "1" * 64, "2" * 64, "3" * 64, run_id),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="internally consistent"):
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE ingestion_runs SET status = 'PARTIAL' WHERE run_id = ?",
+                (run_id,),
+            )
+
+
+def test_duplicate_occurrence_requires_exactly_one_relationship_before_seal(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-bijection"
+    _begin(storage, run_id)
+    canonical_raw = _raw(storage, run_id, raw_record_id="canonical")
+    storage.save_article(_article(run_id, canonical_raw))
+    duplicate_raw = _raw(storage, run_id, raw_record_id="duplicate")
+    duplicate = _article(
+        run_id,
+        duplicate_raw,
+        article_id="duplicate-without-relationship",
+        canonical_url="https://news.example.test/duplicate-without-relationship",
+    )
+    duplicate.update(
+        {
+            "duplicate_of": "article-1",
+            "deduplication_rule": "content_sha256",
+            "raw_artifact_reference": "raw/duplicate.json",
+        }
+    )
+    storage.save_article(duplicate)
+    report = _quality_payload(storage, run_id)
+    storage.save_quality(
+        ingestion_run_id=run_id,
+        quality_status=report["quality_status"],
+        report=report,
+    )
+
+    snapshot = storage.get_run_evidence_snapshot(run_id)
+    assert snapshot["duplicate_occurrence_count"] == 1
+    assert snapshot["duplicate_relationship_count"] == 0
+    assert snapshot["relationship_bijection_valid"] is False
+    with pytest.raises(RuntimeError, match="incomplete duplicate relationships"):
+        _seal(storage, run_id)
+
+
+def test_normalized_articles_cannot_store_duplicate_chains_or_cycles(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-canonical-only"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+
+    with pytest.raises(sqlite3.IntegrityError, match="canonical rows only"):
+        with storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE normalized_articles SET duplicate_of = article_id
+                WHERE article_id = 'article-1'
+                """
+            )
+    assert storage.get_article("article-1")["duplicate_of"] is None
+
+
+def test_seal_binds_inventory_manifest_and_completion_identity(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-sealed"
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    report = _quality_payload(storage, run_id)
+    assert report["deduplication_rule_counts"] == {
+        "canonical_url": 0,
+        "content_sha256": 0,
+        "title_source_time": 0,
+    }
+    storage.save_quality(
+        ingestion_run_id=run_id,
+        quality_status="PASS",
+        report=report,
+    )
+    binding = storage.seal_run(
+        run_id,
+        artifact_inventory=[
+            {"path": "z.json", "sha256": "f" * 64, "size_bytes": 9},
+            {"path": "a.csv", "sha256": "e" * 64, "size_bytes": 3},
+        ],
+        manifest_sha256="d" * 64,
+        completion_marker_sha256="c" * 64,
+        expected_counts=storage.get_run_evidence_snapshot(run_id),
+    )
+
+    assert [item["path"] for item in binding["artifact_inventory"]] == [
+        "a.csv",
+        "z.json",
+    ]
+    assert storage.get_run_finalization_binding(run_id) == binding
+    persisted = storage.get_run(run_id)
+    assert persisted["sealed_manifest_sha256"] == "d" * 64
+    with pytest.raises(sqlite3.IntegrityError, match="seal is immutable"):
+        with storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE ingestion_runs SET sealed_manifest_sha256 = ?
+                WHERE run_id = ?
+                """,
+                ("b" * 64, run_id),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+        _raw(storage, run_id, raw_record_id="late")
+    with pytest.raises(RuntimeError, match="manifest digest"):
+        storage.finalize_run(
+            run_id,
+            status="PASS",
+            expected_manifest_sha256="b" * 64,
+        )
+    storage.finalize_run(
+        run_id,
+        status="PASS",
+        expected_manifest_sha256=binding["manifest_sha256"],
+        expected_inventory_sha256=binding["artifact_inventory_sha256"],
+        expected_completion_sha256=binding["completion_marker_sha256"],
+    )
+
+
+def test_only_one_running_ingestion_can_be_created_concurrently(storage: NewsStorage):
+    barrier = threading.Barrier(3)
+    results: list[tuple[str, str]] = []
+    result_lock = threading.Lock()
+
+    def begin(run_id: str) -> None:
+        barrier.wait()
+        try:
+            _begin(storage, run_id)
+        except Exception as exc:  # the losing writer must fail deterministically
+            result = ("error", str(exc))
+        else:
+            result = ("ok", run_id)
+        with result_lock:
+            results.append(result)
+
+    threads = [
+        threading.Thread(target=begin, args=(f"NEWS-concurrent-{index}",))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert sum(kind == "ok" for kind, _ in results) == 1
+    errors = [message for kind, message in results if kind == "error"]
+    assert len(errors) == 1
+    assert "already active" in errors[0]
+    active_run = next(value for kind, value in results if kind == "ok")
+    storage.discard_running_run(active_run)
+
+
+def test_discard_running_run_removes_partial_evidence_and_allows_retry(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-130000-interrupted"
+    _begin(storage, run_id)
+    canonical_raw = _raw(storage, run_id, raw_record_id="canonical")
+    storage.save_article(_article(run_id, canonical_raw))
+    canonical_occurrence = storage.list_article_ingestions(run_id)[0]
+    storage.save_link(
+        occurrence_id=canonical_occurrence["occurrence_id"],
+        ticker="OGDC",
+        company_name="Oil and Gas Development Company Limited",
+        matched_alias="OGDC",
+        match_method="exact",
+        match_location="title",
+        confidence="exact",
+    )
+    duplicate_raw = _raw(storage, run_id, raw_record_id="duplicate")
+    duplicate = _article(
+        run_id,
+        duplicate_raw,
+        article_id="interrupted-duplicate",
+        canonical_url="https://news.example.test/interrupted-duplicate",
+    )
+    duplicate.update(
+        {
+            "duplicate_of": "article-1",
+            "deduplication_rule": "canonical_url",
+            "raw_artifact_reference": "raw/duplicate.json",
+        }
+    )
+    storage.save_article(duplicate)
+    duplicate_occurrence = next(
+        row
+        for row in storage.list_article_ingestions(run_id)
+        if row["candidate_article_id"] == "interrupted-duplicate"
+    )
+    storage.save_dedup(
+        ingestion_run_id=run_id,
+        occurrence_id=duplicate_occurrence["occurrence_id"],
+        duplicate_candidate_article_id="interrupted-duplicate",
+        canonical_article_id="article-1",
+        deduplication_rule="canonical_url",
+    )
+    storage.save_error(
+        ingestion_run_id=run_id,
+        provider_id="permitted-rss",
+        error_type="interrupted",
+        message="partial evidence",
+    )
+    report = _quality_payload(storage, run_id, quality_status="WARN")
+    storage.save_quality(
+        ingestion_run_id=run_id,
+        quality_status="WARN",
+        report=report,
+    )
+
+    storage.discard_running_run(run_id)
+
+    assert storage.get_run(run_id) is None
+    with storage.connection() as connection:
+        for table in (
+            "raw_source_records",
+            "normalized_articles",
+            "article_ingestions",
+            "article_company_links",
+            "deduplication_relationships",
+            "provider_errors",
+            "quality_reports",
+        ):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+    _begin(storage, run_id)
+    raw_evidence_id = _raw(storage, run_id)
+    storage.save_article(_article(run_id, raw_evidence_id))
+    _save_quality_and_seal(storage, run_id)
+    with pytest.raises(RuntimeError, match="sealed"):
+        storage.discard_running_run(run_id)
+
+
+def test_schema_migration_rolls_back_on_base_exception(tmp_path, monkeypatch):
+    database = tmp_path / "migration-interrupted.sqlite3"
+    _create_versioned_database(database, 3)
+    original_verify = storage_module._verify_schema
+
+    def interrupt_v4(connection, version):
+        if version == 4:
+            raise KeyboardInterrupt
+        return original_verify(connection, version)
+
+    monkeypatch.setattr(storage_module, "_verify_schema", interrupt_v4)
+    with pytest.raises(KeyboardInterrupt):
+        NewsStorage(database).initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ingestion_runs)")
+        }
+        migrations = connection.execute(
+            "SELECT count(*) FROM schema_migrations"
+        ).fetchone()[0]
+    assert "sealed_manifest_sha256" not in columns
+    assert migrations == 3
+
+
+def test_initialize_rejects_tampered_current_schema(tmp_path):
+    database = tmp_path / "tampered-v4.sqlite3"
+    storage = NewsStorage(database).initialize()
+    with storage.connection() as connection:
+        connection.execute("DROP TRIGGER trg_ingestion_runs_insert_running")
+
+    with pytest.raises(RuntimeError, match="schema verification failed"):
+        storage.initialize()

@@ -143,6 +143,7 @@ evidence:
 python scripts/run_news_pipeline.py \
   --provider rss \
   --config configs/news/ogdc_sources.example.json \
+  --storage-root . \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 ```
@@ -154,14 +155,31 @@ A permitted local dataset can instead be imported and is always labelled
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /absolute/path/to/news.csv \
+  --storage-root . \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 ```
 
 After valid argument parsing, the command prints one structured summary and
 creates a collision-refusing `artifacts/news_ingestion/<run_id>/` evidence
-pack. Generated news databases, raw responses, and run outputs are ignored by
-Git. See the
+pack. Paths must remain under `--storage-root` unless external storage is
+explicitly allowed. `PARTIAL` returns non-zero unless `--allow-partial` is
+given. Completed consumers require the SQLite seal and the final
+`completion.json`; an artifact manifest alone is not proof of completion.
+Generated news databases, raw responses, and run outputs are ignored by Git.
+
+Verify a retained pack offline with:
+
+```bash
+python scripts/verify_news_run.py \
+  --run-dir artifacts/news_ingestion/<run_id> \
+  --database data/news/paisa_news.sqlite3
+```
+
+Omit `--database` only for artifact-only offline replay; that mode verifies the
+retained evidence but is not authoritative proof of committed completion.
+
+See the
 [news runbook](docs/NEWS_INGESTION.md),
 [record contract](docs/NEWS_DATA_CONTRACT.md), and
 [time-alignment contract](docs/NEWS_TIME_ALIGNMENT.md).

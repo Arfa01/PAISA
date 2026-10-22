@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 
@@ -18,6 +19,19 @@ from paisa.news.providers.rss import (
 NOW = datetime(2026, 10, 22, 9, 30, tzinfo=timezone.utc)
 
 
+class FakeRawStream:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.bytes_yielded = 0
+
+    def stream(self, chunk_size, *, decode_content):
+        assert decode_content is False
+        for start in range(0, len(self.content), min(chunk_size, 7)):
+            chunk = self.content[start : start + min(chunk_size, 7)]
+            self.bytes_yielded += len(chunk)
+            yield chunk
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -26,11 +40,26 @@ class FakeResponse:
         status_code: int = 200,
         content_type: str = "application/rss+xml; charset=utf-8",
         url: str = "https://publisher.example/feed.xml",
+        content_encoding: str | None = None,
+        peer_ip: str = "93.184.216.34",
+        stream_wire_bytes: bool = False,
     ) -> None:
-        self.content = content
+        self._content = content
+        self.raw = FakeRawStream(content) if stream_wire_bytes else None
         self.status_code = status_code
         self.headers = {"Content-Type": content_type}
+        if content_encoding is not None:
+            self.headers["Content-Encoding"] = content_encoding
         self.url = url
+        self.peer_ip = peer_ip
+        self.closed = False
+
+    @property
+    def content(self):
+        return self._content
+
+    def close(self):
+        self.closed = True
 
 
 class FakeSession:
@@ -44,6 +73,28 @@ class FakeSession:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+    @staticmethod
+    def resolve_addresses(host, port):
+        return ("93.184.216.34",)
+
+    @staticmethod
+    def peer_address(response):
+        return response.peer_ip
+
+
+def _serialized_provider_result(result):
+    return json.dumps(
+        {
+            "configured_sources": result.configured_sources,
+            "records": [record.metadata_dict() for record in result.records],
+            "captures": [capture.metadata_dict() for capture in result.captures],
+            "errors": [error.to_dict() for error in result.errors],
+            "warnings": result.warnings,
+        },
+        default=str,
+        sort_keys=True,
+    )
 
 
 def test_rss_provider_captures_exact_response_and_extracts_without_scraping():
@@ -94,12 +145,220 @@ def test_rss_provider_captures_exact_response_and_extracts_without_scraping():
     [
         "https://alice:secret@publisher.example/feed.xml",
         "https://publisher.example/feed.xml?api_key=secret",
+        "https://publisher.example/feed.xml?key=secret",
+        "https://publisher.example/feed.xml?signature=secret",
         "https://publisher.example:bad/feed.xml",
     ],
 )
 def test_rss_source_rejects_credential_bearing_or_invalid_urls(url: str):
     with pytest.raises(ValueError):
         RssSourceConfig("unsafe", "Unsafe", url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/feed",
+        "http://[::1]/feed",
+        "http://10.0.0.5/feed",
+        "http://169.254.169.254/latest/meta-data",
+    ],
+)
+def test_rss_source_rejects_non_public_literal_destinations_by_default(url: str):
+    with pytest.raises(ValueError, match="public"):
+        RssSourceConfig("private", "Private", url)
+
+
+def test_rss_source_persists_only_query_redacted_identity_and_digest():
+    source = RssSourceConfig(
+        "publisher",
+        "Publisher",
+        "https://publisher.example/feed.xml?edition=pk&opaque=do-not-retain",
+    )
+
+    serialized = json.dumps(source.to_dict(), sort_keys=True)
+
+    assert "edition=pk" not in serialized
+    assert "do-not-retain" not in serialized
+    assert "REDACTED" in serialized
+    assert source.to_dict()["url_sha256"] == hashlib.sha256(
+        source.url.encode("utf-8")
+    ).hexdigest()
+
+
+def test_rss_provider_rejects_private_dns_results_before_request():
+    session = FakeSession([])
+    provider = RssNewsProvider(
+        [RssSourceConfig("internal", "Internal", "https://publisher.example/feed")],
+        session=session,
+        resolver=lambda _host, _port: ("10.0.0.5",),
+        clock=lambda: NOW,
+    )
+
+    result = provider.fetch()
+
+    assert session.calls == []
+    assert result.errors[0].error_type == "unsafe_destination"
+
+
+def test_rss_provider_rejects_mixed_public_and_private_dns_results():
+    session = FakeSession([])
+    provider = RssNewsProvider(
+        [RssSourceConfig("mixed", "Mixed", "https://publisher.example/feed")],
+        session=session,
+        resolver=lambda _host, _port: ("93.184.216.34", "169.254.169.254"),
+        clock=lambda: NOW,
+    )
+
+    result = provider.fetch()
+
+    assert session.calls == []
+    assert result.errors[0].error_type == "unsafe_destination"
+
+
+def test_rss_provider_rejects_connected_peer_outside_validated_dns_set():
+    response = FakeResponse(
+        b"<rss><channel/></rss>",
+        peer_ip="93.184.216.35",
+    )
+    provider = RssNewsProvider(
+        [RssSourceConfig("rebound", "Rebound", "https://publisher.example/feed")],
+        session=FakeSession([response]),
+        resolver=lambda _host, _port: ("93.184.216.34",),
+        peer_address_getter=lambda value: value.peer_ip,
+        clock=lambda: NOW,
+    )
+
+    result = provider.fetch()
+
+    assert result.captures == ()
+    assert result.errors[0].error_type == "unsafe_destination"
+    assert response.closed is True
+
+
+def test_rss_private_destination_requires_explicit_opt_in():
+    response = FakeResponse(b"<rss><channel/></rss>", peer_ip="10.0.0.5")
+    provider = RssNewsProvider(
+        [
+            RssSourceConfig(
+                "reviewed-private",
+                "Reviewed Private",
+                "http://10.0.0.5/feed",
+                allow_private_network=True,
+            )
+        ],
+        session=FakeSession([response]),
+        resolver=lambda _host, _port: ("10.0.0.5",),
+        peer_address_getter=lambda value: value.peer_ip,
+        clock=lambda: NOW,
+    )
+
+    result = provider.fetch()
+
+    assert result.errors == ()
+    assert result.captures[0].configured_source == "http://10.0.0.5/feed"
+
+
+def test_rss_provider_disables_implicit_environment_authentication(monkeypatch):
+    import paisa.news.providers.rss as rss_module
+
+    session = rss_module.requests.Session()
+    session.trust_env = True
+    session.cookies.set("credential", "must-not-be-sent")
+    monkeypatch.setattr(rss_module.requests, "Session", lambda: session)
+
+    RssNewsProvider(
+        [RssSourceConfig("public", "Public", "https://publisher.example/feed")]
+    )
+
+    assert session.trust_env is False
+    assert len(session.cookies) == 0
+
+
+def test_pinned_adapter_preserves_hostname_but_replaces_socket_dns_host(monkeypatch):
+    import paisa.news.providers.rss as rss_module
+
+    socket_targets = []
+
+    class FakeConnection:
+        def __init__(self, *, host, **_kwargs):
+            self.host = host
+            self._dns_host = host
+
+        def _new_conn(self):
+            socket_targets.append(self._dns_host)
+            return object()
+
+    class FakePool:
+        ConnectionCls = FakeConnection
+
+    pool = FakePool()
+    monkeypatch.setattr(
+        rss_module.HTTPAdapter,
+        "get_connection_with_tls_context",
+        lambda self, request, verify, proxies, cert: pool,
+    )
+    request = rss_module.requests.Request(
+        "GET", "https://publisher.example/feed"
+    ).prepare()
+    adapter = rss_module._PinnedAddressAdapter("93.184.216.34")
+
+    pinned_pool = adapter.get_connection_with_tls_context(
+        request,
+        True,
+        proxies={"https": "http://127.0.0.1:9999"},
+    )
+    connection = pinned_pool.ConnectionCls(host="publisher.example")
+
+    assert connection.host == "publisher.example"
+    connection._new_conn()
+    assert socket_targets == ["93.184.216.34"]
+    assert connection._dns_host == "publisher.example"
+    assert connection.host == "publisher.example"
+    assert request.url == "https://publisher.example/feed"
+
+
+def test_owned_rss_client_mounts_validated_address_without_second_resolution(
+    monkeypatch,
+):
+    import paisa.news.providers.rss as rss_module
+
+    class OwnedFakeSession(FakeSession):
+        def __init__(self, outcomes):
+            super().__init__(outcomes)
+            self.trust_env = True
+            self.auth = None
+            self.headers = {}
+            self.cookies = rss_module.requests.cookies.RequestsCookieJar()
+            self.mounted = {}
+
+        def mount(self, prefix, adapter):
+            self.mounted[prefix] = adapter
+
+    response = FakeResponse(b"<rss><channel/></rss>")
+    owned_session = OwnedFakeSession([response])
+    monkeypatch.setattr(rss_module.requests, "Session", lambda: owned_session)
+    resolutions = []
+
+    def resolver(_host, _port):
+        resolutions.append(True)
+        if len(resolutions) == 1:
+            return ("93.184.216.34",)
+        return ("169.254.169.254",)
+
+    provider = RssNewsProvider(
+        [RssSourceConfig("pinned", "Pinned", "https://publisher.example/feed")],
+        resolver=resolver,
+        peer_address_getter=lambda value: value.peer_ip,
+        clock=lambda: NOW,
+    )
+    result = provider.fetch()
+
+    assert result.errors == ()
+    assert len(resolutions) == 1
+    assert owned_session.mounted["https://"].pinned_address == "93.184.216.34"
+    assert owned_session.calls[0][1]["proxies"] == {}
+    assert owned_session.calls[0][1]["allow_redirects"] is False
 
 
 def test_rss_acquisition_time_is_observed_after_response_bytes_arrive():
@@ -119,6 +378,147 @@ def test_rss_acquisition_time_is_observed_after_response_bytes_arrive():
     assert result.fetched_at == NOW
     assert result.captures[0].fetched_at == NOW
     assert result.records[0].fetched_at == NOW
+
+
+def test_rss_provider_rejects_dtd_and_entity_expansion():
+    payload = b"""<?xml version="1.0"?>
+    <!DOCTYPE rss [<!ENTITY secret "expanded">]>
+    <rss><channel><item><title>&secret;</title></item></channel></rss>"""
+    result = RssNewsProvider(
+        [RssSourceConfig("unsafe-xml", "Unsafe XML", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(payload)]),
+        clock=lambda: NOW,
+    ).fetch()
+
+    assert result.records == ()
+    assert result.errors[0].error_type == "unsafe_xml"
+    assert "expanded" not in result.errors[0].message
+
+
+def test_rss_provider_rejects_dtd_without_entity_declarations():
+    payload = b"<!DOCTYPE rss><rss><channel/></rss>"
+    result = RssNewsProvider(
+        [RssSourceConfig("unsafe-dtd", "Unsafe DTD", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(payload)]),
+        clock=lambda: NOW,
+    ).fetch()
+
+    assert result.records == ()
+    assert result.errors[0].error_type == "unsafe_xml"
+
+
+def test_rss_provider_enforces_compressed_and_decoded_response_limits():
+    payload = b"<rss><channel><item><title>OGDC</title></item></channel></rss>"
+    too_large = RssNewsProvider(
+        [RssSourceConfig("large", "Large", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(payload)]),
+        max_compressed_bytes=16,
+        clock=lambda: NOW,
+    ).fetch()
+    assert too_large.captures == ()
+    assert too_large.errors[0].error_type == "response_limit_exceeded"
+
+    compressed = gzip.compress(payload)
+    expanded = RssNewsProvider(
+        [RssSourceConfig("compressed", "Compressed", "https://example.test/feed")],
+        session=FakeSession(
+            [FakeResponse(compressed, content_encoding="gzip")]
+        ),
+        max_decoded_bytes=32,
+        clock=lambda: NOW,
+    ).fetch()
+    assert expanded.captures == ()
+    assert expanded.errors[0].error_type == "response_limit_exceeded"
+
+
+def test_rss_provider_streams_wire_bytes_and_stops_at_compressed_limit():
+    response = FakeResponse(b"x" * 100, stream_wire_bytes=True)
+    result = RssNewsProvider(
+        [RssSourceConfig("stream", "Stream", "https://example.test/feed")],
+        session=FakeSession([response]),
+        max_compressed_bytes=20,
+        clock=lambda: NOW,
+    ).fetch()
+
+    assert result.errors[0].error_type == "response_limit_exceeded"
+    assert response.raw.bytes_yielded < 100
+
+
+def test_rss_provider_enforces_entry_depth_field_and_total_time_limits():
+    two_entries = (
+        b"<rss><channel><item><title>one</title></item>"
+        b"<item><title>two</title></item></channel></rss>"
+    )
+    entries_result = RssNewsProvider(
+        [RssSourceConfig("entries", "Entries", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(two_entries)]),
+        max_entries=1,
+        clock=lambda: NOW,
+    ).fetch()
+    assert entries_result.errors[0].error_type == "feed_limit_exceeded"
+
+    deep_xml = b"<rss><channel><wrapper><item><title>x</title></item></wrapper></channel></rss>"
+    depth_result = RssNewsProvider(
+        [RssSourceConfig("depth", "Depth", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(deep_xml)]),
+        max_xml_depth=3,
+        clock=lambda: NOW,
+    ).fetch()
+    assert depth_result.errors[0].error_type == "feed_limit_exceeded"
+
+    long_field = b"<rss><channel><item><title>long-title</title></item></channel></rss>"
+    field_result = RssNewsProvider(
+        [RssSourceConfig("field", "Field", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(long_field)]),
+        max_field_characters=4,
+        clock=lambda: NOW,
+    ).fetch()
+    assert field_result.errors[0].error_type == "feed_limit_exceeded"
+
+    ticks = iter((0.0, 2.0, 2.0, 2.0))
+    time_result = RssNewsProvider(
+        [RssSourceConfig("slow", "Slow", "https://example.test/feed")],
+        session=FakeSession([FakeResponse(b"<rss><channel/></rss>")]),
+        total_timeout_seconds=1.0,
+        monotonic_clock=lambda: next(ticks),
+        clock=lambda: NOW,
+    ).fetch()
+    assert time_result.errors[0].error_type == "total_timeout"
+
+
+def test_rss_provider_redacts_query_values_and_exception_secrets():
+    source = RssSourceConfig(
+        "redacted",
+        "Redacted",
+        "https://publisher.example/feed?edition=private-value",
+    )
+    result = RssNewsProvider(
+        [source],
+        session=FakeSession([RuntimeError("failed with private-value")]),
+        clock=lambda: NOW,
+    ).fetch()
+
+    serialized = _serialized_provider_result(result)
+    assert "private-value" not in serialized
+    assert "REDACTED" in serialized
+
+
+def test_rss_provider_redacts_article_query_values_from_structured_metadata():
+    payload = b"""<rss><channel><item>
+      <guid>https://publisher.example/id?opaque=guid-secret</guid>
+      <title>OGDC update</title>
+      <link>https://publisher.example/story?edition=link-secret</link>
+    </item></channel></rss>"""
+    result = RssNewsProvider(
+        [RssSourceConfig("links", "Links", "https://publisher.example/feed")],
+        session=FakeSession([FakeResponse(payload)]),
+        clock=lambda: NOW,
+    ).fetch()
+
+    serialized = _serialized_provider_result(result)
+    assert "guid-secret" not in serialized
+    assert "link-secret" not in serialized
+    assert serialized.count("REDACTED") >= 2
 
 
 def test_atom_provider_preserves_updated_as_availability_not_publication():
@@ -291,6 +691,17 @@ def test_manual_csv_parse_error_keeps_raw_evidence(tmp_path):
     assert result.errors[0].error_type == "csv_parse_error"
     assert result.captures[0].content == path.read_bytes()
     assert result.captures[0].data_class == "imported"
+
+
+def test_manual_csv_provider_never_persists_absolute_input_path(tmp_path):
+    path = tmp_path / "private-input.csv"
+    path.write_text("title\nOGDC update\n", encoding="utf-8")
+
+    result = ManualCsvNewsProvider(path, clock=lambda: NOW).fetch()
+    serialized = _serialized_provider_result(result)
+
+    assert str(tmp_path) not in serialized
+    assert "manual-csv:private-input.csv" in serialized
 
 
 def test_fixture_provider_is_deterministic_and_unambiguously_marked_fixture():

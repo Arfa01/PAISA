@@ -59,6 +59,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Local SQLite news database path.",
     )
     parser.add_argument(
+        "--storage-root",
+        default=".",
+        help=(
+            "Trusted root containing artifact and database paths. Paths outside "
+            "this root are rejected unless explicitly allowed."
+        ),
+    )
+    parser.add_argument(
+        "--allow-external-storage",
+        action="store_true",
+        help=(
+            "Explicitly permit artifact/database paths outside --storage-root. "
+            "Persisted summaries still use non-host-identifying logical labels."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Return exit status 0 for a retained PARTIAL run; default is non-zero.",
+    )
+    parser.add_argument(
         "--run-id",
         help="Optional unique NEWS-prefixed run ID; existing destinations are rejected.",
     )
@@ -109,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
             provider,
             output_dir=args.output_dir,
             database_path=args.database,
+            storage_root=args.storage_root,
+            allow_external_storage=args.allow_external_storage,
             run_id=selected_run_id,
         )
     except Exception as exc:
@@ -130,7 +153,11 @@ def main(argv: list[str] | None = None) -> int:
 
     payload = summary.to_dict()
     _print_json(payload)
-    return 0 if summary.run_status in {"PASS", "PARTIAL"} else 1
+    if summary.run_status == "PASS":
+        return 0
+    if summary.run_status == "PARTIAL" and args.allow_partial:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

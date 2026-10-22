@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -89,16 +90,19 @@ def test_quality_report_calculates_all_metrics_deterministically() -> None:
     assert calculate_quality_report is calculate_quality
     articles = [
         _article(),
-        _article(
-            "article-2",
-            title=" ",
-            body=None,
-            published_at=None,
-            available_at=datetime(2026, 1, 3, 9, tzinfo=UTC),
-            source_url="not a URL",
-            canonical_url=None,
-            language=None,
-            provider="rss",
+        replace(
+            _article(
+                "article-2",
+                title=" ",
+                body=None,
+                published_at=None,
+                available_at=datetime(2026, 1, 3, 9, tzinfo=UTC),
+                source_url="not a URL",
+                canonical_url=None,
+                language=None,
+                provider="rss",
+            ),
+            duplicate_of="article-1",
         ),
     ]
     duplicates = [
@@ -106,6 +110,8 @@ def test_quality_report_calculates_all_metrics_deterministically() -> None:
             article_id="article-2",
             canonical_article_id="article-1",
             rule="content_sha256",
+            duplicate_scope="within_run",
+            canonical_owner_run_id="NEWS-20260102-090000-abc123",
         )
     ]
     errors = [
@@ -132,11 +138,23 @@ def test_quality_report_calculates_all_metrics_deterministically() -> None:
         provider_errors=errors,
     )
 
-    assert report["schema_version"] == "1.0"
+    assert report["schema_version"] == "2.0"
     assert report["quality_status"] == report["minimum_quality_status"] == "WARN"
     assert report["total_raw_records"] == 2
     assert report["total_normalized_records"] == 2
     assert report["duplicate_count"] == 1
+    assert report["duplicate_relationship_count"] == 1
+    assert report["normalized_occurrence_count"] == 2
+    assert report["new_canonical_article_count"] == 1
+    assert report["matched_existing_canonical_count"] == 0
+    assert report["within_run_duplicate_count"] == 1
+    assert report["historical_duplicate_count"] == 0
+    assert report["represented_canonical_count"] == 1
+    assert report["deduplication_rule_counts"] == {
+        "canonical_url": 0,
+        "content_sha256": 1,
+        "title_source_time": 0,
+    }
     assert report["missing_title_count"] == 1
     assert report["missing_publication_time_count"] == 1
     assert report["missing_body_count"] == 1
@@ -156,6 +174,52 @@ def test_quality_report_calculates_all_metrics_deterministically() -> None:
     assert report["provider_error_counts"] == {"rss": 1}
     assert list(report["language_counts"]) == ["en", "unknown"]
     assert json.loads(json.dumps(report)) == report
+
+
+def test_quality_report_distinguishes_within_run_and_historical_duplicates() -> None:
+    run_id = "NEWS-20260102-090000-abc123"
+    canonical = _article("article-1")
+    within_run = replace(_article("article-2"), duplicate_of="article-1")
+    historical = replace(_article("article-3"), duplicate_of="historical-1")
+    relationships = [
+        DuplicateRelationship(
+            article_id=within_run.article_id,
+            canonical_article_id="article-1",
+            rule="canonical_url",
+            duplicate_scope="within_run",
+            canonical_owner_run_id=run_id,
+        ),
+        DuplicateRelationship(
+            article_id=historical.article_id,
+            canonical_article_id="historical-1",
+            rule="title_source_time",
+            duplicate_scope="historical",
+            canonical_owner_run_id="NEWS-20260101-090000-owner001",
+        ),
+    ]
+
+    report = calculate_quality(
+        raw_records=[_raw("raw-1"), _raw("raw-2"), _raw("raw-3")],
+        normalized_articles=[canonical, within_run, historical],
+        duplicate_relationships=relationships,
+        entity_links=[],
+        rejected_records=[],
+        provider_errors=[],
+    )
+
+    assert report["normalized_occurrence_count"] == 3
+    assert report["new_canonical_article_count"] == 1
+    assert report["matched_existing_canonical_count"] == 1
+    assert report["within_run_duplicate_count"] == 1
+    assert report["historical_duplicate_count"] == 1
+    assert report["represented_canonical_count"] == 2
+    assert report["duplicate_relationship_count"] == 2
+    assert report["duplicate_count"] == 2
+    assert report["deduplication_rule_counts"] == {
+        "canonical_url": 1,
+        "content_sha256": 0,
+        "title_source_time": 1,
+    }
 
 
 @pytest.mark.parametrize("raw_count,article_count", [(0, 1), (1, 0), (0, 0)])

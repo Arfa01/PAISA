@@ -25,7 +25,12 @@ from paisa.news.models import (
 from paisa.news.normalization import canonicalize_url
 
 
-QUALITY_REPORT_SCHEMA_VERSION = "1.0"
+QUALITY_REPORT_SCHEMA_VERSION = "2.0"
+_DEDUPLICATION_RULES = (
+    "canonical_url",
+    "content_sha256",
+    "title_source_time",
+)
 
 QUALITY_CRITERIA = {
     "FAIL": [
@@ -149,6 +154,71 @@ def calculate_quality(
     errors = list(provider_errors)
     rejected_details = _rejected_record_details(list(rejected_records))
 
+    article_by_id = {article.article_id: article for article in articles}
+    if len(article_by_id) != len(articles):
+        raise ValueError("Normalized article IDs must be unique within a quality report.")
+    duplicate_article_ids = {
+        article.article_id for article in articles if article.duplicate_of is not None
+    }
+    relationship_by_article = {item.article_id: item for item in duplicates}
+    if len(relationship_by_article) != len(duplicates):
+        raise ValueError("Duplicate relationships must contain unique article IDs.")
+    if set(relationship_by_article) != duplicate_article_ids:
+        raise ValueError(
+            "Every duplicate occurrence must have exactly one matching relationship."
+        )
+
+    within_run_duplicate_count = 0
+    historical_duplicate_count = 0
+    deduplication_rule_counts = {rule: 0 for rule in _DEDUPLICATION_RULES}
+    for relationship in duplicates:
+        occurrence = article_by_id[relationship.article_id]
+        if occurrence.duplicate_of != relationship.canonical_article_id:
+            raise ValueError(
+                "Duplicate relationship target does not match its normalized occurrence."
+            )
+        if relationship.rule not in deduplication_rule_counts:
+            raise ValueError(f"Unsupported deduplication rule: {relationship.rule}")
+        deduplication_rule_counts[relationship.rule] += 1
+
+        local_canonical = article_by_id.get(relationship.canonical_article_id)
+        inferred_scope = (
+            "within_run"
+            if local_canonical is not None
+            and local_canonical.duplicate_of is None
+            and local_canonical.ingestion_run_id == occurrence.ingestion_run_id
+            else "historical"
+        )
+        scope = relationship.duplicate_scope or inferred_scope
+        if scope != inferred_scope:
+            raise ValueError(
+                "Duplicate scope contradicts the canonical ownership represented by "
+                "the run."
+            )
+        if relationship.canonical_owner_run_id is not None:
+            if scope == "within_run":
+                expected_owner = occurrence.ingestion_run_id
+                if relationship.canonical_owner_run_id != expected_owner:
+                    raise ValueError(
+                        "Within-run duplicate owner must be the current ingestion run."
+                    )
+            elif relationship.canonical_owner_run_id == occurrence.ingestion_run_id:
+                raise ValueError(
+                    "Historical duplicate owner cannot be the current ingestion run."
+                )
+        if scope == "within_run":
+            within_run_duplicate_count += 1
+        else:
+            historical_duplicate_count += 1
+
+    normalized_occurrence_count = len(articles)
+    new_canonical_article_count = sum(
+        article.duplicate_of is None for article in articles
+    )
+    represented_canonical_count = len(
+        {article.duplicate_of or article.article_id for article in articles}
+    )
+
     missing_title_count = sum(_missing_text(article.title) for article in articles)
     missing_publication_time_count = sum(article.published_at is None for article in articles)
     missing_body_count = sum(_missing_text(article.body) for article in articles)
@@ -199,7 +269,15 @@ def calculate_quality(
         "quality_criteria": QUALITY_CRITERIA,
         "total_raw_records": len(raw),
         "total_normalized_records": len(articles),
+        "normalized_occurrence_count": normalized_occurrence_count,
+        "new_canonical_article_count": new_canonical_article_count,
+        "matched_existing_canonical_count": historical_duplicate_count,
+        "within_run_duplicate_count": within_run_duplicate_count,
+        "historical_duplicate_count": historical_duplicate_count,
+        "represented_canonical_count": represented_canonical_count,
+        "duplicate_relationship_count": len(duplicates),
         "duplicate_count": len(duplicates),
+        "deduplication_rule_counts": deduplication_rule_counts,
         "missing_title_count": missing_title_count,
         "missing_publication_time_count": missing_publication_time_count,
         "missing_body_count": missing_body_count,

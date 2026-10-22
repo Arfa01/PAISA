@@ -216,6 +216,63 @@ def test_content_hash_uses_normalized_text_and_is_deterministic():
     assert len(first) == 64
 
 
+def test_title_only_hash_is_scoped_by_source_and_publication_context():
+    first = normalize_record(
+        raw_record(
+            configured_source="https://publisher-one.example/feed",
+            source_name="Publisher One",
+            title="Market update",
+            summary=None,
+            body=None,
+            published_at_raw="2025-01-02T08:00:00Z",
+        ),
+        ingestion_run_id="NEWS-20261022-120000-sparse0001",
+        raw_artifact_reference="raw/one.json",
+    )
+    second = normalize_record(
+        raw_record(
+            raw_record_id="rss-source-002",
+            configured_source="https://publisher-two.example/feed",
+            source_name="Publisher Two",
+            title="Market update",
+            summary=None,
+            body=None,
+            published_at_raw="2026-01-02T08:00:00Z",
+        ),
+        ingestion_run_id="NEWS-20261022-120000-sparse0001",
+        raw_artifact_reference="raw/two.json",
+    )
+
+    assert first.content_sha256 != second.content_sha256
+    assert "content_hash_scoped_to_source_context" in first.normalization_warnings
+    assert "content_hash_scoped_to_source_context" in second.normalization_warnings
+
+
+def test_title_only_hash_is_stable_for_the_same_source_and_publication_context():
+    first = normalize_record(
+        raw_record(title="Market update", summary=None, body=None),
+        ingestion_run_id="NEWS-20261022-120000-sparse0002",
+        raw_artifact_reference="raw/one.json",
+    )
+    second = normalize_record(
+        raw_record(
+            raw_record_id="rss-source-002",
+            title="  Market   update ",
+            summary=None,
+            body=None,
+        ),
+        ingestion_run_id="NEWS-20261022-120000-sparse0002",
+        raw_artifact_reference="raw/two.json",
+    )
+
+    assert first.content_sha256 == second.content_sha256
+
+
+def test_title_only_hash_rejects_missing_scope_context():
+    with pytest.raises(ValueError, match="stable source"):
+        content_sha256(title="Market update", summary=None, body=None)
+
+
 def test_same_captured_record_normalizes_deterministically():
     kwargs = {
         "ingestion_run_id": "NEWS-20261022-120000-abcd1234",

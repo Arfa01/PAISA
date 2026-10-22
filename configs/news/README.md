@@ -10,7 +10,12 @@ Copy `ogdc_sources.example.json` to an untracked local configuration when you
 need to change sources. The top-level fields are:
 
 - `schema_version`: optional, defaults to `1.0`, and must be `1.0` when set;
-- `timeout_seconds`: optional positive HTTP timeout, default `30` seconds;
+- `timeout_seconds`: compatibility default for finite request/total timeouts;
+- `connect_timeout_seconds`, `read_timeout_seconds`, and
+  `total_timeout_seconds`: optional positive deadline controls;
+- `max_compressed_bytes`, `max_decoded_bytes`, `max_entries`,
+  `max_xml_depth`, `max_xml_elements`, and `max_field_characters`: optional
+  positive resource bounds with the reviewed defaults shown in the example;
 - `user_agent`: optional non-empty, single-line HTTP user agent; the adapter's
   PAISA research identifier is used when it is omitted; and
 - `sources`: a non-empty array containing at least one enabled source.
@@ -27,11 +32,16 @@ Each source supports:
   applied only to a timezone-naive clock value; and
 - `source_type`: optional `rss` or `atom` hint. PAISA detects the actual format
   from the response and records a warning if it differs from the hint.
+- `allow_private_network`: optional boolean, default `false`. Set it only for a
+  specifically reviewed internal feed; public-only DNS and connected-peer
+  validation is the normal security boundary.
 
 PAISA does not turn a date-only value into an invented time. Relative article
-links in a feed are resolved against the configured feed URL, while their raw
-values remain in the record evidence. HTTP redirects are rejected so a
-configured endpoint cannot silently move acquisition to another URL.
+links in a feed are resolved against the configured feed URL. Persisted URL
+identities redact every query value, and credential-like query keys are
+rejected. DTD/entities and oversized or over-complex XML are rejected. HTTP
+redirects are rejected so a configured endpoint cannot silently move
+acquisition to another URL.
 
 Only configure feeds whose publisher permits automated feed access. The
 committed example uses Dawn's publisher-provided business feed and records only
@@ -43,6 +53,7 @@ because permissions and endpoints can change.
 python scripts/run_news_pipeline.py \
   --provider rss \
   --config configs/news/ogdc_sources.example.json \
+  --storage-root . \
   --output-dir artifacts/news_ingestion
 ```
 
@@ -59,6 +70,7 @@ precedence over both defaults.
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /permitted/path/news.csv \
+  --storage-root . \
   --output-dir artifacts/news_ingestion
 ```
 

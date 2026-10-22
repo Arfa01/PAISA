@@ -15,6 +15,7 @@ from paisa.news.models import (
     NEWS_SCHEMA_VERSION,
     NormalizedNewsArticle,
     RawNewsRecord,
+    utc_iso,
 )
 
 
@@ -216,13 +217,40 @@ def canonicalize_url(value: str | None) -> str | None:
 
 
 def content_sha256(
-    *, title: str | None, summary: str | None, body: str | None
+    *,
+    title: str | None,
+    summary: str | None,
+    body: str | None,
+    source_identity: str | None = None,
+    publication_context: str | None = None,
+    record_identity: str | None = None,
 ) -> str:
+    normalized_title = normalize_text(title) or ""
+    normalized_summary = normalize_text(summary) or ""
+    normalized_body = normalize_text(body) or ""
     payload = {
-        "body": normalize_text(body) or "",
-        "summary": normalize_text(summary) or "",
-        "title": normalize_text(title) or "",
+        "body": normalized_body,
+        "summary": normalized_summary,
+        "title": normalized_title,
     }
+    if not normalized_summary and not normalized_body:
+        stable_source = unicodedata.normalize(
+            "NFKC", str(source_identity or "")
+        ).strip()
+        stable_context = unicodedata.normalize(
+            "NFKC", str(publication_context or record_identity or "")
+        ).strip()
+        if not stable_source or not stable_context:
+            raise ValueError(
+                "Title-only content hashes require stable source and publication "
+                "or record context."
+            )
+        payload["sparse_scope"] = {
+            "context": stable_context,
+            "source_identity_sha256": hashlib.sha256(
+                stable_source.encode("utf-8")
+            ).hexdigest(),
+        }
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -286,6 +314,8 @@ def normalize_record(
         warnings.append("title_missing")
     if body is None:
         warnings.append("body_missing")
+    if title is not None and summary is None and body is None:
+        warnings.append("content_hash_scoped_to_source_context")
 
     language = normalize_text(record.language)
     if language is not None:
@@ -311,7 +341,16 @@ def normalize_record(
         mentioned_tickers=(),
         mentioned_companies=(),
         mentioned_sectors=(),
-        content_sha256=content_sha256(title=title, summary=summary, body=body),
+        content_sha256=content_sha256(
+            title=title,
+            summary=summary,
+            body=body,
+            source_identity="\0".join(
+                (record.provider_id.strip(), record.configured_source.strip())
+            ),
+            publication_context=utc_iso(published_at),
+            record_identity=record.provider_record_id or record.raw_record_id,
+        ),
         duplicate_of=None,
         ingestion_run_id=ingestion_run_id,
         raw_artifact_reference=raw_artifact_reference,

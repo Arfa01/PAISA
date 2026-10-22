@@ -12,7 +12,7 @@ retained in ``article_ingestions`` and remains connected to its raw evidence.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
@@ -24,8 +24,9 @@ import sqlite3
 from typing import Any
 
 
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 4
 NEWS_RECORD_SCHEMA_VERSION = "1.0"
+QUALITY_REPORT_SCHEMA_VERSION = "2.0"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SUPPORTED_DEDUPLICATION_RULES = frozenset(
@@ -494,11 +495,9 @@ END;
 """
 
 
-# These triggers are deliberately refreshed on every initialization. Schema v3 was
-# not released before this integrity tightening, and CREATE TRIGGER IF NOT EXISTS
-# would otherwise leave an already-created v3 database with the earlier definitions.
+# Schema v3 adds cross-table deduplication invariants.  It is installed exactly
+# once by the migration runner and verified on every later open.
 _DEDUPLICATION_INTEGRITY_SQL = """
-BEGIN IMMEDIATE;
 DROP TRIGGER IF EXISTS trg_deduplication_relationships_occurrence_identity_insert;
 DROP TRIGGER IF EXISTS trg_deduplication_relationships_occurrence_identity_update;
 DROP TRIGGER IF EXISTS trg_article_ingestions_deduplication_rule_insert;
@@ -587,6 +586,567 @@ BEGIN
     SELECT RAISE(ABORT, 'article ingestion must remain consistent with its deduplication relationship');
 END;
 """
+
+
+def _sealed_evidence_guard_triggers(
+    table: str, *, new_run_expression: str, old_run_expression: str
+) -> str:
+    """Prevent any evidence mutation after a run has been cryptographically sealed."""
+
+    return f"""
+CREATE TRIGGER trg_{table}_insert_unsealed
+BEFORE INSERT ON {table}
+WHEN (SELECT sealed_manifest_sha256 FROM ingestion_runs
+      WHERE run_id = {new_run_expression}) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'cannot write evidence for a sealed ingestion run');
+END;
+
+CREATE TRIGGER trg_{table}_update_unsealed
+BEFORE UPDATE ON {table}
+WHEN (SELECT sealed_manifest_sha256 FROM ingestion_runs
+      WHERE run_id = {old_run_expression}) IS NOT NULL
+  OR (SELECT sealed_manifest_sha256 FROM ingestion_runs
+      WHERE run_id = {new_run_expression}) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'cannot update evidence for a sealed ingestion run');
+END;
+
+CREATE TRIGGER trg_{table}_delete_unsealed
+BEFORE DELETE ON {table}
+WHEN (SELECT sealed_manifest_sha256 FROM ingestion_runs
+      WHERE run_id = {old_run_expression}) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'cannot delete evidence for a sealed ingestion run');
+END;
+"""
+
+
+_SEALED_EVIDENCE_SQL = "".join(
+    (
+        _sealed_evidence_guard_triggers(
+            "raw_source_records",
+            new_run_expression="NEW.ingestion_run_id",
+            old_run_expression="OLD.ingestion_run_id",
+        ),
+        _sealed_evidence_guard_triggers(
+            "normalized_articles",
+            new_run_expression="NEW.first_ingestion_run_id",
+            old_run_expression="OLD.first_ingestion_run_id",
+        ),
+        _sealed_evidence_guard_triggers(
+            "article_ingestions",
+            new_run_expression="NEW.ingestion_run_id",
+            old_run_expression="OLD.ingestion_run_id",
+        ),
+        _sealed_evidence_guard_triggers(
+            "article_company_links",
+            new_run_expression=(
+                "(SELECT ingestion_run_id FROM article_ingestions "
+                "WHERE occurrence_id = NEW.occurrence_id)"
+            ),
+            old_run_expression=(
+                "(SELECT ingestion_run_id FROM article_ingestions "
+                "WHERE occurrence_id = OLD.occurrence_id)"
+            ),
+        ),
+        _sealed_evidence_guard_triggers(
+            "deduplication_relationships",
+            new_run_expression="NEW.ingestion_run_id",
+            old_run_expression="OLD.ingestion_run_id",
+        ),
+        _sealed_evidence_guard_triggers(
+            "provider_errors",
+            new_run_expression="NEW.ingestion_run_id",
+            old_run_expression="OLD.ingestion_run_id",
+        ),
+        _sealed_evidence_guard_triggers(
+            "quality_reports",
+            new_run_expression="NEW.ingestion_run_id",
+            old_run_expression="OLD.ingestion_run_id",
+        ),
+    )
+)
+
+
+_SCHEMA_V4_SQL = """
+ALTER TABLE ingestion_runs ADD COLUMN prepared_at TEXT;
+ALTER TABLE ingestion_runs ADD COLUMN sealed_artifact_inventory_json TEXT;
+ALTER TABLE ingestion_runs ADD COLUMN sealed_artifact_inventory_sha256 TEXT;
+ALTER TABLE ingestion_runs ADD COLUMN sealed_manifest_sha256 TEXT;
+ALTER TABLE ingestion_runs ADD COLUMN sealed_completion_sha256 TEXT;
+
+CREATE UNIQUE INDEX uq_ingestion_runs_single_running
+ON ingestion_runs((1)) WHERE status = 'RUNNING';
+
+CREATE UNIQUE INDEX uq_canonical_article_content_sha256
+ON normalized_articles(content_sha256)
+WHERE duplicate_of IS NULL;
+
+CREATE UNIQUE INDEX uq_canonical_article_title_source_minute
+ON normalized_articles(
+    normalized_title,
+    source_name,
+    strftime('%Y-%m-%dT%H:%M', published_at)
+)
+WHERE duplicate_of IS NULL
+  AND normalized_title <> ''
+  AND published_at IS NOT NULL;
+
+CREATE TRIGGER trg_ingestion_runs_insert_running
+BEFORE INSERT ON ingestion_runs
+WHEN NEW.status <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'ingestion runs must be inserted as RUNNING');
+END;
+
+CREATE TRIGGER trg_ingestion_runs_seal_shape_update
+BEFORE UPDATE OF prepared_at, sealed_artifact_inventory_json,
+                 sealed_artifact_inventory_sha256, sealed_manifest_sha256,
+                 sealed_completion_sha256
+ON ingestion_runs
+WHEN (
+    (NEW.sealed_manifest_sha256 IS NULL) <>
+    (NEW.sealed_artifact_inventory_json IS NULL)
+    OR (NEW.sealed_manifest_sha256 IS NULL) <>
+       (NEW.sealed_artifact_inventory_sha256 IS NULL)
+    OR (NEW.sealed_manifest_sha256 IS NULL) <>
+       (NEW.sealed_completion_sha256 IS NULL)
+    OR (NEW.sealed_manifest_sha256 IS NULL) <> (NEW.prepared_at IS NULL)
+    OR (
+        NEW.sealed_manifest_sha256 IS NOT NULL AND (
+            length(NEW.sealed_manifest_sha256) <> 64
+            OR length(NEW.sealed_artifact_inventory_sha256) <> 64
+            OR length(NEW.sealed_completion_sha256) <> 64
+            OR json_valid(NEW.sealed_artifact_inventory_json) <> 1
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ingestion run seal fields are incomplete or invalid');
+END;
+
+CREATE TRIGGER trg_ingestion_runs_seal_immutable_update
+BEFORE UPDATE OF prepared_at, sealed_artifact_inventory_json,
+                 sealed_artifact_inventory_sha256, sealed_manifest_sha256,
+                 sealed_completion_sha256
+ON ingestion_runs
+WHEN OLD.sealed_manifest_sha256 IS NOT NULL AND (
+    NEW.prepared_at IS NOT OLD.prepared_at
+    OR NEW.sealed_artifact_inventory_json IS NOT OLD.sealed_artifact_inventory_json
+    OR NEW.sealed_artifact_inventory_sha256 IS NOT OLD.sealed_artifact_inventory_sha256
+    OR NEW.sealed_manifest_sha256 IS NOT OLD.sealed_manifest_sha256
+    OR NEW.sealed_completion_sha256 IS NOT OLD.sealed_completion_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ingestion run finalization seal is immutable');
+END;
+
+CREATE TRIGGER trg_normalized_articles_canonical_only_insert
+BEFORE INSERT ON normalized_articles
+WHEN NEW.duplicate_of IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'normalized_articles stores canonical rows only');
+END;
+
+CREATE TRIGGER trg_normalized_articles_canonical_only_update
+BEFORE UPDATE OF duplicate_of ON normalized_articles
+WHEN NEW.duplicate_of IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'normalized_articles stores canonical rows only');
+END;
+
+CREATE TRIGGER trg_article_ingestions_finalized_target_insert
+BEFORE INSERT ON article_ingestions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM normalized_articles AS canonical
+    JOIN ingestion_runs AS owner
+      ON owner.run_id = canonical.first_ingestion_run_id
+    WHERE canonical.article_id = NEW.canonical_article_id
+      AND canonical.duplicate_of IS NULL
+      AND (
+          owner.run_id = NEW.ingestion_run_id
+          OR owner.status IN ('PASS', 'PARTIAL')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'article ingestion must target a same-run or finalized canonical');
+END;
+
+CREATE TRIGGER trg_article_ingestions_finalized_target_update
+BEFORE UPDATE OF ingestion_run_id, canonical_article_id ON article_ingestions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM normalized_articles AS canonical
+    JOIN ingestion_runs AS owner
+      ON owner.run_id = canonical.first_ingestion_run_id
+    WHERE canonical.article_id = NEW.canonical_article_id
+      AND canonical.duplicate_of IS NULL
+      AND (
+          owner.run_id = NEW.ingestion_run_id
+          OR owner.status IN ('PASS', 'PARTIAL')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'article ingestion must target a same-run or finalized canonical');
+END;
+
+CREATE TRIGGER trg_normalized_articles_referenced_update
+BEFORE UPDATE ON normalized_articles
+WHEN EXISTS (
+    SELECT 1
+    FROM article_ingestions AS occurrence
+    JOIN ingestion_runs AS consumer
+      ON consumer.run_id = occurrence.ingestion_run_id
+    WHERE occurrence.canonical_article_id = OLD.article_id
+      AND occurrence.ingestion_run_id <> OLD.first_ingestion_run_id
+      AND consumer.status <> 'RUNNING'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'referenced canonical articles are append-only');
+END;
+
+CREATE TRIGGER trg_normalized_articles_referenced_delete
+BEFORE DELETE ON normalized_articles
+WHEN EXISTS (
+    SELECT 1
+    FROM article_ingestions AS occurrence
+    JOIN ingestion_runs AS consumer
+      ON consumer.run_id = occurrence.ingestion_run_id
+    WHERE occurrence.canonical_article_id = OLD.article_id
+      AND occurrence.ingestion_run_id <> OLD.first_ingestion_run_id
+      AND consumer.status <> 'RUNNING'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'referenced canonical articles are append-only');
+END;
+
+DROP TRIGGER trg_ingestion_runs_truthful_pass;
+DROP TRIGGER trg_ingestion_runs_truthful_partial;
+
+CREATE TRIGGER trg_ingestion_runs_truthful_pass
+BEFORE UPDATE OF status ON ingestion_runs
+WHEN NEW.status = 'PASS' AND (
+    NEW.sealed_manifest_sha256 IS NULL
+    OR NEW.sealed_artifact_inventory_sha256 IS NULL
+    OR NEW.sealed_completion_sha256 IS NULL
+    OR NOT EXISTS (
+        SELECT 1 FROM quality_reports AS quality
+        WHERE quality.ingestion_run_id = OLD.run_id
+          AND quality.schema_version = '2.0'
+          AND quality.quality_status = 'PASS'
+          AND json_valid(quality.report_json) = 1
+          AND json_extract(quality.report_json, '$.schema_version') = '2.0'
+          AND json_extract(quality.report_json, '$.quality_status') = 'PASS'
+          AND json_extract(quality.report_json, '$.total_raw_records') =
+              (SELECT count(*) FROM raw_source_records
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.total_normalized_records') =
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.normalized_occurrence_count') =
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.new_canonical_article_count') =
+              (SELECT count(*) FROM normalized_articles
+               WHERE first_ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.matched_existing_canonical_count') =
+              (SELECT count(*)
+               FROM article_ingestions AS occurrence
+               JOIN normalized_articles AS canonical
+                 ON canonical.article_id = occurrence.canonical_article_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND occurrence.duplicate_of IS NOT NULL
+                 AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id)
+          AND json_extract(quality.report_json, '$.historical_duplicate_count') =
+              (SELECT count(*)
+               FROM article_ingestions AS occurrence
+               JOIN normalized_articles AS canonical
+                 ON canonical.article_id = occurrence.canonical_article_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND occurrence.duplicate_of IS NOT NULL
+                 AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id)
+          AND json_extract(quality.report_json, '$.within_run_duplicate_count') =
+              ((SELECT count(*) FROM article_ingestions
+                WHERE ingestion_run_id = OLD.run_id AND duplicate_of IS NOT NULL)
+               -
+               (SELECT count(*)
+                FROM article_ingestions AS occurrence
+                JOIN normalized_articles AS canonical
+                  ON canonical.article_id = occurrence.canonical_article_id
+                WHERE occurrence.ingestion_run_id = OLD.run_id
+                  AND occurrence.duplicate_of IS NOT NULL
+                  AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id))
+          AND json_extract(quality.report_json, '$.represented_canonical_count') =
+              (SELECT count(DISTINCT canonical_article_id)
+               FROM article_ingestions WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.duplicate_relationship_count') =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.duplicate_count') =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_type(quality.report_json, '$.deduplication_rule_counts') = 'object'
+          AND (SELECT count(*)
+               FROM json_each(quality.report_json, '$.deduplication_rule_counts')) = 3
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.canonical_url'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'canonical_url')
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.content_sha256'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'content_sha256')
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.title_source_time'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'title_source_time')
+          AND json_extract(quality.report_json, '$.provider_error_count') = 0
+          AND json_extract(quality.report_json, '$.rejected_record_count') = 0
+          AND json_extract(quality.report_json, '$.missing_title_count') = 0
+          AND json_extract(
+                  quality.report_json, '$.missing_publication_time_count'
+              ) = 0
+          AND json_extract(quality.report_json, '$.missing_body_count') =
+              (SELECT count(*) FROM article_ingestions AS occurrence
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND (
+                     json_extract(occurrence.normalized_payload_json, '$.body') IS NULL
+                     OR trim(json_extract(
+                         occurrence.normalized_payload_json, '$.body'
+                     )) = ''
+                 ))
+          AND json_extract(quality.report_json, '$.invalid_url_count') = 0
+          AND json_extract(quality.report_json, '$.ogdc_linked_article_count') =
+              (SELECT count(DISTINCT link.occurrence_id)
+               FROM article_company_links AS link
+               JOIN article_ingestions AS occurrence
+                 ON occurrence.occurrence_id = link.occurrence_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND upper(link.ticker) = 'OGDC')
+          AND (SELECT count(*) FROM raw_source_records
+               WHERE ingestion_run_id = OLD.run_id) =
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND NOT EXISTS (
+              SELECT 1 FROM article_ingestions AS occurrence
+              WHERE occurrence.ingestion_run_id = OLD.run_id
+                AND (
+                    json_extract(occurrence.normalized_payload_json, '$.title') IS NULL
+                    OR trim(json_extract(
+                        occurrence.normalized_payload_json, '$.title'
+                    )) = ''
+                    OR json_extract(
+                        occurrence.normalized_payload_json, '$.published_at'
+                    ) IS NULL
+                    OR json_extract(
+                        occurrence.normalized_payload_json, '$.published_at'
+                    ) = ''
+                    OR EXISTS (
+                        SELECT 1
+                        FROM json_each(occurrence.normalization_warnings_json)
+                        WHERE value = 'source_url_invalid'
+                    )
+                )
+          )
+    )
+    OR EXISTS (
+        SELECT 1 FROM provider_errors WHERE ingestion_run_id = OLD.run_id
+    )
+    OR (SELECT count(*) FROM raw_source_records
+        WHERE ingestion_run_id = OLD.run_id) = 0
+    OR (SELECT count(*) FROM article_ingestions
+        WHERE ingestion_run_id = OLD.run_id) = 0
+    OR EXISTS (
+        SELECT 1 FROM article_ingestions AS occurrence
+        LEFT JOIN deduplication_relationships AS relationship
+          ON relationship.occurrence_id = occurrence.occurrence_id
+        WHERE occurrence.ingestion_run_id = OLD.run_id
+          AND (
+              (occurrence.duplicate_of IS NULL AND relationship.occurrence_id IS NOT NULL)
+              OR (occurrence.duplicate_of IS NOT NULL AND relationship.occurrence_id IS NULL)
+          )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'PASS requires sealed, nonempty, internally consistent evidence');
+END;
+
+CREATE TRIGGER trg_ingestion_runs_truthful_partial
+BEFORE UPDATE OF status ON ingestion_runs
+WHEN NEW.status = 'PARTIAL' AND (
+    NEW.sealed_manifest_sha256 IS NULL
+    OR NEW.sealed_artifact_inventory_sha256 IS NULL
+    OR NEW.sealed_completion_sha256 IS NULL
+    OR NOT EXISTS (
+        SELECT 1 FROM quality_reports AS quality
+        WHERE quality.ingestion_run_id = OLD.run_id
+          AND quality.schema_version = '2.0'
+          AND quality.quality_status = 'WARN'
+          AND json_valid(quality.report_json) = 1
+          AND json_extract(quality.report_json, '$.schema_version') = '2.0'
+          AND json_extract(quality.report_json, '$.quality_status') = 'WARN'
+          AND json_extract(quality.report_json, '$.total_raw_records') =
+              (SELECT count(*) FROM raw_source_records
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.total_normalized_records') =
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.normalized_occurrence_count') =
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.new_canonical_article_count') =
+              (SELECT count(*) FROM normalized_articles
+               WHERE first_ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.matched_existing_canonical_count') =
+              (SELECT count(*)
+               FROM article_ingestions AS occurrence
+               JOIN normalized_articles AS canonical
+                 ON canonical.article_id = occurrence.canonical_article_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND occurrence.duplicate_of IS NOT NULL
+                 AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id)
+          AND json_extract(quality.report_json, '$.historical_duplicate_count') =
+              (SELECT count(*)
+               FROM article_ingestions AS occurrence
+               JOIN normalized_articles AS canonical
+                 ON canonical.article_id = occurrence.canonical_article_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND occurrence.duplicate_of IS NOT NULL
+                 AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id)
+          AND json_extract(quality.report_json, '$.within_run_duplicate_count') =
+              ((SELECT count(*) FROM article_ingestions
+                WHERE ingestion_run_id = OLD.run_id AND duplicate_of IS NOT NULL)
+               -
+               (SELECT count(*)
+                FROM article_ingestions AS occurrence
+                JOIN normalized_articles AS canonical
+                  ON canonical.article_id = occurrence.canonical_article_id
+                WHERE occurrence.ingestion_run_id = OLD.run_id
+                  AND occurrence.duplicate_of IS NOT NULL
+                  AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id))
+          AND json_extract(quality.report_json, '$.represented_canonical_count') =
+              (SELECT count(DISTINCT canonical_article_id)
+               FROM article_ingestions WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.duplicate_relationship_count') =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.duplicate_count') =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_type(quality.report_json, '$.deduplication_rule_counts') = 'object'
+          AND (SELECT count(*)
+               FROM json_each(quality.report_json, '$.deduplication_rule_counts')) = 3
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.canonical_url'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'canonical_url')
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.content_sha256'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'content_sha256')
+          AND json_extract(
+                  quality.report_json,
+                  '$.deduplication_rule_counts.title_source_time'
+              ) =
+              (SELECT count(*) FROM deduplication_relationships
+               WHERE ingestion_run_id = OLD.run_id
+                 AND deduplication_rule = 'title_source_time')
+          AND json_extract(quality.report_json, '$.provider_error_count') =
+              (SELECT count(*) FROM provider_errors
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.rejected_record_count') =
+              ((SELECT count(*) FROM raw_source_records
+                WHERE ingestion_run_id = OLD.run_id)
+               -
+               (SELECT count(*) FROM article_ingestions
+                WHERE ingestion_run_id = OLD.run_id))
+          AND (SELECT count(*) FROM raw_source_records
+               WHERE ingestion_run_id = OLD.run_id) >=
+              (SELECT count(*) FROM article_ingestions
+               WHERE ingestion_run_id = OLD.run_id)
+          AND json_extract(quality.report_json, '$.missing_title_count') =
+              (SELECT count(*) FROM article_ingestions AS occurrence
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND (
+                     json_extract(occurrence.normalized_payload_json, '$.title') IS NULL
+                     OR trim(json_extract(
+                         occurrence.normalized_payload_json, '$.title'
+                     )) = ''
+                 ))
+          AND json_extract(
+                  quality.report_json, '$.missing_publication_time_count'
+              ) =
+              (SELECT count(*) FROM article_ingestions AS occurrence
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND (
+                     json_extract(
+                         occurrence.normalized_payload_json, '$.published_at'
+                     ) IS NULL
+                     OR json_extract(
+                         occurrence.normalized_payload_json, '$.published_at'
+                     ) = ''
+                 ))
+          AND json_extract(quality.report_json, '$.missing_body_count') =
+              (SELECT count(*) FROM article_ingestions AS occurrence
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND (
+                     json_extract(occurrence.normalized_payload_json, '$.body') IS NULL
+                     OR trim(json_extract(
+                         occurrence.normalized_payload_json, '$.body'
+                     )) = ''
+                 ))
+          AND json_extract(quality.report_json, '$.invalid_url_count') =
+              (SELECT count(*) FROM article_ingestions AS occurrence
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND EXISTS (
+                     SELECT 1
+                     FROM json_each(occurrence.normalization_warnings_json)
+                     WHERE value = 'source_url_invalid'
+                 ))
+          AND json_extract(quality.report_json, '$.ogdc_linked_article_count') =
+              (SELECT count(DISTINCT link.occurrence_id)
+               FROM article_company_links AS link
+               JOIN article_ingestions AS occurrence
+                 ON occurrence.occurrence_id = link.occurrence_id
+               WHERE occurrence.ingestion_run_id = OLD.run_id
+                 AND upper(link.ticker) = 'OGDC')
+    )
+    OR (SELECT count(*) FROM raw_source_records
+        WHERE ingestion_run_id = OLD.run_id) = 0
+    OR (SELECT count(*) FROM article_ingestions
+        WHERE ingestion_run_id = OLD.run_id) = 0
+    OR EXISTS (
+        SELECT 1 FROM article_ingestions AS occurrence
+        LEFT JOIN deduplication_relationships AS relationship
+          ON relationship.occurrence_id = occurrence.occurrence_id
+        WHERE occurrence.ingestion_run_id = OLD.run_id
+          AND (
+              (occurrence.duplicate_of IS NULL AND relationship.occurrence_id IS NOT NULL)
+              OR (occurrence.duplicate_of IS NOT NULL AND relationship.occurrence_id IS NULL)
+          )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'PARTIAL requires sealed, nonempty, internally consistent evidence');
+END;
+""" + _SEALED_EVIDENCE_SQL
 
 
 def utc_now_z() -> str:
@@ -755,6 +1315,40 @@ def _json_text(value: Any, *, default: Any) -> str:
     )
 
 
+def _json_sha256(value: Any, *, default: Any) -> tuple[str, str]:
+    payload = _json_text(value, default=default)
+    return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sealed_inventory(value: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("artifact_inventory must be a sequence of mappings")
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_entry in value:
+        if not isinstance(raw_entry, Mapping):
+            raise TypeError("every artifact inventory entry must be a mapping")
+        path = _artifact_reference(raw_entry.get("path"), field="artifact path")
+        if path in seen:
+            raise ValueError(f"artifact_inventory contains a duplicate path: {path}")
+        seen.add(path)
+        size = raw_entry.get("size_bytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("artifact inventory size_bytes must be a non-negative integer")
+        entries.append(
+            {
+                "path": path,
+                "sha256": _sha256(
+                    raw_entry.get("sha256"), field="artifact inventory sha256"
+                ),
+                "size_bytes": size,
+            }
+        )
+    if not entries:
+        raise ValueError("artifact_inventory cannot be empty")
+    return sorted(entries, key=lambda item: item["path"])
+
+
 def _normalized_title(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
@@ -814,6 +1408,503 @@ def _validate_existing_deduplication_integrity(
         )
 
 
+_MIGRATION_NAMES = {
+    1: "news_ingestion_foundation",
+    2: "news_storage_immutability",
+    3: "news_storage_cross_run_integrity",
+    4: "news_storage_sealed_finalization",
+}
+
+
+def _normalized_schema_sql(value: str | None) -> str:
+    return " ".join((value or "").split()).casefold()
+
+
+def _schema_stage_sql(version: int) -> str:
+    if version == 1:
+        return _SCHEMA_SQL
+    elif version == 2:
+        return _IMMUTABILITY_SQL
+    elif version == 3:
+        return _DEDUPLICATION_INTEGRITY_SQL
+    elif version == 4:
+        return _SCHEMA_V4_SQL
+    raise ValueError(f"Unsupported news schema stage: {version}")
+
+
+def _apply_schema_stage(
+    connection: sqlite3.Connection, version: int, *, begin: bool = False
+) -> None:
+    prefix = "BEGIN IMMEDIATE;\n" if begin else ""
+    connection.executescript(prefix + _schema_stage_sql(version))
+
+
+def _expected_schema_objects(version: int) -> dict[tuple[str, str], str]:
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.execute("PRAGMA foreign_keys = ON")
+        for stage in range(1, version + 1):
+            _apply_schema_stage(expected, stage)
+        return {
+            (str(row[0]), str(row[1])): _normalized_schema_sql(row[2])
+            for row in expected.execute(
+                """
+                SELECT type, name, sql
+                FROM sqlite_master
+                WHERE type IN ('table', 'index', 'trigger')
+                  AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+    finally:
+        expected.close()
+
+
+def _verify_migration_ledger(
+    connection: sqlite3.Connection, version: int
+) -> None:
+    rows = connection.execute(
+        "SELECT version, name FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    actual = [(int(row[0]), str(row[1])) for row in rows]
+    expected = [
+        (item, _MIGRATION_NAMES[item]) for item in range(1, version + 1)
+    ]
+    if actual != expected:
+        raise RuntimeError(
+            "News database migration ledger does not match its schema version"
+        )
+
+
+def _verify_schema(connection: sqlite3.Connection, version: int) -> None:
+    actual_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if actual_version != version:
+        raise RuntimeError(
+            "News database user_version does not match the expected migration stage"
+        )
+    expected_objects = _expected_schema_objects(version)
+    actual_objects = {
+        (str(row[0]), str(row[1])): _normalized_schema_sql(row[2])
+        for row in connection.execute(
+            """
+            SELECT type, name, sql
+            FROM sqlite_master
+            WHERE type IN ('table', 'index', 'trigger')
+              AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
+    missing = sorted(set(expected_objects) - set(actual_objects))
+    unexpected = sorted(set(actual_objects) - set(expected_objects))
+    changed = sorted(
+        key
+        for key in set(expected_objects) & set(actual_objects)
+        if expected_objects[key] != actual_objects[key]
+    )
+    if missing or unexpected or changed:
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected={unexpected}")
+        if changed:
+            details.append(f"changed={changed}")
+        raise RuntimeError(
+            "News database schema verification failed: " + "; ".join(details)
+        )
+    _verify_migration_ledger(connection, version)
+
+
+def _validate_v4_migration_preconditions(
+    connection: sqlite3.Connection,
+) -> None:
+    if connection.execute(
+        "SELECT count(*) FROM ingestion_runs WHERE status = 'RUNNING'"
+    ).fetchone()[0] > 1:
+        raise RuntimeError(
+            "Cannot serialize news ingestion while multiple RUNNING rows exist"
+        )
+    noncanonical = connection.execute(
+        """
+        SELECT article_id FROM normalized_articles
+        WHERE duplicate_of IS NOT NULL LIMIT 1
+        """
+    ).fetchone()
+    if noncanonical is not None:
+        raise RuntimeError(
+            "Cannot migrate news storage while normalized_articles contains "
+            f"a noncanonical row: {noncanonical['article_id']}"
+        )
+    duplicate_hash = connection.execute(
+        """
+        SELECT content_sha256 FROM normalized_articles
+        GROUP BY content_sha256 HAVING count(*) > 1 LIMIT 1
+        """
+    ).fetchone()
+    if duplicate_hash is not None:
+        raise RuntimeError(
+            "Cannot migrate news storage with duplicate canonical content hashes"
+        )
+    duplicate_title = connection.execute(
+        """
+        SELECT normalized_title, source_name,
+               strftime('%Y-%m-%dT%H:%M', published_at) AS published_minute
+        FROM normalized_articles
+        WHERE normalized_title <> '' AND published_at IS NOT NULL
+        GROUP BY normalized_title, source_name, published_minute
+        HAVING count(*) > 1 LIMIT 1
+        """
+    ).fetchone()
+    if duplicate_title is not None:
+        raise RuntimeError(
+            "Cannot migrate news storage with duplicate canonical title identities"
+        )
+    unsafe_target = connection.execute(
+        """
+        SELECT occurrence.occurrence_id
+        FROM article_ingestions AS occurrence
+        JOIN normalized_articles AS canonical
+          ON canonical.article_id = occurrence.canonical_article_id
+        JOIN ingestion_runs AS owner
+          ON owner.run_id = canonical.first_ingestion_run_id
+        WHERE owner.run_id <> occurrence.ingestion_run_id
+          AND owner.status NOT IN ('PASS', 'PARTIAL')
+        LIMIT 1
+        """
+    ).fetchone()
+    if unsafe_target is not None:
+        raise RuntimeError(
+            "Cannot migrate news storage while an occurrence references an "
+            f"unfinalized canonical: {unsafe_target['occurrence_id']}"
+        )
+
+
+def _migrate_schema(
+    connection: sqlite3.Connection, from_version: int, to_version: int
+) -> None:
+    if to_version != from_version + 1:
+        raise ValueError("News schema migrations must advance one version at a time")
+    _verify_schema(connection, from_version)
+    if to_version == 3:
+        _validate_existing_deduplication_integrity(connection)
+    if to_version == 4:
+        _validate_existing_deduplication_integrity(connection)
+        _validate_v4_migration_preconditions(connection)
+    try:
+        _apply_schema_stage(connection, to_version, begin=True)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (to_version, _MIGRATION_NAMES[to_version], utc_now_z()),
+        )
+        connection.execute(f"PRAGMA user_version = {to_version}")
+        _verify_schema(connection, to_version)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _bootstrap_schema(connection: sqlite3.Connection) -> None:
+    existing = connection.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchall()
+    if existing:
+        raise RuntimeError(
+            "Refusing to stamp an unversioned, nonempty news database"
+        )
+    try:
+        _apply_schema_stage(connection, 1, begin=True)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (1, ?, ?)
+            """,
+            (_MIGRATION_NAMES[1], utc_now_z()),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        _verify_schema(connection, 1)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _run_evidence_snapshot(
+    connection: sqlite3.Connection, run_id: str
+) -> dict[str, Any]:
+    def count(query: str, parameters: tuple[Any, ...] = (run_id,)) -> int:
+        return int(connection.execute(query, parameters).fetchone()[0])
+
+    raw_count = count(
+        "SELECT count(*) FROM raw_source_records WHERE ingestion_run_id = ?"
+    )
+    occurrence_count = count(
+        "SELECT count(*) FROM article_ingestions WHERE ingestion_run_id = ?"
+    )
+    new_canonical_count = count(
+        "SELECT count(*) FROM normalized_articles WHERE first_ingestion_run_id = ?"
+    )
+    relationship_count = count(
+        """
+        SELECT count(*) FROM deduplication_relationships
+        WHERE ingestion_run_id = ?
+        """
+    )
+    duplicate_occurrence_count = count(
+        """
+        SELECT count(*) FROM article_ingestions
+        WHERE ingestion_run_id = ? AND duplicate_of IS NOT NULL
+        """
+    )
+    represented_canonical_count = count(
+        """
+        SELECT count(DISTINCT canonical_article_id) FROM article_ingestions
+        WHERE ingestion_run_id = ?
+        """
+    )
+    historical_duplicate_count = count(
+        """
+        SELECT count(*)
+        FROM article_ingestions AS occurrence
+        JOIN normalized_articles AS canonical
+          ON canonical.article_id = occurrence.canonical_article_id
+        WHERE occurrence.ingestion_run_id = ?
+          AND occurrence.duplicate_of IS NOT NULL
+          AND canonical.first_ingestion_run_id <> occurrence.ingestion_run_id
+        """
+    )
+    within_run_duplicate_count = duplicate_occurrence_count - historical_duplicate_count
+    provider_error_count = count(
+        "SELECT count(*) FROM provider_errors WHERE ingestion_run_id = ?"
+    )
+    ogdc_linked_count = count(
+        """
+        SELECT count(DISTINCT link.occurrence_id)
+        FROM article_company_links AS link
+        JOIN article_ingestions AS occurrence
+          ON occurrence.occurrence_id = link.occurrence_id
+        WHERE occurrence.ingestion_run_id = ? AND upper(link.ticker) = 'OGDC'
+        """
+    )
+    mismatch_count = count(
+        """
+        SELECT count(*)
+        FROM article_ingestions AS occurrence
+        LEFT JOIN deduplication_relationships AS relationship
+          ON relationship.occurrence_id = occurrence.occurrence_id
+        WHERE occurrence.ingestion_run_id = ?
+          AND (
+              (occurrence.duplicate_of IS NULL AND relationship.occurrence_id IS NOT NULL)
+              OR (occurrence.duplicate_of IS NOT NULL AND relationship.occurrence_id IS NULL)
+          )
+        """
+    )
+    relationship_rule_counts = {
+        rule: 0 for rule in sorted(_SUPPORTED_DEDUPLICATION_RULES)
+    }
+    relationship_rule_counts.update(
+        {
+            str(row[0]): int(row[1])
+            for row in connection.execute(
+                """
+                SELECT deduplication_rule, count(*)
+                FROM deduplication_relationships
+                WHERE ingestion_run_id = ?
+                GROUP BY deduplication_rule ORDER BY deduplication_rule
+                """,
+                (run_id,),
+            )
+        }
+    )
+
+    missing_title_count = 0
+    missing_publication_time_count = 0
+    missing_body_count = 0
+    invalid_url_count = 0
+    for row in connection.execute(
+        """
+        SELECT normalized_payload_json, normalization_warnings_json
+        FROM article_ingestions WHERE ingestion_run_id = ?
+        """,
+        (run_id,),
+    ):
+        try:
+            payload = json.loads(str(row[0]))
+            warnings = json.loads(str(row[1]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Stored normalized occurrence JSON is unreadable"
+            ) from exc
+        if not isinstance(payload, Mapping) or not isinstance(warnings, list):
+            raise RuntimeError("Stored normalized occurrence JSON has invalid shape")
+        title = payload.get("title")
+        body = payload.get("body")
+        if title is None or not str(title).strip():
+            missing_title_count += 1
+        if payload.get("published_at") in (None, ""):
+            missing_publication_time_count += 1
+        if body is None or not str(body).strip():
+            missing_body_count += 1
+        if any(str(item) == "source_url_invalid" for item in warnings):
+            invalid_url_count += 1
+
+    rejected_record_count = raw_count - occurrence_count
+    if rejected_record_count < 0:
+        raise RuntimeError(
+            "News evidence contains more normalized occurrences than raw records"
+        )
+    if raw_count == 0 or occurrence_count == 0:
+        expected_quality_status = "FAIL"
+    elif (
+        provider_error_count
+        or rejected_record_count
+        or missing_title_count
+        or missing_publication_time_count
+        or invalid_url_count
+    ):
+        expected_quality_status = "WARN"
+    else:
+        expected_quality_status = "PASS"
+
+    return {
+        "raw_record_count": raw_count,
+        "normalized_occurrence_count": occurrence_count,
+        "normalized_record_count": occurrence_count,
+        "new_canonical_article_count": new_canonical_count,
+        "matched_existing_canonical_count": historical_duplicate_count,
+        "within_run_duplicate_count": within_run_duplicate_count,
+        "historical_duplicate_count": historical_duplicate_count,
+        "represented_canonical_count": represented_canonical_count,
+        "duplicate_relationship_count": relationship_count,
+        "duplicate_count": relationship_count,
+        "duplicate_occurrence_count": duplicate_occurrence_count,
+        "deduplication_rule_counts": relationship_rule_counts,
+        "provider_error_count": provider_error_count,
+        "rejected_record_count": rejected_record_count,
+        "missing_title_count": missing_title_count,
+        "missing_publication_time_count": missing_publication_time_count,
+        "missing_body_count": missing_body_count,
+        "invalid_url_count": invalid_url_count,
+        "ogdc_linked_article_count": ogdc_linked_count,
+        "relationship_bijection_valid": mismatch_count == 0,
+        "expected_quality_status": expected_quality_status,
+    }
+
+
+_COUNT_FIELD_MAP = {
+    "total_raw_records": "raw_record_count",
+    "raw_record_count": "raw_record_count",
+    "total_normalized_records": "normalized_occurrence_count",
+    "normalized_record_count": "normalized_occurrence_count",
+    "normalized_occurrence_count": "normalized_occurrence_count",
+    "new_canonical_article_count": "new_canonical_article_count",
+    "matched_existing_canonical_count": "matched_existing_canonical_count",
+    "within_run_duplicate_count": "within_run_duplicate_count",
+    "historical_duplicate_count": "historical_duplicate_count",
+    "represented_canonical_count": "represented_canonical_count",
+    "duplicate_count": "duplicate_relationship_count",
+    "duplicate_relationship_count": "duplicate_relationship_count",
+    "provider_error_count": "provider_error_count",
+    "rejected_record_count": "rejected_record_count",
+    "missing_title_count": "missing_title_count",
+    "missing_publication_time_count": "missing_publication_time_count",
+    "missing_body_count": "missing_body_count",
+    "invalid_url_count": "invalid_url_count",
+    "ogdc_linked_article_count": "ogdc_linked_article_count",
+}
+
+
+def _validate_count_payload(
+    payload: Mapping[str, Any], snapshot: Mapping[str, Any], *, label: str
+) -> None:
+    for supplied_field, snapshot_field in _COUNT_FIELD_MAP.items():
+        if supplied_field not in payload:
+            continue
+        supplied = payload[supplied_field]
+        if isinstance(supplied, bool):
+            raise ValueError(f"{label} {supplied_field} must be an integer")
+        try:
+            supplied_count = int(supplied)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{label} {supplied_field} must be an integer"
+            ) from exc
+        if supplied_count != int(snapshot[snapshot_field]):
+            raise ValueError(
+                f"{label} {supplied_field} contradicts persisted evidence: "
+                f"{supplied_count} != {snapshot[snapshot_field]}"
+            )
+    for field in ("deduplication_rule_counts", "duplicate_rule_counts"):
+        if field in payload:
+            supplied_rules = payload[field]
+            if not isinstance(supplied_rules, Mapping):
+                raise ValueError(f"{label} {field} must be a mapping")
+            normalized = {
+                str(key): int(value) for key, value in supplied_rules.items()
+            }
+            if normalized != snapshot["deduplication_rule_counts"]:
+                raise ValueError(
+                    f"{label} {field} contradicts persisted evidence"
+                )
+
+
+def _validate_quality_payload(
+    quality_status: str,
+    payload: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> None:
+    required = {
+        "schema_version",
+        "quality_status",
+        "total_raw_records",
+        "total_normalized_records",
+        "normalized_occurrence_count",
+        "new_canonical_article_count",
+        "matched_existing_canonical_count",
+        "within_run_duplicate_count",
+        "historical_duplicate_count",
+        "represented_canonical_count",
+        "duplicate_relationship_count",
+        "duplicate_count",
+        "deduplication_rule_counts",
+        "provider_error_count",
+        "rejected_record_count",
+        "missing_title_count",
+        "missing_publication_time_count",
+        "missing_body_count",
+        "invalid_url_count",
+        "ogdc_linked_article_count",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(
+            "quality report is missing database-verifiable fields: "
+            + ", ".join(missing)
+        )
+    if str(payload["schema_version"]) != QUALITY_REPORT_SCHEMA_VERSION:
+        raise ValueError(
+            "quality report schema_version must be "
+            f"{QUALITY_REPORT_SCHEMA_VERSION}"
+        )
+    reported_status = str(payload["quality_status"]).strip().upper()
+    if reported_status != quality_status:
+        raise ValueError("quality report status contradicts quality_status")
+    _validate_count_payload(payload, snapshot, label="quality report")
+    severity = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    expected = str(snapshot["expected_quality_status"])
+    if severity[quality_status] < severity[expected]:
+        raise ValueError(
+            f"quality report is more optimistic than persisted evidence: "
+            f"{quality_status} < {expected}"
+        )
+
+
 class NewsStorage:
     """A small transactional repository around one configurable SQLite file."""
 
@@ -835,40 +1926,22 @@ class NewsStorage:
     def initialize(self) -> "NewsStorage":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if current > DATABASE_SCHEMA_VERSION:
                 raise RuntimeError(
                     "News database schema is newer than this PAISA version: "
                     f"{current} > {DATABASE_SCHEMA_VERSION}"
                 )
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(_SCHEMA_SQL)
-            null_raw_count = connection.execute(
-                """
-                SELECT count(*) FROM article_ingestions
-                WHERE raw_evidence_id IS NULL
-                """
-            ).fetchone()[0]
-            if null_raw_count:
-                raise RuntimeError(
-                    "Cannot harden news storage while article ingestions lack "
-                    "raw-evidence references"
-                )
-            connection.executescript(_IMMUTABILITY_SQL)
-            connection.executescript(_DEDUPLICATION_INTEGRITY_SQL)
-            _validate_existing_deduplication_integrity(connection)
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO schema_migrations(version, name, applied_at)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    (1, "news_ingestion_foundation", utc_now_z()),
-                    (2, "news_storage_immutability", utc_now_z()),
-                    (3, "news_storage_cross_run_integrity", utc_now_z()),
-                ),
-            )
-            connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+            if current == 0:
+                _bootstrap_schema(connection)
+                current = 1
+            else:
+                _verify_schema(connection, current)
+            while current < DATABASE_SCHEMA_VERSION:
+                _migrate_schema(connection, current, current + 1)
+                current += 1
+            _verify_schema(connection, DATABASE_SCHEMA_VERSION)
         return self
 
     @contextmanager
@@ -890,7 +1963,7 @@ class NewsStorage:
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
-        except Exception:
+        except BaseException:
             connection.rollback()
             raise
         finally:
@@ -907,6 +1980,14 @@ class NewsStorage:
         provider_mode = _required_text(data, "provider_mode", "provider_type")
         data_kind = _required_text(data, "data_kind", "record_kind").lower()
         with self.transaction() as connection:
+            active = connection.execute(
+                "SELECT run_id FROM ingestion_runs WHERE status = 'RUNNING'"
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError(
+                    "Another news ingestion run is already active: "
+                    f"{active['run_id']}"
+                )
             connection.execute(
                 """
                 INSERT INTO ingestion_runs(
@@ -1498,7 +2579,18 @@ class NewsStorage:
         if quality_status not in {"PASS", "WARN", "FAIL"}:
             raise ValueError("quality_status must be PASS, WARN, or FAIL")
         payload = _value(data, "report", "report_payload", default=data)
+        if not isinstance(payload, Mapping):
+            raise TypeError("quality report payload must be a mapping")
         with self.transaction() as connection:
+            run = connection.execute(
+                "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown ingestion run: {run_id}")
+            if run["status"] != "RUNNING":
+                raise RuntimeError(f"Ingestion run is already finalized: {run_id}")
+            snapshot = _run_evidence_snapshot(connection, run_id)
+            _validate_quality_payload(quality_status, payload, snapshot)
             connection.execute(
                 """
                 INSERT INTO quality_reports(
@@ -1508,7 +2600,7 @@ class NewsStorage:
                 """,
                 (
                     run_id,
-                    str(data.get("schema_version", NEWS_RECORD_SCHEMA_VERSION)),
+                    QUALITY_REPORT_SCHEMA_VERSION,
                     quality_status,
                     _timestamp(
                         data.get("created_at", utc_now_z()), field="created_at"
@@ -1564,12 +2656,290 @@ class NewsStorage:
         if not clauses:
             return []
         query = (
-            "SELECT * FROM normalized_articles WHERE duplicate_of IS NULL AND ("
+            "SELECT article.*, "
+            "owner.sealed_manifest_sha256 AS owner_manifest_sha256 "
+            "FROM normalized_articles AS article "
+            "JOIN ingestion_runs AS owner "
+            "ON owner.run_id = article.first_ingestion_run_id "
+            "WHERE article.duplicate_of IS NULL "
+            "AND owner.status IN ('PASS', 'PARTIAL') AND ("
             + " OR ".join(clauses)
-            + ") ORDER BY article_id"
+            + ") ORDER BY article.article_id"
         )
         with self.connection() as connection:
             return [dict(row) for row in connection.execute(query, parameters)]
+
+    def get_run_evidence_snapshot(self, run_id: str) -> dict[str, Any]:
+        """Return counts derived from SQLite rather than caller-supplied reports."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        with self.connection() as connection:
+            run = connection.execute(
+                "SELECT status FROM ingestion_runs WHERE run_id = ?", (identifier,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown ingestion run: {identifier}")
+            snapshot = _run_evidence_snapshot(connection, identifier)
+        snapshot["run_id"] = identifier
+        snapshot["status"] = str(run["status"])
+        return snapshot
+
+    def validate_run_evidence(
+        self,
+        run_id: str,
+        *,
+        quality_report: Mapping[str, Any] | None = None,
+        summary: Mapping[str, Any] | None = None,
+        require_relationship_bijection: bool = True,
+    ) -> dict[str, Any]:
+        """Validate persisted counts, quality, and duplicate relationships."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        with self.connection() as connection:
+            run = connection.execute(
+                "SELECT status FROM ingestion_runs WHERE run_id = ?", (identifier,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown ingestion run: {identifier}")
+            snapshot = _run_evidence_snapshot(connection, identifier)
+            if require_relationship_bijection and not snapshot[
+                "relationship_bijection_valid"
+            ]:
+                raise RuntimeError(
+                    "Every duplicate occurrence must have exactly one matching "
+                    "relationship, and canonical occurrences must have none"
+                )
+            report_status: str | None = None
+            if quality_report is None:
+                quality_row = connection.execute(
+                    """
+                    SELECT quality_status, report_json FROM quality_reports
+                    WHERE ingestion_run_id = ?
+                    """,
+                    (identifier,),
+                ).fetchone()
+                if quality_row is not None:
+                    report_status = str(quality_row["quality_status"])
+                    try:
+                        loaded = json.loads(str(quality_row["report_json"]))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            "Persisted quality report JSON is unreadable"
+                        ) from exc
+                    if not isinstance(loaded, Mapping):
+                        raise RuntimeError(
+                            "Persisted quality report JSON must be an object"
+                        )
+                    quality_report = loaded
+            else:
+                report_status = str(
+                    quality_report.get("quality_status", "")
+                ).strip().upper()
+            if quality_report is not None:
+                if report_status not in {"PASS", "WARN", "FAIL"}:
+                    raise ValueError("quality report must declare a valid status")
+                _validate_quality_payload(report_status, quality_report, snapshot)
+            if summary is not None:
+                _validate_count_payload(summary, snapshot, label="run summary")
+        snapshot["run_id"] = identifier
+        snapshot["status"] = str(run["status"])
+        return snapshot
+
+    def seal_run(
+        self,
+        run_id: str,
+        *,
+        artifact_inventory: Sequence[Mapping[str, Any]],
+        manifest_sha256: str,
+        completion_marker_sha256: str,
+        expected_counts: Mapping[str, Any] | None = None,
+        prepared_at: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        """Bind a RUNNING row to one exact artifact set and completion identity."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        normalized_inventory = _sealed_inventory(artifact_inventory)
+        inventory_json, inventory_sha256 = _json_sha256(
+            normalized_inventory, default=[]
+        )
+        manifest_digest = _sha256(manifest_sha256, field="manifest_sha256")
+        completion_digest = _sha256(
+            completion_marker_sha256, field="completion_marker_sha256"
+        )
+        prepared = _timestamp(prepared_at or utc_now_z(), field="prepared_at")
+        with self.transaction() as connection:
+            run = connection.execute(
+                """
+                SELECT status, sealed_manifest_sha256 FROM ingestion_runs
+                WHERE run_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown ingestion run: {identifier}")
+            if run["status"] != "RUNNING":
+                raise RuntimeError(f"Ingestion run is already finalized: {identifier}")
+            if run["sealed_manifest_sha256"] is not None:
+                raise RuntimeError(f"Ingestion run is already sealed: {identifier}")
+            snapshot = _run_evidence_snapshot(connection, identifier)
+            if not snapshot["relationship_bijection_valid"]:
+                raise RuntimeError(
+                    "Cannot seal a run with incomplete duplicate relationships"
+                )
+            quality_row = connection.execute(
+                """
+                SELECT quality_status, report_json FROM quality_reports
+                WHERE ingestion_run_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if quality_row is None:
+                raise RuntimeError("Cannot seal a run without a quality report")
+            try:
+                quality_payload = json.loads(str(quality_row["report_json"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Persisted quality report JSON is unreadable") from exc
+            if not isinstance(quality_payload, Mapping):
+                raise RuntimeError("Persisted quality report JSON must be an object")
+            _validate_quality_payload(
+                str(quality_row["quality_status"]), quality_payload, snapshot
+            )
+            if expected_counts is not None:
+                _validate_count_payload(
+                    expected_counts, snapshot, label="finalization counts"
+                )
+            result = connection.execute(
+                """
+                UPDATE ingestion_runs
+                SET prepared_at = ?, sealed_artifact_inventory_json = ?,
+                    sealed_artifact_inventory_sha256 = ?,
+                    sealed_manifest_sha256 = ?, sealed_completion_sha256 = ?
+                WHERE run_id = ? AND status = 'RUNNING'
+                  AND sealed_manifest_sha256 IS NULL
+                """,
+                (
+                    prepared,
+                    inventory_json,
+                    inventory_sha256,
+                    manifest_digest,
+                    completion_digest,
+                    identifier,
+                ),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(f"Could not seal ingestion run: {identifier}")
+        return {
+            "run_id": identifier,
+            "prepared_at": prepared,
+            "artifact_inventory": normalized_inventory,
+            "artifact_inventory_sha256": inventory_sha256,
+            "manifest_sha256": manifest_digest,
+            "completion_marker_sha256": completion_digest,
+        }
+
+    def get_run_finalization_binding(
+        self, run_id: str
+    ) -> dict[str, Any] | None:
+        identifier = _safe_id(run_id, field="run_id")
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT prepared_at, sealed_artifact_inventory_json,
+                       sealed_artifact_inventory_sha256,
+                       sealed_manifest_sha256, sealed_completion_sha256
+                FROM ingestion_runs WHERE run_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown ingestion run: {identifier}")
+        if row["sealed_manifest_sha256"] is None:
+            return None
+        return {
+            "run_id": identifier,
+            "prepared_at": row["prepared_at"],
+            "artifact_inventory": json.loads(
+                str(row["sealed_artifact_inventory_json"])
+            ),
+            "artifact_inventory_sha256": row[
+                "sealed_artifact_inventory_sha256"
+            ],
+            "manifest_sha256": row["sealed_manifest_sha256"],
+            "completion_marker_sha256": row["sealed_completion_sha256"],
+        }
+
+    def discard_running_run(self, run_id: str) -> None:
+        """Delete an unsealed interrupted run and only the evidence it owns."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        with self.transaction() as connection:
+            run = connection.execute(
+                """
+                SELECT status, sealed_manifest_sha256 FROM ingestion_runs
+                WHERE run_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Unknown ingestion run: {identifier}")
+            if run["status"] != "RUNNING":
+                raise RuntimeError("Only a RUNNING ingestion run can be discarded")
+            if run["sealed_manifest_sha256"] is not None:
+                raise RuntimeError("A sealed ingestion run cannot be discarded")
+            external_reference = connection.execute(
+                """
+                SELECT occurrence.occurrence_id
+                FROM article_ingestions AS occurrence
+                JOIN normalized_articles AS canonical
+                  ON canonical.article_id = occurrence.canonical_article_id
+                WHERE canonical.first_ingestion_run_id = ?
+                  AND occurrence.ingestion_run_id <> ?
+                LIMIT 1
+                """,
+                (identifier, identifier),
+            ).fetchone()
+            if external_reference is not None:
+                raise RuntimeError(
+                    "Cannot discard a RUNNING ingestion run whose canonical "
+                    "evidence is referenced by another run"
+                )
+            connection.execute(
+                """
+                DELETE FROM article_company_links
+                WHERE occurrence_id IN (
+                    SELECT occurrence_id FROM article_ingestions
+                    WHERE ingestion_run_id = ?
+                )
+                """,
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM deduplication_relationships WHERE ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM article_ingestions WHERE ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM normalized_articles WHERE first_ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM raw_source_records WHERE ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM provider_errors WHERE ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM quality_reports WHERE ingestion_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM ingestion_runs WHERE run_id = ?", (identifier,)
+            )
 
     def finalize_run(
         self,
@@ -1579,6 +2949,9 @@ class NewsStorage:
         completed_at: str | datetime | None = None,
         summary: Mapping[str, Any] | None = None,
         error_message: str | None = None,
+        expected_manifest_sha256: str | None = None,
+        expected_inventory_sha256: str | None = None,
+        expected_completion_sha256: str | None = None,
     ) -> None:
         identifier = _safe_id(run_id, field="run_id")
         final_status = str(status).strip().upper()
@@ -1586,7 +2959,12 @@ class NewsStorage:
             raise ValueError("Final run status must be PASS, PARTIAL, or FAIL")
         with self.transaction() as connection:
             current = connection.execute(
-                "SELECT status FROM ingestion_runs WHERE run_id = ?", (identifier,)
+                """
+                SELECT status, sealed_artifact_inventory_sha256,
+                       sealed_manifest_sha256, sealed_completion_sha256
+                FROM ingestion_runs WHERE run_id = ?
+                """,
+                (identifier,),
             ).fetchone()
             if current is None:
                 raise KeyError(f"Unknown ingestion run: {identifier}")
@@ -1594,11 +2972,62 @@ class NewsStorage:
                 raise RuntimeError(f"Ingestion run is already finalized: {identifier}")
             quality = connection.execute(
                 """
-                SELECT quality_status FROM quality_reports
+                SELECT quality_status, report_json FROM quality_reports
                 WHERE ingestion_run_id = ?
                 """,
                 (identifier,),
             ).fetchone()
+            if final_status in {"PASS", "PARTIAL"}:
+                if (
+                    current["sealed_manifest_sha256"] is None
+                    or current["sealed_artifact_inventory_sha256"] is None
+                    or current["sealed_completion_sha256"] is None
+                ):
+                    raise RuntimeError(
+                        f"A {final_status} run must be sealed before finalization"
+                    )
+                expected_digests = (
+                    (
+                        expected_manifest_sha256,
+                        current["sealed_manifest_sha256"],
+                        "manifest",
+                    ),
+                    (
+                        expected_inventory_sha256,
+                        current["sealed_artifact_inventory_sha256"],
+                        "artifact inventory",
+                    ),
+                    (
+                        expected_completion_sha256,
+                        current["sealed_completion_sha256"],
+                        "completion marker",
+                    ),
+                )
+                for expected_digest, sealed_digest, label in expected_digests:
+                    if expected_digest is not None and _sha256(
+                        expected_digest, field=f"expected {label} sha256"
+                    ) != str(sealed_digest):
+                        raise RuntimeError(
+                            f"Expected {label} digest does not match the DB seal"
+                        )
+                snapshot = _run_evidence_snapshot(connection, identifier)
+                if not snapshot["relationship_bijection_valid"]:
+                    raise RuntimeError(
+                        "Every duplicate occurrence must have exactly one matching "
+                        "deduplication relationship"
+                    )
+                if quality is None:
+                    raise RuntimeError(
+                        f"A {final_status} run requires a quality report"
+                    )
+                quality_payload = json.loads(str(quality["report_json"]))
+                if not isinstance(quality_payload, Mapping):
+                    raise RuntimeError("Persisted quality report JSON must be an object")
+                _validate_quality_payload(
+                    str(quality["quality_status"]), quality_payload, snapshot
+                )
+                if summary is not None:
+                    _validate_count_payload(summary, snapshot, label="run summary")
             if final_status == "PASS":
                 if quality is None or quality["quality_status"] != "PASS":
                     raise RuntimeError(
@@ -1664,10 +3093,14 @@ class NewsStorage:
                 """
                 SELECT article_id, canonical_url, content_sha256,
                        title, normalized_title, source_name, published_at,
-                       available_at, fetched_at
-                FROM normalized_articles
-                WHERE duplicate_of IS NULL
-                ORDER BY article_id
+                       available_at, fetched_at, first_ingestion_run_id,
+                       owner.sealed_manifest_sha256 AS owner_manifest_sha256
+                FROM normalized_articles AS article
+                JOIN ingestion_runs AS owner
+                  ON owner.run_id = article.first_ingestion_run_id
+                WHERE article.duplicate_of IS NULL
+                  AND owner.status IN ('PASS', 'PARTIAL')
+                ORDER BY article.article_id
                 """
             ).fetchall()
         return [dict(row) for row in rows]

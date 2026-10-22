@@ -7,7 +7,7 @@ import pytest
 
 from paisa.news.deduplication import deduplicate_articles
 from paisa.news.entity_linking import OGDC_ALIASES, link_ogdc
-from paisa.news.models import NormalizedNewsArticle
+from paisa.news.models import NEWS_SCHEMA_VERSION, NormalizedNewsArticle
 from paisa.news.normalization import content_sha256
 
 
@@ -26,7 +26,7 @@ def article(
     published_at: datetime | None = NOW,
 ) -> NormalizedNewsArticle:
     return NormalizedNewsArticle(
-        schema_version="1.0",
+        schema_version=NEWS_SCHEMA_VERSION,
         article_id=article_id,
         raw_record_id=f"raw-{article_id}",
         provider="fixture",
@@ -146,7 +146,10 @@ def test_title_time_rule_does_not_run_without_publication_time():
 
 
 def test_existing_canonical_articles_participate_in_duplicate_detection():
-    existing = article("existing", canonical_url="https://example.com/story")
+    existing = replace(
+        article("existing", canonical_url="https://example.com/story"),
+        ingestion_run_id="NEWS-20261021-120000-history0",
+    )
     incoming = article("incoming", canonical_url="https://example.com/story")
 
     resolved, relationships = deduplicate_articles(
@@ -154,6 +157,45 @@ def test_existing_canonical_articles_participate_in_duplicate_detection():
     )
     assert resolved[0].duplicate_of == "existing"
     assert relationships[0].canonical_article_id == "existing"
+    assert relationships[0].duplicate_scope == "historical"
+    assert relationships[0].canonical_owner_run_id == existing.ingestion_run_id
+
+
+def test_rule_priority_is_global_across_existing_and_same_run_canonicals():
+    historical = article(
+        "historical",
+        title="Historical hash target",
+        summary="Historical content",
+        canonical_url="https://history.example/story",
+    )
+    historical = replace(
+        historical,
+        ingestion_run_id="NEWS-20261021-120000-history1",
+    )
+    same_run = article(
+        "same-run",
+        title="Same-run URL target",
+        summary="Different local content",
+        canonical_url="https://current.example/shared",
+    )
+    incoming = replace(
+        article(
+            "incoming",
+            title="Incoming",
+            summary="Incoming content",
+            canonical_url="https://current.example/shared",
+        ),
+        content_sha256=historical.content_sha256,
+    )
+
+    resolved, relationships = deduplicate_articles(
+        [same_run, incoming], existing_articles=[historical]
+    )
+
+    assert resolved[1].duplicate_of == same_run.article_id
+    assert relationships[0].rule == "canonical_url"
+    assert relationships[0].duplicate_scope == "within_run"
+    assert relationships[0].canonical_owner_run_id == same_run.ingestion_run_id
 
 
 def test_duplicate_evidence_keeps_distinct_occurrence_identity():

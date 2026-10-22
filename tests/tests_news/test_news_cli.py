@@ -68,7 +68,9 @@ def test_cli_validates_provider_specific_arguments(argv, expected_message, capsy
     assert expected_message in capsys.readouterr().err
 
 
-def test_cli_prints_exactly_one_body_free_summary_and_accepts_partial(monkeypatch, capsys):
+def test_cli_prints_exactly_one_body_free_summary_and_rejects_partial_by_default(
+    monkeypatch, capsys
+):
     module = _load_cli_module()
     monkeypatch.setattr(module, "_build_provider", lambda args: object())
     monkeypatch.setattr(
@@ -81,12 +83,35 @@ def test_cli_prints_exactly_one_body_free_summary_and_accepts_partial(monkeypatc
 
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert exit_code == 0
+    assert exit_code == 1
     assert payload["run_id"] == "NEWS-20261022-093000-cli"
     assert payload["artifact_directory"].endswith("NEWS-20261022-093000-cli")
     assert payload["database_path"].endswith("news.sqlite3")
     assert "body" not in captured.out.lower()
     assert captured.err == ""
+
+
+def test_cli_allows_partial_only_with_explicit_opt_in(monkeypatch, capsys):
+    module = _load_cli_module()
+    monkeypatch.setattr(module, "_build_provider", lambda args: object())
+    monkeypatch.setattr(
+        module,
+        "run_news_pipeline",
+        lambda *args, **kwargs: _summary(status="PARTIAL"),
+    )
+
+    exit_code = module.main(
+        [
+            "--provider",
+            "manual-csv",
+            "--input",
+            "news.csv",
+            "--allow-partial",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["run_status"] == "PARTIAL"
 
 
 def test_cli_returns_nonzero_for_failed_summary(monkeypatch, capsys):
@@ -150,6 +175,8 @@ def test_manual_csv_cli_end_to_end_emits_summary_and_artifact_locations(tmp_path
             str(output_root),
             "--database",
             str(database),
+            "--storage-root",
+            str(tmp_path),
             "--run-id",
             run_id,
         ],
@@ -167,8 +194,8 @@ def test_manual_csv_cli_end_to_end_emits_summary_and_artifact_locations(tmp_path
     assert payload["raw_record_count"] == 1
     assert payload["normalized_record_count"] == 1
     assert payload["ogdc_linked_article_count"] == 1
-    assert payload["artifact_directory"] == str(output_root / run_id)
-    assert payload["database_path"] == str(database)
+    assert payload["artifact_directory"] == f"artifacts/{run_id}"
+    assert payload["database_path"] == "news.sqlite3"
     assert "Permitted dataset body" not in completed.stdout
     assert completed.stderr == ""
     assert (output_root / run_id / "run_manifest.json").is_file()

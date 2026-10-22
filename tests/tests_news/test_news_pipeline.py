@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -12,7 +13,13 @@ import sqlite3
 import pytest
 
 import paisa.news.pipeline as news_pipeline
-from paisa.news.models import ProviderFetchResult, RawCapture, RawNewsRecord
+from paisa.news.models import (
+    NEWS_SCHEMA_VERSION,
+    NormalizedNewsArticle,
+    ProviderFetchResult,
+    RawCapture,
+    RawNewsRecord,
+)
 from paisa.news.pipeline import (
     NewsRunCollisionError,
     NewsRunFinalizationError,
@@ -21,10 +28,18 @@ from paisa.news.pipeline import (
     validate_news_run_id,
 )
 from paisa.news.storage import DATABASE_SCHEMA_VERSION, NewsStorage
+from paisa.news.verification import verify_news_run
 
 
 STARTED = datetime(2026, 10, 22, 10, 0, tzinfo=timezone.utc)
 CAPTURE_BYTES = b"permitted captured feed bytes\n"
+
+
+@pytest.fixture(autouse=True)
+def _trusted_storage_root_is_each_test_workspace(tmp_path, monkeypatch):
+    """Keep implicit storage-root cases inside their isolated workspace."""
+
+    monkeypatch.chdir(tmp_path)
 
 
 class StaticRealProvider:
@@ -252,6 +267,43 @@ class SecretMetadataProvider(StaticRealProvider):
         )
 
 
+class QueryValueMetadataProvider(StaticRealProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.secret_url = (
+            "https://publisher.example/feed.xml?session=UNNAMEDSECRET&view=full"
+        )
+        self.configured_sources = (
+            {
+                "source_id": "query-value-source",
+                "url": self.secret_url,
+                "note": f"configured from {self.secret_url}",
+            },
+        )
+
+    def fetch(self, *, fetched_at=None) -> ProviderFetchResult:
+        result = super().fetch(fetched_at=fetched_at)
+        return replace(
+            result,
+            captures=(
+                replace(
+                    result.captures[0],
+                    configured_source=self.secret_url,
+                    warnings=(f"capture source {self.secret_url}",),
+                ),
+            ),
+            records=(
+                replace(
+                    result.records[0],
+                    configured_source=self.secret_url,
+                    source_url=self.secret_url,
+                    raw_payload={"reference": f"record source {self.secret_url}"},
+                    provider_warnings=(f"record source {self.secret_url}",),
+                ),
+            ),
+        )
+
+
 def _load_cli_module():
     root = Path(__file__).resolve().parents[2]
     script = root / "scripts" / "run_news_pipeline.py"
@@ -264,6 +316,42 @@ def _load_cli_module():
 
 def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalized_article(
+    article_id: str,
+    *,
+    canonical_url: str,
+    content_sha256: str,
+    run_id: str = "NEWS-20261022-100000-current",
+) -> NormalizedNewsArticle:
+    return NormalizedNewsArticle(
+        schema_version=NEWS_SCHEMA_VERSION,
+        article_id=article_id,
+        raw_record_id=f"raw-{article_id}",
+        provider="test",
+        source_name="Publisher",
+        source_type="rss",
+        source_url=canonical_url,
+        canonical_url=canonical_url,
+        title=f"Title {article_id}",
+        summary="Substantive summary",
+        body=None,
+        published_at=STARTED,
+        published_timezone="UTC",
+        available_at=STARTED,
+        fetched_at=STARTED,
+        language="en",
+        mentioned_tickers=(),
+        mentioned_companies=(),
+        mentioned_sectors=(),
+        content_sha256=content_sha256,
+        duplicate_of=None,
+        ingestion_run_id=run_id,
+        raw_artifact_reference=f"raw/{article_id}.json",
+        normalization_warnings=(),
+        data_class="real",
+    )
 
 
 def test_run_ids_have_timestamp_format_and_are_unique():
@@ -310,6 +398,8 @@ def test_complete_artifact_tree_inventory_and_raw_preservation(tmp_path):
         "provider_errors.json",
         "quality_report.json",
         "final_summary.json",
+        "deduplication_context.json",
+        "completion.json",
     }
     actual = {
         path.relative_to(run_dir).as_posix()
@@ -333,7 +423,9 @@ def test_complete_artifact_tree_inventory_and_raw_preservation(tmp_path):
     assert manifest["finalization_state"] == "COMMITTED"
     assert manifest["database"]["schema_version"] == DATABASE_SCHEMA_VERSION
     inventory = manifest["artifact_inventory"]
-    assert [entry["path"] for entry in inventory] == sorted(actual - {"run_manifest.json"})
+    assert [entry["path"] for entry in inventory] == sorted(
+        actual - {"run_manifest.json", "final_summary.json", "completion.json"}
+    )
     for entry in inventory:
         path = run_dir / entry["path"]
         assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
@@ -574,6 +666,35 @@ def test_credentials_in_success_metadata_are_redacted_everywhere(tmp_path):
     assert "[REDACTED]" in combined
 
 
+def test_all_url_query_values_are_redacted_from_artifacts_and_database(tmp_path):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-query-value-redaction"
+
+    summary = run_news_pipeline(
+        QueryValueMetadataProvider(),
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+
+    assert summary.run_status == "PASS"
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in (output / run_id).rglob("*")
+        if path.is_file()
+    )
+    with sqlite3.connect(database) as connection:
+        database_text = "\n".join(connection.iterdump())
+    combined = artifact_text + database_text
+    assert "UNNAMEDSECRET" not in combined
+    assert "view=full" not in combined
+    assert "publisher.example/feed.xml" in combined
+    assert "session=%5BREDACTED%5D" in combined
+    assert "view=%5BREDACTED%5D" in combined
+
+
 @pytest.mark.parametrize(
     "provider, expected_message",
     [
@@ -620,6 +741,8 @@ def test_cli_reports_controlled_provider_failure_as_nonzero(tmp_path, monkeypatc
             str(tmp_path / "artifacts"),
             "--database",
             str(tmp_path / "news.sqlite3"),
+            "--storage-root",
+            str(tmp_path),
             "--run-id",
             run_id,
         ]
@@ -690,6 +813,40 @@ def test_cross_run_dedup_preserves_both_evidence_occurrences(tmp_path):
         "article_ingestions": 2,
         "deduplication_relationships": 1,
     }
+
+
+def test_global_dedup_rule_precedence_beats_historical_source_precedence(tmp_path):
+    local = _normalized_article(
+        "NEWS-local",
+        canonical_url="https://publisher.example/shared-story",
+        content_sha256="local-content",
+    )
+    incoming = _normalized_article(
+        "NEWS-incoming",
+        canonical_url="https://publisher.example/shared-story",
+        content_sha256="historical-content",
+    )
+    historical = {
+        "article_id": "NEWS-historical",
+        "first_ingestion_run_id": "NEWS-20261021-100000-historical",
+        "canonical_url": "https://archive.example/different-story",
+        "content_sha256": "historical-content",
+        "title": "Different title",
+        "source_name": "Archive",
+        "published_at": STARTED.isoformat(),
+    }
+
+    resolved, relationships = news_pipeline._deduplicate_with_storage(
+        NewsStorage(tmp_path / "unused.sqlite3"),
+        [local, incoming],
+        existing_candidates=[historical],
+    )
+
+    assert resolved[1].duplicate_of == local.article_id
+    assert len(relationships) == 1
+    assert relationships[0].canonical_article_id == local.article_id
+    assert relationships[0].rule == "canonical_url"
+    assert relationships[0].duplicate_scope == "within_run"
 
 
 def test_cross_run_title_source_minute_rule_matches_with_case_normalization(tmp_path):
@@ -817,11 +974,12 @@ def test_database_finalization_failure_can_never_leave_pass_artifacts(
     run_dir = output / run_id
     summary = _read_json(run_dir / "final_summary.json")
     manifest = _read_json(run_dir / "run_manifest.json")
-    assert summary["run_status"] == "FAIL"
-    assert summary["finalization_state"] == "DATABASE_FINALIZATION_FAILED"
-    assert manifest["status"] == "FAIL"
-    assert manifest["finalization_state"] == "DATABASE_FINALIZATION_FAILED"
-    assert "simulated durable finalization failure" in manifest["finalization_error"]
+    assert summary["run_status"] == "PENDING"
+    assert summary["finalization_state"] == "PENDING_DATABASE_FINALIZATION"
+    assert manifest["status"] == "PENDING"
+    assert manifest["finalization_state"] == "PENDING_DATABASE_FINALIZATION"
+    assert not (run_dir / "completion.json").exists()
+    assert (run_dir / news_pipeline._FINALIZATION_JOURNAL).is_file()
     with sqlite3.connect(database) as connection:
         status = connection.execute(
             "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
@@ -856,7 +1014,7 @@ def test_committed_manifest_write_failure_is_pending_and_idempotently_recovered(
         "_atomic_write_json",
         fail_first_committed_manifest,
     )
-    with pytest.raises(NewsRunFinalizationError, match="can be retried safely"):
+    with pytest.raises(NewsRunFinalizationError, match="publication is pending"):
         run_news_pipeline(
             provider,
             output_dir=output,
@@ -870,14 +1028,15 @@ def test_committed_manifest_write_failure_is_pending_and_idempotently_recovered(
     pending_summary = _read_json(run_dir / "final_summary.json")
     assert provider.calls == 1
     assert manifest["status"] == "PENDING"
-    assert manifest["finalization_state"] == "ARTIFACT_COMMIT_RETRY_REQUIRED"
-    assert pending_summary["run_status"] == "PENDING"
+    assert manifest["finalization_state"] == "PENDING_DATABASE_FINALIZATION"
+    assert pending_summary["run_status"] == "PASS"
+    assert not (run_dir / "completion.json").exists()
     assert (run_dir / news_pipeline._FINALIZATION_JOURNAL).is_file()
     with sqlite3.connect(database) as connection:
         database_status = connection.execute(
             "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
-    assert database_status == "RUNNING"
+    assert database_status == "PASS"
 
     monkeypatch.setattr(
         news_pipeline,
@@ -918,44 +1077,34 @@ def test_committed_manifest_write_failure_is_pending_and_idempotently_recovered(
     assert provider.calls == 1
 
 
-def test_database_and_failure_marker_errors_retain_recovery_journal(
+def test_completion_marker_error_retains_journal_until_idempotent_recovery(
     tmp_path, monkeypatch
 ):
     output = tmp_path / "artifacts"
     database = tmp_path / "news.sqlite3"
     run_id = "NEWS-20261022-100000-compensation-recovery"
     provider = StaticRealProvider()
-    original_finalize = NewsStorage.finalize_run
     original_atomic_write = news_pipeline._atomic_write_json
-    finalize_injected = False
     marker_injected = False
 
-    def fail_first_database_finalization(self, *args, **kwargs):
-        nonlocal finalize_injected
-        if not finalize_injected:
-            finalize_injected = True
-            raise OSError("simulated database finalization failure")
-        return original_finalize(self, *args, **kwargs)
-
-    def fail_first_database_failure_manifest(path, value):
+    def fail_first_completion_marker(path, value):
         nonlocal marker_injected
         if (
             not marker_injected
-            and path.name == "run_manifest.json"
+            and path.name == "completion.json"
             and isinstance(value, dict)
-            and value.get("finalization_state") == "DATABASE_FINALIZATION_FAILED"
+            and value.get("finalization_state") == "COMMITTED"
         ):
             marker_injected = True
-            raise OSError("simulated failure-marker write failure")
+            raise OSError("simulated completion-marker write failure")
         return original_atomic_write(path, value)
 
-    monkeypatch.setattr(NewsStorage, "finalize_run", fail_first_database_finalization)
     monkeypatch.setattr(
         news_pipeline,
         "_atomic_write_json",
-        fail_first_database_failure_manifest,
+        fail_first_completion_marker,
     )
-    with pytest.raises(NewsRunFinalizationError, match="journal was retained"):
+    with pytest.raises(NewsRunFinalizationError, match="publication is pending"):
         run_news_pipeline(
             provider,
             output_dir=output,
@@ -967,18 +1116,15 @@ def test_database_and_failure_marker_errors_retain_recovery_journal(
     run_dir = output / run_id
     assert provider.calls == 1
     assert (run_dir / news_pipeline._FINALIZATION_JOURNAL).is_file()
-    assert (
-        _read_json(run_dir / "run_manifest.json")["finalization_state"]
-        == "ARTIFACT_COMMIT_RETRY_REQUIRED"
-    )
-    assert _read_json(run_dir / "final_summary.json")["run_status"] == "PENDING"
+    assert not (run_dir / "completion.json").exists()
+    assert _read_json(run_dir / "run_manifest.json")["status"] == "PASS"
+    assert _read_json(run_dir / "final_summary.json")["run_status"] == "PASS"
     with sqlite3.connect(database) as connection:
         pending_database_status = connection.execute(
             "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
-    assert pending_database_status == "RUNNING"
+    assert pending_database_status == "PASS"
 
-    monkeypatch.setattr(NewsStorage, "finalize_run", original_finalize)
     monkeypatch.setattr(
         news_pipeline,
         "_atomic_write_json",
@@ -1001,3 +1147,416 @@ def test_database_and_failure_marker_errors_retain_recovery_journal(
             "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
     assert final_database_status == "PASS"
+
+
+def _leave_run_pending_at_database_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    suffix: str,
+) -> tuple[Path, Path, str, StaticRealProvider]:
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = f"NEWS-20261022-100000-{suffix}"
+    provider = StaticRealProvider()
+    original_finalize = NewsStorage.finalize_run
+
+    def interrupt_finalization(self, *args, **kwargs):
+        raise KeyboardInterrupt("simulated interruption before SQLite commit")
+
+    monkeypatch.setattr(NewsStorage, "finalize_run", interrupt_finalization)
+    with pytest.raises(KeyboardInterrupt):
+        run_news_pipeline(
+            provider,
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+    monkeypatch.setattr(NewsStorage, "finalize_run", original_finalize)
+    return output / run_id, database, run_id, provider
+
+
+def test_database_interrupt_keeps_public_markers_pending_until_commit(
+    tmp_path, monkeypatch
+):
+    run_dir, database, run_id, provider = _leave_run_pending_at_database_finalization(
+        tmp_path,
+        monkeypatch,
+        suffix="database-interrupt",
+    )
+
+    assert not (run_dir / "completion.json").exists()
+    assert _read_json(run_dir / "run_manifest.json")["status"] == "PENDING"
+    assert _read_json(run_dir / "final_summary.json")["run_status"] == "PENDING"
+    assert (run_dir / news_pipeline._FINALIZATION_JOURNAL).is_file()
+
+    recovered = run_news_pipeline(
+        provider,
+        output_dir=run_dir.parent,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+
+    assert recovered.run_status == "PASS"
+    assert provider.calls == 1
+    assert (run_dir / "completion.json").is_file()
+    assert _read_json(run_dir / "run_manifest.json")["status"] == "PASS"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == "PASS"
+
+
+def test_provider_keyboard_interrupt_cleans_unsealed_state_and_same_id_retries(
+    tmp_path,
+):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-provider-interrupt"
+
+    class InterruptingProvider(StaticRealProvider):
+        def fetch(self, *, fetched_at=None):
+            self.calls += 1
+            raise KeyboardInterrupt("simulated provider interruption")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_news_pipeline(
+            InterruptingProvider(),
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    assert not (output / run_id).exists()
+    assert NewsStorage(database).initialize().get_run(run_id) is None
+
+    retried = run_news_pipeline(
+        StaticRealProvider(),
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+    assert retried.run_status == "PASS"
+
+
+def test_reservation_write_failure_releases_lock_and_run_directory(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-reservation-write-failure"
+    original_write_json = news_pipeline._atomic_write_json
+    failed = False
+
+    def fail_first_run_state_write(path, payload):
+        nonlocal failed
+        if path.name == ".run-state.json" and not failed:
+            failed = True
+            raise OSError("simulated reservation metadata failure")
+        return original_write_json(path, payload)
+
+    monkeypatch.setattr(
+        news_pipeline, "_atomic_write_json", fail_first_run_state_write
+    )
+
+    with pytest.raises(OSError, match="reservation metadata failure"):
+        run_news_pipeline(
+            StaticRealProvider(),
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    assert not (output / run_id).exists()
+    summary = run_news_pipeline(
+        StaticRealProvider(),
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+    assert summary.run_status == "PASS"
+
+
+def test_hard_crash_reservation_without_database_row_is_reacquired(tmp_path):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-abandoned-reservation"
+    run_dir = output / run_id
+    pending = run_dir / ".pending-abandoned"
+    (pending / "raw").mkdir(parents=True)
+    news_pipeline._write_json(
+        run_dir / ".run-state.json",
+        {
+            "schema_version": news_pipeline.NEWS_SCHEMA_VERSION,
+            "run_id": run_id,
+            "state": "RESERVED",
+            "started_at": STARTED.isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    summary = run_news_pipeline(
+        StaticRealProvider(),
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+
+    assert summary.run_status == "PASS"
+    assert (run_dir / "completion.json").is_file()
+
+
+def test_committed_run_with_stale_controls_is_verified_and_cleaned(tmp_path):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-committed-cleanup"
+    run_dir = output / run_id
+    first_provider = StaticRealProvider()
+    expected = run_news_pipeline(
+        first_provider,
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+    news_pipeline._write_json(
+        run_dir / ".run-state.json",
+        {
+            "schema_version": NEWS_SCHEMA_VERSION,
+            "run_id": run_id,
+            "state": "RESERVED",
+            "started_at": STARTED.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    (run_dir / ".run.lock").write_bytes(b"")
+    retry_provider = StaticRealProvider()
+
+    recovered = run_news_pipeline(
+        retry_provider,
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+
+    assert recovered.to_dict() == expected.to_dict()
+    assert retry_provider.calls == 0
+    assert not (run_dir / ".run-state.json").exists()
+    # A pre-existing lock inode is deliberately retained after unlocking;
+    # unlinking it while held would allow a second process to lock a new inode.
+    assert (run_dir / ".run.lock").is_file()
+    assert verify_news_run(
+        run_dir, database_path=database
+    ).database_verified is True
+
+
+def test_committed_cleanup_rejects_tampered_artifacts(tmp_path):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-committed-cleanup-tamper"
+    run_dir = output / run_id
+    run_news_pipeline(
+        StaticRealProvider(),
+        output_dir=output,
+        database_path=database,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+    news_pipeline._write_json(
+        run_dir / ".run-state.json",
+        {
+            "schema_version": NEWS_SCHEMA_VERSION,
+            "run_id": run_id,
+            "state": "RESERVED",
+            "started_at": STARTED.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    (run_dir / ".run.lock").write_bytes(b"")
+    (run_dir / "normalized_articles.csv").write_text(
+        "tampered\n", encoding="utf-8"
+    )
+    retry_provider = StaticRealProvider()
+
+    with pytest.raises(NewsRunFinalizationError, match="sealed artifact"):
+        run_news_pipeline(
+            retry_provider,
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    assert retry_provider.calls == 0
+    assert (run_dir / ".run-state.json").is_file()
+    assert (run_dir / ".run.lock").is_file()
+
+
+@pytest.mark.parametrize("tamper", ("wrong-run-id", "extra-root-file", "staging-link"))
+def test_invalid_abandoned_reservation_is_preserved_as_collision(tmp_path, tamper):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = f"NEWS-20261022-100000-invalid-reservation-{tamper}"
+    run_dir = output / run_id
+    pending = run_dir / ".pending-abandoned"
+    run_dir.mkdir(parents=True)
+    if tamper == "staging-link":
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "do-not-delete.txt").write_text("preserve\n", encoding="utf-8")
+        pending.symlink_to(external, target_is_directory=True)
+    else:
+        (pending / "raw").mkdir(parents=True)
+    news_pipeline._write_json(
+        run_dir / ".run-state.json",
+        {
+            "schema_version": news_pipeline.NEWS_SCHEMA_VERSION,
+            "run_id": "NEWS-20261022-100000-other"
+            if tamper == "wrong-run-id"
+            else run_id,
+            "state": "RESERVED",
+            "started_at": STARTED.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    if tamper == "extra-root-file":
+        (run_dir / "unowned.txt").write_text("preserve\n", encoding="utf-8")
+
+    with pytest.raises(NewsRunCollisionError, match="reservation"):
+        run_news_pipeline(
+            StaticRealProvider(),
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    assert run_dir.exists()
+    if tamper == "extra-root-file":
+        assert (run_dir / "unowned.txt").read_text(encoding="utf-8") == "preserve\n"
+    if tamper == "staging-link":
+        assert (pending / "do-not-delete.txt").read_text(encoding="utf-8") == "preserve\n"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("missing", "modified", "external_symlink", "extra", "special_file"),
+)
+def test_recovery_rejects_any_change_to_the_sealed_artifact_set(
+    tmp_path, monkeypatch, tamper
+):
+    run_dir, database, run_id, provider = _leave_run_pending_at_database_finalization(
+        tmp_path,
+        monkeypatch,
+        suffix=f"sealed-{tamper.replace('_', '-')}",
+    )
+    normalized = run_dir / "normalized_articles.csv"
+    if tamper == "missing":
+        normalized.unlink()
+    elif tamper == "modified":
+        normalized.write_text("tampered\n", encoding="utf-8")
+    elif tamper == "external_symlink":
+        external = tmp_path / "external.csv"
+        external.write_text(normalized.read_text(encoding="utf-8"), encoding="utf-8")
+        normalized.unlink()
+        normalized.symlink_to(external)
+    elif tamper == "extra":
+        (run_dir / "unexpected.txt").write_text("extra\n", encoding="utf-8")
+    else:
+        os.mkfifo(run_dir / "unexpected.fifo")
+
+    with pytest.raises(NewsRunFinalizationError, match="artifact|sealed|inventory"):
+        run_news_pipeline(
+            provider,
+            output_dir=run_dir.parent,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    assert provider.calls == 1
+    assert not (run_dir / "completion.json").exists()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == "RUNNING"
+
+
+def test_finalization_rejects_export_that_disagrees_with_sqlite(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "artifacts"
+    database = tmp_path / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-artifact-db-mismatch"
+    original_save_quality = NewsStorage.save_quality
+
+    def save_quality_then_corrupt_occurrence(self, *args, **kwargs):
+        original_save_quality(self, *args, **kwargs)
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE article_ingestions
+                SET normalized_payload_json = json_set(
+                    normalized_payload_json, '$.title', 'contradictory DB title'
+                )
+                WHERE ingestion_run_id = ?
+                """,
+                (run_id,),
+            )
+
+    monkeypatch.setattr(
+        NewsStorage, "save_quality", save_quality_then_corrupt_occurrence
+    )
+    with pytest.raises(NewsRunFinalizationError, match="does not match SQLite"):
+        run_news_pipeline(
+            StaticRealProvider(),
+            output_dir=output,
+            database_path=database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    run_dir = output / run_id
+    assert not (run_dir / "completion.json").exists()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT status FROM ingestion_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == "RUNNING"
+
+
+def test_pipeline_storage_paths_are_root_contained_and_portable(
+    tmp_path, monkeypatch
+):
+    storage_root = tmp_path / "workspace"
+    storage_root.mkdir()
+    monkeypatch.chdir(storage_root)
+    outside_database = tmp_path / "outside" / "news.sqlite3"
+    run_id = "NEWS-20261022-100000-root-containment"
+
+    with pytest.raises(ValueError, match="storage root"):
+        run_news_pipeline(
+            StaticRealProvider(),
+            output_dir=storage_root / "artifacts",
+            database_path=outside_database,
+            run_id=run_id,
+            started_at=STARTED,
+        )
+
+    summary = run_news_pipeline(
+        StaticRealProvider(),
+        output_dir=storage_root / "artifacts",
+        database_path=outside_database,
+        storage_root=storage_root,
+        allow_external_storage=True,
+        run_id=run_id,
+        started_at=STARTED,
+    )
+
+    assert not Path(summary.artifact_directory).is_absolute()
+    assert not Path(summary.database_path).is_absolute()
+    serialized = json.dumps(summary.to_dict(), sort_keys=True)
+    assert str(tmp_path) not in serialized

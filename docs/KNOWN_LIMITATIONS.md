@@ -114,10 +114,13 @@ RSS history and fields depend on each configured publisher. The foundation is
 an explicit command, not a scheduler, and it does not crawl linked pages for
 missing bodies. Manual CSV data is imported evidence, not live acquisition.
 The first-stage entity linker recognizes controlled OGDC aliases only; it is
-not general NER and does not infer sectors or events. RSS requests have a
-finite timeout but the first adapter does not yet impose an explicit response
-byte limit before buffering a publisher feed; only reviewed feed endpoints
-should be configured until streaming limits are added.
+not general NER and does not infer sectors or events. RSS acquisition is
+streamed with compressed/decoded byte, XML depth/element, entry, field, and
+total-time limits; DTD/entities and non-public destinations are rejected by
+default. These controls reduce resource-exhaustion and SSRF risk but do not
+establish a publisher's reliability, completeness, licensing, or long-term
+availability. The explicit private-network source opt-in is for reviewed
+deployments only.
 
 ### No knowledge graph yet
 
@@ -145,11 +148,12 @@ multi-user tenancy, backup/restore service, scheduled ingestion, or production
 observability. Local artifact availability and integrity are prerequisites for
 the API and dashboard.
 
-News-run marker replacement is atomic and has a retry journal, but the local
-prototype does not `fsync` files and directories for power-loss durability. A
-permanent SQLite finalization failure is represented truthfully as `FAIL` in
-the artifact markers, but its database row may remain `RUNNING` and require
-operator reconciliation. This is not a production transaction coordinator.
+News-run marker replacement is atomic and has a sealed retry journal, but the
+local prototype does not `fsync` files and directories for power-loss
+durability. Public markers remain pending until the database commits; a final
+completion marker is published last, and recovery fails closed if the sealed
+artifact set changed. A permanent storage failure can retain a pending sealed
+run for an explicit retry. This is not a production transaction coordinator.
 
 ### No broker integration
 

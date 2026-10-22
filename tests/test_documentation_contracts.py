@@ -264,3 +264,29 @@ def test_project_context_prominently_marks_superseded_status() -> None:
     assert "](docs/CURRENT_IMPLEMENTATION_STATUS.md)" in context
     assert "## Historical implementation status: PAISA v0 (superseded)" in context
     assert "## Current implementation status: PAISA v0" not in context
+
+
+def test_sentiment_status_docs_disclose_zero_price_date_overlap() -> None:
+    for relative_path in (
+        "docs/FINBERT_SENTIMENT.md",
+        "docs/CURRENT_IMPLEMENTATION_STATUS.md",
+        "RUN_FROM_GITHUB.md",
+    ):
+        document = _normalized(_read(relative_path))
+
+        assert "october 19--22, 2026" in document
+        assert "september 15, 2026" in document
+        assert "zero overlapping dates" in document
+        assert "combined" in document
+        assert "portfolio conclusion" in document
+        assert "overlapping historical news corpus" in document
+
+
+def test_time_alignment_documents_current_same_url_correction_limit() -> None:
+    document = _normalized(_read("docs/SENTIMENT_TIME_ALIGNMENT.md"))
+
+    assert "canonical url has deduplication priority" in document
+    assert "same-url corrections are currently unsupported" in document
+    assert "ignored as an independent sentiment input" in document
+    assert "neither a versioned correction identity nor its own sentiment result" in document
+    assert "with their own `available_at`" in document

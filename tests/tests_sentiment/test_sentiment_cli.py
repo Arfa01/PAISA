@@ -77,3 +77,36 @@ def test_cli_rejects_token_lengths_above_model_limit():
         cli.parse_args(_arguments("--max-token-length", "513"))
 
     assert error.value.code == 2
+
+
+def test_cli_requires_exact_run_id_for_stale_discard():
+    cli = _load_cli()
+
+    with pytest.raises(SystemExit) as error:
+        cli.parse_args(
+            [
+                "--source-run-id",
+                "NEWS-20261022-131242-5ddffd2d",
+                "--discard-stale-running",
+            ]
+        )
+
+    assert error.value.code == 2
+
+
+def test_cli_passes_explicit_stale_discard_to_pipeline(monkeypatch, capsys):
+    cli = _load_cli()
+    observed = {}
+    summary = SimpleNamespace(
+        status="PASS",
+        to_dict=lambda: {"schema_version": "1.0", "status": "PASS"},
+    )
+
+    def run(**kwargs):
+        observed.update(kwargs)
+        return summary
+
+    monkeypatch.setattr(cli, "run_sentiment_inference", run)
+    assert cli.main(_arguments("--discard-stale-running")) == 0
+    assert observed["discard_stale_running"] is True
+    capsys.readouterr()

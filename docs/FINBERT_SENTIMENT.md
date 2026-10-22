@@ -42,6 +42,15 @@ the tensor index has that order. The predicted label is the canonical label
 with the greatest mapped probability, and the predicted probability is that
 same value.
 
+The production loader also requires the reviewed SHA-256 values for
+`config.json`, `model.safetensors`, `tokenizer_config.json`, `vocab.txt`, and
+`special_tokens_map.json`. It verifies the resolved regular files, copies only
+those five files into a private clean directory, and loads both model and
+tokenizer from that directory so extra cache files (for example,
+`added_tokens.json`) cannot affect inference. It verifies the isolated bytes
+again after construction and binds the full inventory into the model-revision
+ID and sealed run evidence.
+
 ## Installation
 
 The transformer runtime is deliberately separate from the default PAISA
@@ -74,8 +83,9 @@ An article without a usable title is rejected. English language tags (`en` and
 language evidence is recorded as a structured skip/error rather than guessed.
 The policy applies the configured maximum character limit deterministically,
 then the pinned tokenizer applies the configured maximum token length. Selected
-field names, the input SHA-256, character count, token count, limits, and
-truncation state are persisted. The selected text itself is not duplicated in
+field names, the input SHA-256, character counts, pre-truncation token count,
+post-limit non-padding attention-mask count, explicit `right` truncation side,
+limits, flags, and warnings are persisted. The selected text itself is not duplicated in
 the sentiment artifacts or SQLite. The persisted effective policy identity also
 contains both bounds—for example,
 `title-summary-body-fallback-v1-chars4000-tokens512`—so changing either limit
@@ -125,6 +135,21 @@ model download/load failure returns non-zero, records a structured failure, and
 does not fall back to another classifier. The command prints only a body-free
 structured summary; it never prints article bodies or selected full input text.
 
+If a process was interrupted before finalization, its `RUNNING` output is not
+eligible for reuse. After confirming that no process still owns it, retry the
+same ID explicitly:
+
+```bash
+python scripts/run_sentiment_inference.py \
+  --source-run-id NEWS-20261022-131242-5ddffd2d \
+  --run-id SENT-YYYYMMDD-HHMMSS-xxxxxxxx \
+  --discard-stale-running
+```
+
+The discard is an atomic SQLite operation scoped to that exact unfinished ID;
+it cannot delete a finalized run. A different run ID fails rather than treating
+an unfinished owner's rows as trusted idempotent output.
+
 ## Run artifacts
 
 Each invocation publishes an immutable directory:
@@ -154,10 +179,13 @@ publication itself fails after the SQLite commit, the checksum-bound pack
 remains at the private, deterministic `.SENT-....staging` path. Repeating the
 command with that exact run ID validates the two database-bound seals, full
 file inventory, database identity, status, completion timestamp, provenance,
-configuration, and safety flags, then publishes without rerunning inference.
+configuration, input/output associations, and safety flags, then publishes
+without rerunning inference.
 Any mismatch refuses publication. The audit sample is a deterministic, small
 selection of article references, permitted titles, probabilities, labels,
-OGDC linkage, and timing. It is an inspection aid, not labelled ground truth.
+OGDC linkage, timing, selected fields, limits, before/after counts, explicit
+truncation side, flags, and warnings. It is an inspection aid, not labelled
+ground truth.
 
 The quality report includes requested, scored, skipped, and failed counts;
 canonical label counts; mean probabilities; truncation and title-only counts;
@@ -190,14 +218,18 @@ OGDC-linked article, from one short Dawn Business RSS snapshot. All 30 retained
 canonical inputs carry `en-us` language evidence. The accepted ingestion
 manifest and artifact pack record the schema version at ingestion completion:
 version `3`. Those historical artifacts are unchanged and still predate the
-schema-4 sealing evidence and current schema-5 layout.
+schema-4 sealing evidence, the schema-5 sentiment tables, and the current
+schema-6 certification contract.
 
 Before sentiment execution, the working `data/news/paisa_news.sqlite3` also
 used schema version `3`. The migration recognized only that exact legacy
 signature, verified that every retained row met the later constraints,
 transactionally rebuilt the three affected base tables, and advanced through
-schema 4 to schema 5. The working database is now schema version `5`; any other
-drift or invalid row would have been rejected. An ignored, uncommitted
+schema 4 to schema 5. The retained reference run below was produced at schema
+version `5`. Current code advances a verified database to schema version `6`
+for model-file identity, truncation evidence, run associations, and certified
+finalization; migration preconditions are evaluated while holding the write
+lock. Any other drift or invalid row is rejected. An ignored, uncommitted
 pre-migration copy remains at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`; it was verified
 at schema version `3` with `31` canonical articles, `150` article occurrences,
@@ -227,10 +259,17 @@ Git and are not committed.
 | Model and tokenizer revision | `0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` |
 | Device / duration | `cpu / 7.116756208240986 seconds` |
 | Runtime | Python `3.13.7`; PyTorch `2.10.0`; Transformers `5.20.2`; Tokenizers `0.23.3`; Hugging Face Hub `1.32.0`; Safetensors `0.8.0` |
-| Database schema after migration | `5` |
+| Database schema for the retained reference run | `5` (current code target: `6`) |
 | Artifact directory | `artifacts/sentiment_inference/SENT-20261022-172211-real0002` |
 
 Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+
+The retained sentiment evidence covers October 19--22, 2026, while the retained
+OGDC price evidence ends on September 15, 2026: there are **zero overlapping
+dates**. No joined price-plus-sentiment observation can currently be
+constructed, so this run cannot support a combined experiment or portfolio
+conclusion. An overlapping historical news corpus is required before any
+price-plus-sentiment research stage can run.
 
 This short, single-publisher snapshot is not sufficient for stock-model
 integration or a price-only versus price-plus-sentiment comparison. It cannot

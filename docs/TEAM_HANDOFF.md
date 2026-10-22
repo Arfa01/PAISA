@@ -142,7 +142,9 @@ evidence, stock models, policy, portfolios, API, or dashboard.
 The retained real execution is `SENT-20261022-172211-real0002`, sourced from
 `NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
 `7.116756208240986` seconds against a preserved schema-3 database copy, which
-migrated to schema version `5`.
+migrated to schema version `5` for that retained execution. Current code
+advances a verified database to schema `6` for sentiment evidence
+certification.
 It requested and scored all `30` unique canonical articles, with `0` skipped,
 `0` failed, and `any_articles_failed=false`; one scored article was OGDC-linked.
 The label counts were `negative=11`, `neutral=9`, and `positive=10`; `17`
@@ -161,12 +163,14 @@ The short single-publisher snapshot is insufficient for stock-model integration.
 
 At ingestion completion, the accepted manifest and artifact pack recorded
 schema version `3`; those artifacts remain historical and predate the schema-4
-sealing evidence and current schema-5 layout. Before sentiment execution, the
+sealing evidence, the schema-5 sentiment tables, and the current schema-6
+certification contract. Before sentiment execution, the
 working `data/news/paisa_news.sqlite3` also used schema version `3`. The
 compatibility migration accepted only that exact known signature, validated
 the affected rows, transactionally restored the later constraints, verified
-integrity, and advanced through schema 4 to schema 5. The working database is
-now schema version `5`.
+integrity, and advanced through schema 4 to schema 5 for the retained run.
+Current code then advances verified storage to schema `6`; validation and DDL
+remain under one write lock.
 
 The ignored, uncommitted pre-migration copy
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3` was verified as

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from paisa.sentiment.inference import (
     SentimentInferenceConfig,
     iter_article_sentiment,
@@ -34,6 +36,8 @@ def test_cpu_inference_with_mock_backend_emits_stable_schema(
         "character_count",
         "original_character_count",
         "tokenizer_token_count",
+        "final_token_count",
+        "truncation_side",
         "truncation_applied",
         "character_truncation_applied",
         "token_truncation_applied",
@@ -109,8 +113,30 @@ def test_token_and_character_truncation_metadata_are_combined(
     assert result.truncation_applied is True
     assert result.character_truncation_applied is True
     assert result.token_truncation_applied is True
+    assert result.final_token_count == 3
+    assert result.tokenizer_token_count > result.final_token_count
+    assert result.truncation_side == "right"
     assert "input_character_truncated" in result.warning_codes
     assert "input_token_truncated" in result.warning_codes
+
+
+def test_article_sentiment_rejects_unobserved_post_limit_token_count(
+    article, mock_backend
+):
+    result = score_articles(
+        [article],
+        backend=mock_backend,
+        inference_timestamp=article.available_at,
+    )[0]
+
+    assert isinstance(result, ArticleSentiment)
+    with pytest.raises(ValueError, match="post-limit token count"):
+        replace(
+            result,
+            final_token_count=result.final_token_count - 1,
+            token_truncation_applied=True,
+            truncation_applied=True,
+        )
 
 
 def test_effective_policy_identity_includes_both_input_limits(article, mock_backend):

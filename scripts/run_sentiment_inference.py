@@ -128,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional new SENT-YYYYMMDD-HHMMSS-xxxxxxxx identity.",
     )
     parser.add_argument(
+        "--discard-stale-running",
+        action="store_true",
+        help=(
+            "Atomically discard unfinished SQLite evidence for the exact --run-id "
+            "before retrying. Never applies to a finalized run."
+        ),
+    )
+    parser.add_argument(
         "--allow-partial",
         action="store_true",
         help="Return zero for a retained PARTIAL run; default is non-zero.",
@@ -140,6 +148,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_token_length > 512:
         parser.error("--max-token-length must be no greater than 512")
+    if args.discard_stale_running and not args.run_id:
+        parser.error("--discard-stale-running requires an explicit --run-id")
     return args
 
 
@@ -169,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             config=config,
             audit_sample_size=args.audit_sample_size,
+            discard_stale_running=args.discard_stale_running,
         )
     except Exception as exc:
         # Arbitrary exception text can contain remote URLs, cache paths, or

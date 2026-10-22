@@ -15,30 +15,26 @@ import shutil
 from time import monotonic
 from typing import Any, Iterable, Mapping
 
-from paisa.news.storage import NewsStorage
+from paisa.news.storage import NewsStorage, SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION
 from paisa.sentiment.artifacts import (
     SentimentRunCollisionError,
     json_bytes,
     logical_storage_label,
     make_sentiment_run_id,
     publish_staged_run,
+    regular_file_inventory,
     utc_now_z,
     validate_sentiment_run_id,
     write_csv,
     write_json,
 )
 from paisa.sentiment.backend import (
+    SentimentBackendIdentity,
     SentimentInferenceBackend,
     TransformersFinBERTBackend,
 )
 from paisa.sentiment.config import (
     CANONICAL_SENTIMENT_LABELS,
-    FINBERT_LICENSE,
-    FINBERT_LICENSE_URL,
-    FINBERT_MODEL_REPOSITORY,
-    FINBERT_MODEL_REVISION,
-    FINBERT_ORIGINAL_LABELS_BY_INDEX,
-    FINBERT_TOKENIZER_REVISION,
     SENTIMENT_SCHEMA_VERSION,
 )
 from paisa.sentiment.inference import (
@@ -100,6 +96,8 @@ _ARTICLE_SENTIMENT_FIELDS = (
     "character_count",
     "original_character_count",
     "tokenizer_token_count",
+    "final_token_count",
+    "truncation_side",
     "truncation_applied",
     "character_truncation_applied",
     "token_truncation_applied",
@@ -139,6 +137,18 @@ _AUDIT_FIELDS = (
     "predicted_label",
     "predicted_probability",
     "input_text_sha256",
+    "selected_fields",
+    "character_count",
+    "original_character_count",
+    "maximum_input_characters",
+    "tokenizer_token_count",
+    "final_token_count",
+    "maximum_sequence_length",
+    "truncation_side",
+    "truncation_applied",
+    "character_truncation_applied",
+    "token_truncation_applied",
+    "warning_codes",
 )
 
 _PINNED_RUNTIME_REQUIREMENTS = {
@@ -188,6 +198,7 @@ class SentimentRunSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "summary_schema_version": SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION,
             "schema_version": SENTIMENT_SCHEMA_VERSION,
             "run_id": self.run_id,
             "status": self.status,
@@ -269,14 +280,7 @@ def _resolved_storage_path(
 
 
 def _model_revision_id(backend: SentimentInferenceBackend) -> str:
-    identity = "\0".join(
-        (
-            backend.model_repository,
-            backend.model_revision,
-            backend.tokenizer_revision,
-        )
-    )
-    return "SMR-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return "SMR-" + backend.identity.identity_sha256[:24]
 
 
 def _installed_library_versions() -> dict[str, str]:
@@ -297,33 +301,54 @@ def _model_manifest(
     cache_label: str,
     load_status: str,
 ) -> dict[str, Any]:
+    identity = backend.identity
+    snapshot_inventory = (
+        [dict(row) for row in backend.snapshot_inventory]
+        if load_status == "LOADED"
+        else [
+            {"path": path, "sha256": digest, "size_bytes": None}
+            for path, digest in sorted(identity.snapshot_files_sha256.items())
+        ]
+    )
     return {
         "schema_version": SENTIMENT_SCHEMA_VERSION,
         "model_revision_id": model_revision_id,
-        "model_repository": backend.model_repository,
-        "model_revision": backend.model_revision,
-        "tokenizer_repository": backend.model_repository,
-        "tokenizer_revision": backend.tokenizer_revision,
+        "backend_identity_sha256": identity.identity_sha256,
+        "model_repository": identity.model_repository,
+        "model_revision": identity.model_revision,
+        "tokenizer_repository": identity.tokenizer_repository,
+        "tokenizer_revision": identity.tokenizer_revision,
         "revision_policy": "full_40_character_commit_hash",
         "intended_task": "three_class_financial_text_sentiment",
         "original_labels_by_index": {
             str(index): label
-            for index, label in enumerate(FINBERT_ORIGINAL_LABELS_BY_INDEX)
+            for index, label in enumerate(identity.original_labels_by_index)
         },
         "canonical_labels": list(CANONICAL_SENTIMENT_LABELS),
-        "canonical_probability_index_mapping": {
-            "negative": 1,
-            "neutral": 2,
-            "positive": 0,
-        },
-        "license_identifier": FINBERT_LICENSE,
-        "license_url": FINBERT_LICENSE_URL,
+        "canonical_probability_index_mapping": dict(
+            sorted(identity.canonical_probability_index_mapping.items())
+        ),
+        "license_identifier": identity.license_identifier,
+        "license_url": identity.license_url,
         "license_scope": "model_weights",
         "permitted_use": "non_commercial_academic_research",
         "commercial_use_requires_new_rights_review": True,
         "runtime_library_versions": dict(sorted(runtime_versions.items())),
         "pinned_runtime_requirements": dict(sorted(_PINNED_RUNTIME_REQUIREMENTS.items())),
         "model_cache": cache_label,
+        "reviewed_snapshot_files": snapshot_inventory,
+        "snapshot_bytes_verified": load_status == "LOADED",
+        "model_config_sha256": identity.snapshot_files_sha256["config.json"],
+        "tokenizer_config_sha256": identity.snapshot_files_sha256[
+            "tokenizer_config.json"
+        ],
+        "model_weights_sha256": identity.snapshot_files_sha256[
+            "model.safetensors"
+        ],
+        "tokenizer_vocabulary_sha256": identity.snapshot_files_sha256["vocab.txt"],
+        "tokenizer_special_tokens_sha256": identity.snapshot_files_sha256[
+            "special_tokens_map.json"
+        ],
         "load_status": load_status,
         "silent_fallback_permitted": False,
     }
@@ -403,6 +428,20 @@ def _deterministic_audit_rows(
                 "predicted_label": row["predicted_label"],
                 "predicted_probability": row["predicted_probability"],
                 "input_text_sha256": row["input_text_sha256"],
+                "selected_fields": row["selected_fields"],
+                "character_count": row["character_count"],
+                "original_character_count": row["original_character_count"],
+                "maximum_input_characters": row["maximum_input_characters"],
+                "tokenizer_token_count": row["tokenizer_token_count"],
+                "final_token_count": row["final_token_count"],
+                "maximum_sequence_length": row["maximum_sequence_length"],
+                "truncation_side": row["truncation_side"],
+                "truncation_applied": row["truncation_applied"],
+                "character_truncation_applied": row[
+                    "character_truncation_applied"
+                ],
+                "token_truncation_applied": row["token_truncation_applied"],
+                "warning_codes": row["warning_codes"],
             }
         )
     return result
@@ -420,18 +459,28 @@ def _inventory_rows(
 ) -> list[dict[str, Any]]:
     """Build deterministic checksums for an already-vetted artifact set."""
 
-    return [
-        {
-            "path": relative,
-            "sha256": hashlib.sha256((root / relative).read_bytes()).hexdigest(),
-            "size_bytes": (root / relative).stat().st_size,
-        }
-        for relative in sorted(relative_paths)
-    ]
+    return regular_file_inventory(root, files=tuple(sorted(relative_paths)))
 
 
 def _json_sha256(value: Any) -> str:
     return hashlib.sha256(json_bytes(value)).hexdigest()
+
+
+def _publication_inventory(run_manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Bind the complete staged tree, including the self-excluded manifest."""
+
+    manifest_bytes = json_bytes(run_manifest)
+    return sorted(
+        [
+            *(dict(row) for row in run_manifest["artifact_inventory"]),
+            {
+                "path": "run_manifest.json",
+                "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "size_bytes": len(manifest_bytes),
+            },
+        ],
+        key=lambda row: str(row["path"]),
+    )
 
 
 def _bind_staged_pack(
@@ -632,11 +681,15 @@ def _recover_finalized_staging(
         raise RuntimeError("staged sentiment evidence does not match SQLite")
 
     summary = _summary_from_final_payload(final_summary)
-    publish_staged_run(staging, destination)
+    publish_staged_run(
+        staging,
+        destination,
+        expected_inventory=_publication_inventory(manifest),
+    )
     return summary
 
 
-def run_sentiment_inference(
+def _run_sentiment_inference_with_backend_for_testing(
     *,
     source_ingestion_run_id: str,
     database_path: str | Path = "data/news/paisa_news.sqlite3",
@@ -649,6 +702,7 @@ def run_sentiment_inference(
     config: SentimentInferenceConfig | None = None,
     backend: SentimentInferenceBackend | None = None,
     audit_sample_size: int = 10,
+    discard_stale_running: bool = False,
 ) -> SentimentRunSummary:
     """Score one bounded, completed ingestion run and publish immutable evidence."""
 
@@ -700,20 +754,40 @@ def run_sentiment_inference(
     # this opaque descriptor, never a relative or absolute filesystem path.
     cache_label = "configured-cache"
     storage = NewsStorage(database).initialize()
+    persisted_run = storage.get_sentiment_run(selected_run_id)
     if staging.exists() or staging.is_symlink():
-        return _recover_finalized_staging(
-            storage=storage,
-            staging=staging,
-            destination=destination,
-            run_id=selected_run_id,
-            source_ingestion_run_id=source_ingestion_run_id,
-            artifact_label=artifact_label,
-        )
-    if storage.get_sentiment_run(selected_run_id) is not None:
-        raise SentimentRunCollisionError(
-            f"sentiment run identity already exists without recoverable staging: "
-            f"{selected_run_id}"
-        )
+        if persisted_run is not None and persisted_run.get("status") != "RUNNING":
+            return _recover_finalized_staging(
+                storage=storage,
+                staging=staging,
+                destination=destination,
+                run_id=selected_run_id,
+                source_ingestion_run_id=source_ingestion_run_id,
+                artifact_label=artifact_label,
+            )
+        if not discard_stale_running:
+            raise SentimentRunCollisionError(
+                f"unfinished sentiment run requires explicit discard: {selected_run_id}"
+            )
+        if staging.is_symlink() or not staging.is_dir():
+            raise SentimentRunCollisionError(
+                f"sentiment staging collision for immutable run: {selected_run_id}"
+            )
+        shutil.rmtree(staging)
+        if persisted_run is None:
+            raise SentimentRunCollisionError(
+                f"staging exists without a matching RUNNING run: {selected_run_id}"
+            )
+        storage.discard_running_sentiment_run(selected_run_id)
+        persisted_run = None
+    if persisted_run is not None:
+        if persisted_run.get("status") == "RUNNING" and discard_stale_running:
+            storage.discard_running_sentiment_run(selected_run_id)
+        else:
+            raise SentimentRunCollisionError(
+                f"sentiment run identity already exists without recoverable staging: "
+                f"{selected_run_id}"
+            )
 
     cache.mkdir(parents=True, exist_ok=True)
     selected_backend = backend or TransformersFinBERTBackend(
@@ -722,28 +796,49 @@ def run_sentiment_inference(
     )
     if selected_backend.device != device.strip().lower():
         raise ValueError("backend device does not match requested device")
+    identity = selected_backend.identity
+    if not isinstance(identity, SentimentBackendIdentity):
+        raise TypeError("sentiment backend must supply a verifiable identity")
+    if (
+        selected_backend.model_repository != identity.model_repository
+        or selected_backend.model_revision != identity.model_revision
+        or selected_backend.tokenizer_revision != identity.tokenizer_revision
+    ):
+        raise ValueError("backend runtime identity does not match its manifest identity")
 
     started_at = utc_now_z()
     inference_timestamp = _parse_timestamp(started_at, field="started_at")
     assert isinstance(inference_timestamp, datetime)
     started_clock = monotonic()
 
-    model_revision_id = _model_revision_id(selected_backend)
-    storage.register_sentiment_model_revision(
-        model_revision_id=model_revision_id,
+    requested_model_revision_id = _model_revision_id(selected_backend)
+    model_revision_id = storage.register_sentiment_model_revision(
+        model_revision_id=requested_model_revision_id,
         schema_version=SENTIMENT_SCHEMA_VERSION,
-        model_repository=selected_backend.model_repository,
-        model_revision=selected_backend.model_revision,
-        tokenizer_repository=selected_backend.model_repository,
-        tokenizer_revision=selected_backend.tokenizer_revision,
-        original_labels=list(FINBERT_ORIGINAL_LABELS_BY_INDEX),
-        label_mapping={
-            "negative": 1,
-            "neutral": 2,
-            "positive": 0,
-        },
-        license_identifier=FINBERT_LICENSE,
+        model_repository=identity.model_repository,
+        model_revision=identity.model_revision,
+        tokenizer_repository=identity.tokenizer_repository,
+        tokenizer_revision=identity.tokenizer_revision,
+        original_labels=list(identity.original_labels_by_index),
+        label_mapping=dict(identity.canonical_probability_index_mapping),
+        license_identifier=identity.license_identifier,
         library_versions=_PINNED_RUNTIME_REQUIREMENTS,
+        backend_identity_sha256=identity.identity_sha256,
+        snapshot_inventory=[
+            {"path": path, "sha256": digest}
+            for path, digest in sorted(identity.snapshot_files_sha256.items())
+        ],
+        model_config_sha256=identity.snapshot_files_sha256["config.json"],
+        tokenizer_config_sha256=identity.snapshot_files_sha256[
+            "tokenizer_config.json"
+        ],
+        model_weights_sha256=identity.snapshot_files_sha256[
+            "model.safetensors"
+        ],
+        tokenizer_vocabulary_sha256=identity.snapshot_files_sha256["vocab.txt"],
+        tokenizer_special_tokens_sha256=identity.snapshot_files_sha256[
+            "special_tokens_map.json"
+        ],
         created_at=started_at,
     )
     storage.begin_sentiment_run(
@@ -774,6 +869,7 @@ def run_sentiment_inference(
     skipped_article_errors = 0
     failed_article_errors = 0
     fatal_error = False
+    completed_input_ids: set[str] = set()
     runtime_versions = _installed_library_versions()
     model_load_status = "FAILED"
 
@@ -788,6 +884,11 @@ def run_sentiment_inference(
             pending: list[_SourceArticle] = []
             for source_row in source_batch:
                 article_id = str(source_row["article_id"])
+                storage.register_sentiment_run_input(
+                    selected_run_id,
+                    article_id,
+                    input_ordinal=len(input_references),
+                )
                 input_references.append(_input_reference(source_row))
                 source_metadata[article_id] = {
                     "title": source_row.get("title"),
@@ -800,6 +901,13 @@ def run_sentiment_inference(
                     resolved_config.effective_input_policy_id,
                 )
                 if existing is not None:
+                    storage.complete_sentiment_run_input(
+                        selected_run_id,
+                        article_id,
+                        outcome="REUSED",
+                        sentiment_output_id=str(existing["sentiment_output_id"]),
+                    )
+                    completed_input_ids.add(article_id)
                     skipped_existing += 1
                     continue
                 pending.append(_source_article(source_row))
@@ -827,8 +935,22 @@ def run_sentiment_inference(
                         model_revision_id=model_revision_id,
                     )
                     if not inserted:
+                        storage.complete_sentiment_run_input(
+                            selected_run_id,
+                            outcome.article_id,
+                            outcome="REUSED",
+                            sentiment_output_id=output_id,
+                        )
+                        completed_input_ids.add(outcome.article_id)
                         skipped_existing += 1
                         continue
+                    storage.complete_sentiment_run_input(
+                        selected_run_id,
+                        outcome.article_id,
+                        outcome="GENERATED",
+                        sentiment_output_id=output_id,
+                    )
+                    completed_input_ids.add(outcome.article_id)
                     row = outcome.to_dict()
                     row["sentiment_output_id"] = output_id
                     row["sentiment_run_id"] = selected_run_id
@@ -842,7 +964,7 @@ def run_sentiment_inference(
                     skipped_article_errors += 1
                 else:
                     failed_article_errors += 1
-                storage.save_sentiment_error(
+                error_id = storage.save_sentiment_error(
                     inference_run_id=selected_run_id,
                     article_id=outcome.article_id,
                     stage=("input_validation" if is_skip else "inference"),
@@ -855,6 +977,13 @@ def run_sentiment_inference(
                     warning_codes=list(outcome.warning_codes),
                     retryable=False,
                 )
+                storage.complete_sentiment_run_input(
+                    selected_run_id,
+                    outcome.article_id,
+                    outcome=("SKIPPED" if is_skip else "FAILED"),
+                    error_id=error_id,
+                )
+                completed_input_ids.add(outcome.article_id)
                 error_rows.append(error)
     except Exception as exc:
         fatal_error = True
@@ -862,6 +991,60 @@ def run_sentiment_inference(
         safe_message = (
             "Pinned sentiment runtime failed; no substitute model was used."
         )
+        # Every registered input needs a terminal association before a
+        # partially successful run can be certified. Attribute the fatal
+        # interruption to each not-yet-completed input; the separate run-level
+        # error below preserves the root failure for operators.
+        for reference in input_references:
+            article_id = str(reference["article_id"])
+            if article_id in completed_input_ids:
+                continue
+            occurred_at = utc_now_z()
+            try:
+                error_id = storage.save_sentiment_error(
+                    inference_run_id=selected_run_id,
+                    article_id=article_id,
+                    stage="run",
+                    error_type=safe_error_type,
+                    message=safe_message,
+                    occurred_at=occurred_at,
+                    original_language=reference.get("original_language"),
+                    retryable=False,
+                )
+                storage.complete_sentiment_run_input(
+                    selected_run_id,
+                    article_id,
+                    outcome="FAILED",
+                    error_id=error_id,
+                )
+            except Exception:
+                # The finalization trigger will reject a PARTIAL run if storage
+                # could not persist the terminal association. Its existing
+                # recovery path then records a non-reusable FAIL instead.
+                continue
+            completed_input_ids.add(article_id)
+            failed_article_errors += 1
+            error_rows.append(
+                {
+                    "schema_version": SENTIMENT_SCHEMA_VERSION,
+                    "article_id": article_id,
+                    "source_ingestion_run_id": source_ingestion_run_id,
+                    "input_policy_id": resolved_config.effective_input_policy_id,
+                    "selected_fields": [],
+                    "input_text_sha256": None,
+                    "original_language": reference.get("original_language"),
+                    "model_repository": selected_backend.model_repository,
+                    "model_revision": selected_backend.model_revision,
+                    "tokenizer_revision": selected_backend.tokenizer_revision,
+                    "published_at": None,
+                    "available_at": reference.get("available_at"),
+                    "fetched_at": None,
+                    "inference_timestamp": occurred_at,
+                    "warning_codes": [],
+                    "error_code": safe_error_type,
+                    "error_message": safe_message,
+                }
+            )
         try:
             storage.save_sentiment_error(
                 inference_run_id=selected_run_id,
@@ -928,9 +1111,9 @@ def run_sentiment_inference(
             }
         )
 
-    if fatal_error or (not output_rows and failed_article_errors > 0):
+    if not output_rows and (fatal_error or failed_article_errors > 0):
         status = "FAIL"
-    elif error_rows:
+    elif fatal_error or error_rows:
         status = "PARTIAL"
     else:
         status = "PASS"
@@ -1090,6 +1273,7 @@ def run_sentiment_inference(
             final_summary=final_summary,
             manifest_contract=manifest_contract,
         )
+        publication_inventory = _publication_inventory(run_manifest)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
@@ -1099,6 +1283,10 @@ def run_sentiment_inference(
         failed_summary["completed_at"] = failed_at
         failed_summary["any_articles_failed"] = True
         try:
+            # No complete staged pack exists, so outputs generated by this run
+            # have no artifact seal. Remove them while the owner is still
+            # RUNNING rather than exposing uncertified global reuse keys.
+            storage.reset_unpublished_sentiment_outputs(selected_run_id)
             storage.save_sentiment_error(
                 inference_run_id=selected_run_id,
                 stage="artifact_publication",
@@ -1146,7 +1334,11 @@ def run_sentiment_inference(
             status=status,
             final_summary=final_summary,
         ):
-            publish_staged_run(staging, destination)
+            publish_staged_run(
+                staging,
+                destination,
+                expected_inventory=publication_inventory,
+            )
             return summary
 
         # A finalized row with different completion evidence is not this
@@ -1204,7 +1396,12 @@ def run_sentiment_inference(
             final_summary=final_summary,
             manifest_contract=manifest_contract,
         )
+        publication_inventory = _publication_inventory(run_manifest)
         try:
+            # A FAIL owner is never a reusable result source. Remove outputs
+            # produced by this still-RUNNING attempt before finalizing so the
+            # global version-5 idempotency key cannot block a clean retry.
+            storage.reset_unpublished_sentiment_outputs(selected_run_id)
             storage.save_sentiment_error(
                 inference_run_id=selected_run_id,
                 stage="finalization",
@@ -1228,8 +1425,50 @@ def run_sentiment_inference(
 
     # Publication is the final commit marker. A completed directory can never
     # become visible before its matching SQLite row reaches a final status.
-    publish_staged_run(staging, destination)
+    publish_staged_run(
+        staging,
+        destination,
+        expected_inventory=publication_inventory,
+    )
     return summary
+
+
+def run_sentiment_inference(
+    *,
+    source_ingestion_run_id: str,
+    database_path: str | Path = "data/news/paisa_news.sqlite3",
+    output_dir: str | Path = "artifacts/sentiment_inference",
+    model_cache: str | Path = "data/sentiment_model_cache",
+    storage_root: str | Path = ".",
+    allow_external_storage: bool = False,
+    run_id: str | None = None,
+    device: str = "cpu",
+    config: SentimentInferenceConfig | None = None,
+    audit_sample_size: int = 10,
+    discard_stale_running: bool = False,
+) -> SentimentRunSummary:
+    """Run the exact reviewed FinBERT backend and publish immutable evidence.
+
+    Backend injection is intentionally absent from this production boundary so
+    callers cannot publish arbitrary classifier output under the reviewed
+    FinBERT identity.  Unit tests exercise orchestration through the private
+    helper above.
+    """
+
+    return _run_sentiment_inference_with_backend_for_testing(
+        source_ingestion_run_id=source_ingestion_run_id,
+        database_path=database_path,
+        output_dir=output_dir,
+        model_cache=model_cache,
+        storage_root=storage_root,
+        allow_external_storage=allow_external_storage,
+        run_id=run_id,
+        device=device,
+        config=config,
+        backend=None,
+        audit_sample_size=audit_sample_size,
+        discard_stale_running=discard_stale_running,
+    )
 
 
 __all__ = ["SentimentRunSummary", "run_sentiment_inference"]

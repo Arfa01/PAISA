@@ -233,6 +233,14 @@ article bodies. CPU is the default; an explicitly available CUDA or Apple Metal
 device is recorded when selected. A model/download failure is non-zero and is
 never replaced with a generic classifier.
 
+The loader verifies reviewed SHA-256 hashes for the configuration, safetensors
+weights, tokenizer configuration, vocabulary, and special-token map before and
+after model loading. SQLite schema `6` records those hashes, ordered input and
+generated/reused/error associations, post-truncation token counts, and both
+artifact recovery seals before `PASS` is allowed. An interrupted `RUNNING` run
+is never reused globally. After confirming it is stale, retry its exact
+`--run-id` with `--discard-stale-running`; finalized runs cannot be discarded.
+
 The current stage emits article-level sentiment only. It does not aggregate by
 day, join prices, retrain a stock model, emit a trading signal, or alter the API
 or dashboard. A later consumer must first enforce `available_at <=

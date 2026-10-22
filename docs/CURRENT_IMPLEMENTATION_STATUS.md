@@ -23,7 +23,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
-| Verification | Final branch validation recorded `525` passing Python tests with `1` optional TensorFlow test skipped, all `57` frontend tests, frontend lint, frontend production build, `pip check`, bytecode compilation, and `git diff --check`. The retained sentiment run below supplies separate real-model execution evidence. |
+| Verification | The full Python suite, all `57` frontend tests, frontend lint, frontend production build, `pip check`, bytecode compilation, and `git diff --check` are required branch gates. The ignored retained-artifact checkout can run one additional local integration test that a clean Git clone skips; the retained sentiment run below supplies separate real-model execution evidence. |
 
 ## Retained real-run evidence
 
@@ -77,11 +77,15 @@ storage-integrity hardening, while `NEWS-20261022-130023-470cb7a7` predates the
 final time-evidence, secret-redaction, and recoverable-finalization hardening.
 The accepted manifest reports finalization state `COMMITTED` and SQLite schema
 version `3`. Its ingestion artifact tree remains historical: it predates the
-schema-4 sealing fingerprint, the current schema-5 layout, and the
+schema-4 sealing fingerprint, the schema-5 sentiment tables, the current
+schema-6 certification contract, and the
 completion/deduplication-context files, and must not be described as passing
 the current news verifier. Before sentiment execution the working
 `data/news/paisa_news.sqlite3` also used schema version `3`; it is now schema
-version `5`. An ignored, uncommitted pre-migration copy at
+version `5` for the retained reference execution. Current code migrates a
+verified database onward to schema `6`, which adds hash-bound model files,
+post-truncation evidence, explicit run associations, and certified
+finalization. An ignored, uncommitted pre-migration copy at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3` was verified as
 schema version `3` with `31` canonical articles, `150` article occurrences,
 and an `ok` integrity check. The accepted run demonstrates only
@@ -123,16 +127,24 @@ artifacts and database records, not committed repository files.
 | Device / duration | `cpu / 7.116756208240986 seconds` |
 | Model and tokenizer revision | `0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` |
 | Runtime | Python `3.13.7`; PyTorch `2.10.0`; Transformers `5.20.2`; Tokenizers `0.23.3`; Hugging Face Hub `1.32.0`; Safetensors `0.8.0` |
-| Database schema after migration | `5` |
+| Database schema for retained reference run / current code | `5 / 6` |
 | Artifact directory | `artifacts/sentiment_inference/SENT-20261022-172211-real0002` |
 
 Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+
+The retained sentiment evidence covers October 19--22, 2026, but the retained
+OGDC price evidence ends on September 15, 2026. These sources have **zero
+overlapping dates**. The current evidence therefore cannot form even one
+price-plus-sentiment observation and cannot support a combined experiment or
+portfolio conclusion. That work requires an overlapping historical news
+corpus.
 
 The narrow legacy compatibility path validates the exact recognized schema-3
 signature and affected rows, transactionally restores the later constraints,
 and applies migrations 4 and 5. It does not recreate missing artifacts or
 retroactively validate the retained news pack. The working database is now
-schema version `5`, while the ignored pre-migration copy above preserves the
+schema version `5` (and is upgraded to `6` when opened by current code), while
+the ignored pre-migration copy above preserves the
 verified schema-3 state. Even after a successful execution, this single short
 RSS snapshot will not be sufficient for stock-model integration,
 classifier-accuracy claims, or price-plus-sentiment comparison.

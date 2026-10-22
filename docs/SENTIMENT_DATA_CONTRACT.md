@@ -18,11 +18,16 @@ Every result references one immutable model-revision record containing:
 - the upstream index labels `0=positive`, `1=negative`, `2=neutral`;
 - the explicit mapping to PAISA's canonical `negative`, `neutral`, `positive`
   fields; and
+- a SHA-256 inventory of the reviewed `config.json`, safetensors weights,
+  tokenizer configuration, vocabulary, and special-token map, plus one
+  `backend_identity_sha256` binding all of that metadata; and
 - exact runtime library versions observed during inference.
 
 A floating branch, tag, or `latest` revision is not a valid production input.
-A changed model or tokenizer revision creates a new identity and never replaces
-old output.
+The production entry point does not accept an injected classifier. The reviewed
+snapshot is hashed before load and again after load; changed, missing,
+non-regular, or cache-escaping bytes fail closed. A changed model, tokenizer,
+or reviewed file digest creates a new identity and never replaces old output.
 
 ## Deterministic inference input
 
@@ -64,6 +69,8 @@ contract below. JSON-valued fields use sorted compact JSON in CSV.
 | `character_count` | integer | Character count after the configured deterministic character bound. |
 | `original_character_count` | integer | Character count before the configured bound. |
 | `tokenizer_token_count` | integer | Tokenizer count before truncation; it may therefore exceed the declared maximum sequence length. |
+| `final_token_count` | integer | Non-padding attention-mask count after the sequence limit; positive, no greater than the pre-truncation count, and no greater than the configured limit. |
+| `truncation_side` | string | Explicitly `right`; the discarded end is never inferred from a tokenizer default. |
 | `truncation_applied` | boolean | True when either configured character or tokenizer sequence truncation changed the selected input. |
 | `character_truncation_applied` | boolean | Whether the character bound shortened the selected source fields. |
 | `token_truncation_applied` | boolean | Whether the tokenizer count exceeded the maximum sequence length. |
@@ -129,16 +136,27 @@ artifacts/sentiment_inference/<run_id>/
 - `article_sentiment.csv` contains stable successful article-level records.
 - `inference_errors.json` contains sanitized structured skips and failures.
 - `audit_sample.csv` is a deterministic small review sample with references,
-  permitted titles, probabilities, label, OGDC linkage, and timestamps.
+  permitted titles, probabilities, label, OGDC linkage, timestamps, selected
+  fields, character/token limits, before/after counts, explicit right-side
+  truncation, flags, and warning codes.
 - `quality_report.json` contains coverage/distribution/resource statistics and
   does not claim accuracy from unlabelled data.
 - `final_summary.json` is the body-free CLI/reporting summary and carries the
   database-bound payload-inventory and run-manifest-contract seals.
 
-Creation fails on any existing run path or ID; no file is overwritten. Artifact
-paths are relative and portable. Credentials, full selected article text, and
-absolute cache paths are prohibited. Downloaded weights and generated outputs
-remain ignored by Git.
+Creation fails on any existing run path or ID; no file is overwritten. Sealing
+opens only stable regular files without following symbolic links. Publication
+uses an operating-system no-replace rename, so an empty directory appearing in
+the check/use gap is not replaced. Artifact paths are relative and portable.
+Credentials, full selected article text, and absolute cache paths are
+prohibited. Downloaded weights and generated outputs remain ignored by Git.
+
+An interrupted `RUNNING` owner is never a global idempotency source. Recovery
+of a hidden staged pack is allowed only after the matching SQLite run is
+finalized and both seals validate. Otherwise retrying the exact run ID requires
+the explicit `--discard-stale-running` option; that transaction removes only
+the named unfinished run and its unfinished output. Finalized evidence is never
+eligible for discard.
 
 ## Quality report
 
@@ -161,8 +179,10 @@ Unlabelled articles cannot establish classification accuracy.
 
 ## SQLite persistence and migration
 
-News database migration `5`, `financial_sentiment_foundation`, creates these
-separate concerns:
+News database migration `5`, `financial_sentiment_foundation`, created the
+original sentiment tables. Migration `6`, `sentiment_run_certification`, adds
+hash-bound model identity, post-truncation evidence, explicit run-input/output
+associations, recovery seals, and database-enforced completion checks:
 
 | Table | Ownership |
 |---|---|
@@ -170,25 +190,45 @@ separate concerns:
 | `sentiment_inference_runs` | Run configuration, source ingestion run, status, timing, runtime, portable artifact reference, and summary. |
 | `article_sentiment_outputs` | Successful immutable article/model/policy results and inherited time evidence. |
 | `sentiment_inference_errors` | Sanitized run/article failures and skips. |
+| `sentiment_run_articles` | Ordered input evidence and exactly one terminal `GENERATED`, `REUSED`, `SKIPPED`, or `FAILED` association per completed input. |
 
 Foreign keys preserve source article, source run, model revision, and inference
 run identity. A uniqueness constraint makes the same canonical article, exact
 model revision, tokenizer revision, and input-policy identity idempotent. A new
 model revision creates a separate result rather than updating the old one.
-Finalized run rows and their outputs/errors are immutable; a failed invocation
-cannot mutate a prior completed run or be promoted to `PASS` without valid
-output and quality evidence.
+Finalized run rows and their outputs/errors are immutable. Summary schema
+`2.0` counts are derived from SQLite rather than trusted from a caller. `PASS`
+and `PARTIAL` require nonempty input evidence, no pending input, a terminal
+association for every input, database-consistent generated/reused/error counts,
+label and truncation counts, and both artifact recovery seals. `PASS` also
+forbids retained errors. Direct SQL therefore cannot certify a zero-output or
+fabricated-count `PASS`.
 
 The accepted PR #12 ingestion manifest and artifact pack record schema version
 `3`. Their historical base-table evidence predates the schema-4 sealing-layer
-fingerprints used by the current schema 5. Before sentiment execution, the
+fingerprints introduced by schema 4. Before sentiment execution, the
 working `data/news/paisa_news.sqlite3` also used schema version `3`. A narrow
 compatibility repair accepted only its exact known signature, proved that
 existing rows satisfied the later time/raw-evidence/status constraints,
 transactionally rebuilt the three affected tables without changing their
-values, verified integrity, and applied migrations 4 and 5. The working
-database is now schema version `5`; unknown drift and invalid legacy rows fail
-closed.
+values, verified integrity, and applied migrations 4 and 5. That retained run
+was produced at schema version `5`. Current code then advances a verified
+database to schema version `6`; unknown drift and invalid legacy rows fail
+closed, and migration validation occurs only after the SQLite write lock is
+held.
+
+Migration does not invent file hashes for a version-5 model row. That legacy
+row and every run that references it remain explicitly unverified. The first
+current-code execution registers a separate hash-bound model identity—even
+when the declared repository and revisions are the same—while preserving the
+legacy identifier and its foreign-key history unchanged.
+
+A version-5 `RUNNING` owner and its output remain explicitly discardable and
+are not backfilled as completed associations. Migration fails closed if a
+version-5 `FAIL` owner still contains output: that globally unique result cannot
+be certified for reuse or deleted without rewriting finalized historical
+evidence. Preserve such a database for audit and start a clean schema-6 working
+database rather than weakening immutability.
 
 The ignored, uncommitted pre-migration copy at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3` was verified at

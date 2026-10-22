@@ -24,8 +24,10 @@ For example, if a canonical article was first available at 11:52 and appeared
 again in a feed fetched at 13:12, sentiment for that canonical article retains
 11:52. The 13:12 occurrence remains ingestion evidence but does not move the
 canonical's availability forward. Conversely, a materially corrected article
-that becomes a new canonical record at 13:12 retains 13:12 and cannot be used
-for an earlier decision.
+at the same canonical URL does not currently become a new canonical record.
+Canonical-URL deduplication keeps it as duplicate occurrence evidence tied to
+the earlier canonical article; it is not independently scored and cannot enter
+an earlier or later decision as a correction.
 
 Missing or invalid source timing is never repaired from model execution time.
 If required `available_at`/`fetched_at` evidence is missing, invalid, or
@@ -51,12 +53,17 @@ Examples:
 |---|---|---|---|
 | 09:10 UTC | 14:00 UTC | 09:05 UTC | Excluded. Inference cannot backdate the article. |
 | 09:10 UTC | next day | 09:10 UTC | Included at the exact inclusive boundary. |
-| 13:12 UTC correction | 13:13 UTC | 12:00 UTC | Excluded, even when an earlier version of the story existed. |
+| Hypothetical independently versioned correction available at 13:12 UTC | 13:13 UTC | 12:00 UTC | Excluded. A future correction contract must preserve its own `available_at`. |
 | Missing/naive availability | any | any | Rejected/skipped; no timestamp is invented. |
 
-Future corrections are append-only evidence. They receive their own article or
-input identity and availability. Re-running inference later does not alter an
-old result or let the correction enter a historical decision.
+Same-URL corrections are currently unsupported. Because canonical URL has
+deduplication priority, changed content later observed at the same URL is
+ignored as an independent sentiment input: it receives neither a versioned
+correction identity nor its own sentiment result. This is conservative against
+look-ahead, but it can leave the retained canonical content stale. A future
+correction contract must create versioned correction identities with their own
+`available_at` before corrected content can be independently scored. Re-running
+inference does not alter an old result or retroactively introduce a correction.
 
 ## Source-run versus canonical time
 

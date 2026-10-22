@@ -139,14 +139,27 @@ Git. Public manifests contain portable cache/database labels, not absolute
 private paths or credentials. A failed model download/load exits non-zero and
 never silently selects another classifier.
 
+The reviewed config, safetensors, tokenizer config, vocabulary, and
+special-token files are SHA-256 verified before and after load. Current SQLite
+schema `6` records their identity, each ordered input's terminal
+generated/reused/error association, post-truncation token evidence, and both
+recovery seals before it permits `PASS`.
+
+If an earlier process was interrupted and the exact ID remains `RUNNING`, first
+confirm no process still owns it, then retry that same ID with
+`--discard-stale-running`. The option never applies to finalized runs; a new ID
+cannot reuse output owned by the unfinished run.
+
 The accepted PR #12 ingestion manifest and artifact pack record schema version
 `3`; those historical artifacts predate the schema-4 sealing evidence and
 cannot be passed off as current news verification evidence. Before the
 retained sentiment execution, the working `data/news/paisa_news.sqlite3` also
 used schema version `3`. The migration repaired only the exact recognized
 legacy signature after validating every affected row, then applied schemas 4
-and 5; all other drift fails closed. The working database is now schema version
-`5`. Its ignored, uncommitted pre-migration copy is
+and 5; all other drift fails closed. The retained reference database records
+schema version `5`; current code advances a verified working copy to schema
+version `6` before new sentiment inference. Its ignored, uncommitted
+pre-migration copy is
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified at
 schema version `3` with `31` canonical articles, `150` article occurrences,
 and an `ok` integrity check. Do not describe database compatibility as
@@ -156,7 +169,9 @@ The retained final-code reference execution is
 `SENT-20261022-172211-real0002`, sourced from
 `NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
 `7.116756208240986` seconds against a preserved schema-3 database copy, which
-migrated to schema version `5`.
+migrated to schema version `5`. That is the retained reference-run schema;
+current code advances a verified database to schema `6` for sentiment run
+certification.
 It requested and scored `30` unique canonical articles, skipped `0`, failed
 `0`, and recorded `any_articles_failed=false`. One scored article was linked
 to OGDC. The label counts were `negative=11`, `neutral=9`, and `positive=10`;
@@ -172,6 +187,11 @@ directory is
 committed.
 
 Sentiment outputs were generated, but classification accuracy was not evaluated in this run.
+The retained sentiment evidence covers October 19--22, 2026, whereas retained
+OGDC prices end on September 15, 2026, so there are **zero overlapping dates**.
+This run cannot support a combined price-plus-sentiment experiment or portfolio
+conclusion. Obtain an overlapping historical news corpus before attempting that
+research stage.
 This short snapshot is insufficient for stock-model integration. See
 [`docs/FINBERT_SENTIMENT.md`](docs/FINBERT_SENTIMENT.md),
 [`docs/SENTIMENT_DATA_CONTRACT.md`](docs/SENTIMENT_DATA_CONTRACT.md), and

@@ -213,6 +213,7 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
         "sentiment_inference_runs",
         "article_sentiment_outputs",
         "sentiment_inference_errors",
+        "sentiment_run_articles",
     }
     with storage.connection() as connection:
         tables = {
@@ -238,11 +239,11 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
             "SELECT version, name FROM schema_migrations ORDER BY version DESC"
         ).fetchone()
     assert latest["version"] == DATABASE_SCHEMA_VERSION
-    assert latest["name"] == "financial_sentiment_foundation"
+    assert latest["name"] == "sentiment_run_certification"
 
 
-@pytest.mark.parametrize("prior_version", [1, 2, 3, 4])
-def test_initialize_migrates_each_verified_prior_schema_to_v5(
+@pytest.mark.parametrize("prior_version", [1, 2, 3, 4, 5])
+def test_initialize_migrates_each_verified_prior_schema_to_v6(
     tmp_path, prior_version
 ):
     database = tmp_path / f"prior-v{prior_version}.sqlite3"
@@ -260,9 +261,9 @@ def test_initialize_migrates_each_verified_prior_schema_to_v5(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             )
         ]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
     assert "sealed_manifest_sha256" in columns
-    assert versions[-1] == (5, "financial_sentiment_foundation")
+    assert versions[-1] == (6, "sentiment_run_certification")
 
 
 def test_initialize_rejects_malformed_stamped_schema_without_advancing(tmp_path):
@@ -1860,6 +1861,92 @@ def test_schema_migration_rolls_back_on_base_exception(tmp_path, monkeypatch):
         ).fetchone()[0]
     assert "sealed_manifest_sha256" not in columns
     assert migrations == 3
+
+
+def test_schema_migration_locks_before_validating_data_preconditions(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "migration-validation-lock.sqlite3"
+    _create_versioned_database(database, 3)
+    legacy = NewsStorage(database)
+    run_id = "NEWS-20261022-100000-migration-race"
+    _begin(legacy, run_id)
+
+    first_raw = _raw(legacy, run_id, "item/1")
+    legacy.save_article(_article(run_id, first_raw))
+    second_raw = _raw(legacy, run_id, "item/2")
+    second = _article(
+        run_id,
+        second_raw,
+        article_id="article-2",
+        canonical_url="https://news.example.test/ogdc-second",
+        title="OGDC announces second discovery",
+    )
+    second.update(
+        {
+            "content_sha256": "c" * 64,
+            "raw_artifact_reference": "raw/item-2.json",
+        }
+    )
+    legacy.save_article(second)
+
+    validation_reached = threading.Event()
+    writer_finished = threading.Event()
+    writer_result: list[str] = []
+
+    def concurrent_writer() -> None:
+        assert validation_reached.wait(timeout=5)
+        connection = sqlite3.connect(
+            database,
+            timeout=0.1,
+            isolation_level=None,
+        )
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                """
+                UPDATE normalized_articles
+                SET duplicate_of = 'article-2'
+                WHERE article_id = 'article-1'
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            assert "locked" in str(exc).lower()
+            writer_result.append("locked")
+        else:
+            writer_result.append("committed")
+        finally:
+            connection.close()
+            writer_finished.set()
+
+    original_validate = storage_module._validate_v4_migration_preconditions
+
+    def pause_after_validation(connection):
+        original_validate(connection)
+        validation_reached.set()
+        assert writer_finished.wait(timeout=5)
+
+    monkeypatch.setattr(
+        storage_module,
+        "_validate_v4_migration_preconditions",
+        pause_after_validation,
+    )
+    writer = threading.Thread(target=concurrent_writer)
+    writer.start()
+    migrated = NewsStorage(database).initialize()
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert writer_result == ["locked"]
+    with migrated.connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        duplicate_of = connection.execute(
+            """
+            SELECT duplicate_of FROM normalized_articles
+            WHERE article_id = 'article-1'
+            """
+        ).fetchone()[0]
+    assert duplicate_of is None
 
 
 def test_initialize_rejects_tampered_current_schema(tmp_path):

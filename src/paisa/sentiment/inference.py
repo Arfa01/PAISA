@@ -142,6 +142,8 @@ def _success(
         character_count=selection.character_count,
         original_character_count=selection.original_character_count,
         tokenizer_token_count=prediction.tokenizer_token_count,
+        final_token_count=prediction.final_token_count,
+        truncation_side=prediction.truncation_side,
         truncation_applied=(
             selection.character_truncation_applied
             or prediction.token_truncation_applied

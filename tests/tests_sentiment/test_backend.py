@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import builtins
 from contextlib import contextmanager
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import paisa.sentiment.backend as backend_module
 from paisa.sentiment.backend import (
+    ModelSnapshotIntegrityError,
+    SentimentBackendIdentity,
     ModelLabelMappingError,
     TransformersFinBERTBackend,
     map_probabilities_by_label,
     validate_finbert_label_mapping,
     validate_immutable_revision,
+    verify_reviewed_snapshot,
 )
 from paisa.sentiment.config import (
+    FINBERT_REVIEWED_SNAPSHOT_SHA256,
     FINBERT_MODEL_REPOSITORY,
     FINBERT_MODEL_REVISION,
     FINBERT_TOKENIZER_REVISION,
@@ -70,6 +76,8 @@ def test_prediction_probabilities_must_sum_to_one():
             predicted_label="positive",
             predicted_probability=0.6,
             tokenizer_token_count=4,
+            final_token_count=4,
+            truncation_side="right",
             token_truncation_applied=False,
         )
 
@@ -83,6 +91,8 @@ def test_probability_tolerance_matches_sqlite_contract():
             predicted_label="positive",
             predicted_probability=0.700005,
             tokenizer_token_count=4,
+            final_token_count=4,
+            truncation_side="right",
             token_truncation_applied=False,
         )
 
@@ -106,6 +116,15 @@ def test_production_backend_is_lazy_and_does_not_import_or_download_on_creation(
     assert backend.model_revision == FINBERT_MODEL_REVISION
     assert backend.tokenizer_revision == FINBERT_TOKENIZER_REVISION
     assert imported == []
+
+
+def test_production_backend_rejects_unreviewed_repository_or_revision():
+    with pytest.raises(ValueError, match="repository is fixed"):
+        TransformersFinBERTBackend(model_repository="example/arbitrary-model")
+    with pytest.raises(ValueError, match="revision is fixed"):
+        TransformersFinBERTBackend(model_revision="1" * 40)
+    with pytest.raises(ValueError, match="tokenizer revision is fixed"):
+        TransformersFinBERTBackend(tokenizer_revision="2" * 40)
 
 
 def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
@@ -137,9 +156,17 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
         def tolist(self):
             return self.rows
 
+        def to(self, _device):
+            return self
+
+        def sum(self, *, dim):
+            assert dim == 1
+            return FakeTensor([sum(row) for row in self.rows])
+
     class FakeTokenizer:
         def __init__(self):
             self.batch_tensor = FakeDeviceTensor()
+            self.truncation_side = "left"
 
         def __call__(self, value, **kwargs):
             if isinstance(value, str):
@@ -152,7 +179,10 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
                 }
                 return {"input_ids": [101, 1001, 1002, 102]}
             calls["tokenizer_batch"] = (value, kwargs)
-            return {"input_ids": self.batch_tensor}
+            return {
+                "input_ids": self.batch_tensor,
+                "attention_mask": FakeTensor([[1, 1, 1, 1]]),
+            }
 
     tokenizer = FakeTokenizer()
 
@@ -160,6 +190,9 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
         @classmethod
         def from_pretrained(cls, repository, **kwargs):
             calls["tokenizer_load"] = (repository, kwargs)
+            calls["tokenizer_load_files"] = {
+                path.name for path in Path(repository).iterdir()
+            }
             return tokenizer
 
     class FakeModel:
@@ -188,6 +221,9 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
         @classmethod
         def from_pretrained(cls, repository, **kwargs):
             calls["model_load"] = (repository, kwargs)
+            calls["model_load_files"] = {
+                path.name for path in Path(repository).iterdir()
+            }
             return model
 
     fake_torch = ModuleType("torch")
@@ -210,31 +246,54 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
     fake_transformers = ModuleType("transformers")
     fake_transformers.AutoTokenizer = FakeAutoTokenizer
     fake_transformers.AutoModelForSequenceClassification = FakeAutoModel
+    fake_huggingface_hub = ModuleType("huggingface_hub")
+
+    def hf_hub_download(*, repo_id, filename, revision, cache_dir):
+        calls.setdefault("snapshot_downloads", []).append(
+            (repo_id, filename, revision, cache_dir)
+        )
+        path = cache / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(filename.encode("utf-8"))
+        return str(path)
+
+    fake_huggingface_hub.hf_hub_download = hf_hub_download
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_huggingface_hub)
+
+    def verified_inventory(files, *, expected_sha256, trusted_root):
+        assert set(files) == set(expected_sha256)
+        assert trusted_root is not None
+        return tuple(
+            {"path": name, "sha256": digest, "size_bytes": 1}
+            for name, digest in sorted(expected_sha256.items())
+        )
+
+    monkeypatch.setattr(
+        backend_module, "verify_reviewed_snapshot", verified_inventory
+    )
 
     cache = tmp_path / "model-cache"
+    cache.mkdir()
+    (cache / "added_tokens.json").write_text(
+        '{"[UNREVIEWED]": 30522}\n', encoding="utf-8"
+    )
     backend = TransformersFinBERTBackend(cache_dir=cache)
     predictions = backend.score_batch(
         ["OGDC reports higher production"], maximum_sequence_length=8
     )
 
-    common = {
-        "cache_dir": str(cache),
-        "trust_remote_code": False,
-    }
-    assert calls["tokenizer_load"] == (
-        FINBERT_MODEL_REPOSITORY,
-        {"revision": FINBERT_TOKENIZER_REVISION, **common},
-    )
-    assert calls["model_load"] == (
-        FINBERT_MODEL_REPOSITORY,
-        {
-            "revision": FINBERT_MODEL_REVISION,
-            "use_safetensors": True,
-            **common,
-        },
-    )
+    isolated_root = Path(calls["tokenizer_load"][0])
+    assert isolated_root == Path(calls["model_load"][0])
+    assert isolated_root != cache
+    assert isolated_root.is_dir()
+    common = {"trust_remote_code": False, "local_files_only": True}
+    assert calls["tokenizer_load"][1] == common
+    assert calls["model_load"][1] == {"use_safetensors": True, **common}
+    assert calls["tokenizer_load_files"] == set(FINBERT_REVIEWED_SNAPSHOT_SHA256)
+    assert calls["model_load_files"] == set(FINBERT_REVIEWED_SNAPSHOT_SHA256)
+    assert "added_tokens.json" not in calls["tokenizer_load_files"]
     assert model.eval_called is True
     assert model.moved_to == "cpu"
     assert tokenizer.batch_tensor.moved_to == "cpu"
@@ -258,4 +317,57 @@ def test_production_backend_loads_pinned_safe_revision_and_scores_offline(
     }
     assert predictions[0].predicted_label == "positive"
     assert predictions[0].tokenizer_token_count == 4
+    assert predictions[0].final_token_count == 4
+    assert predictions[0].truncation_side == "right"
     assert predictions[0].token_truncation_applied is False
+    assert tokenizer.truncation_side == "right"
+    assert {item[1] for item in calls["snapshot_downloads"]} == set(
+        FINBERT_REVIEWED_SNAPSHOT_SHA256
+    )
+    assert backend.snapshot_inventory
+
+
+def test_reviewed_snapshot_inventory_rejects_changed_or_external_bytes(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    expected = {"config.json": "a" * 64}
+    config = cache / "config.json"
+    config.write_text("changed", encoding="utf-8")
+
+    with pytest.raises(ModelSnapshotIntegrityError, match="hash mismatch"):
+        verify_reviewed_snapshot(
+            {"config.json": config},
+            expected_sha256=expected,
+            trusted_root=cache,
+        )
+
+    external = tmp_path / "external.json"
+    external.write_text("outside", encoding="utf-8")
+    config.unlink()
+    config.symlink_to(external)
+    observed = __import__("hashlib").sha256(external.read_bytes()).hexdigest()
+    with pytest.raises(ModelSnapshotIntegrityError, match="escapes"):
+        verify_reviewed_snapshot(
+            {"config.json": config},
+            expected_sha256={"config.json": observed},
+            trusted_root=cache,
+        )
+
+
+def test_backend_identity_hash_binds_every_snapshot_file():
+    identity = TransformersFinBERTBackend().identity
+    changed = dict(identity.snapshot_files_sha256)
+    changed["vocab.txt"] = "0" * 64
+    altered = SentimentBackendIdentity(
+        model_repository=identity.model_repository,
+        model_revision=identity.model_revision,
+        tokenizer_repository=identity.tokenizer_repository,
+        tokenizer_revision=identity.tokenizer_revision,
+        original_labels_by_index=identity.original_labels_by_index,
+        canonical_probability_index_mapping=identity.canonical_probability_index_mapping,
+        license_identifier=identity.license_identifier,
+        license_url=identity.license_url,
+        snapshot_files_sha256=changed,
+    )
+
+    assert identity.identity_sha256 != altered.identity_sha256

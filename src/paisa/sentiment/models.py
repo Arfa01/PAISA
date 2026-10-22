@@ -79,6 +79,8 @@ class BackendPrediction:
     predicted_label: str
     predicted_probability: float
     tokenizer_token_count: int
+    final_token_count: int
+    truncation_side: str
     token_truncation_applied: bool
 
     def __post_init__(self) -> None:
@@ -102,6 +104,19 @@ class BackendPrediction:
             raise ValueError("Predicted probability does not match predicted label.")
         if self.tokenizer_token_count <= 0:
             raise ValueError("tokenizer_token_count must be positive.")
+        if not 0 < self.final_token_count <= self.tokenizer_token_count:
+            raise ValueError(
+                "final_token_count must be positive and no greater than the "
+                "pre-truncation tokenizer_token_count."
+            )
+        if self.truncation_side != "right":
+            raise ValueError("Only explicitly audited right truncation is supported.")
+        if self.token_truncation_applied != (
+            self.final_token_count < self.tokenizer_token_count
+        ):
+            raise ValueError(
+                "token_truncation_applied must match the before/after token counts."
+            )
 
     @property
     def probabilities(self) -> dict[str, float]:
@@ -124,6 +139,8 @@ class ArticleSentiment:
     character_count: int
     original_character_count: int
     tokenizer_token_count: int
+    final_token_count: int
+    truncation_side: str
     truncation_applied: bool
     character_truncation_applied: bool
     token_truncation_applied: bool
@@ -174,9 +191,18 @@ class ArticleSentiment:
             predicted_label=self.predicted_label,
             predicted_probability=self.predicted_probability,
             tokenizer_token_count=self.tokenizer_token_count,
+            final_token_count=self.final_token_count,
+            truncation_side=self.truncation_side,
             token_truncation_applied=self.token_truncation_applied,
         )
         del prediction
+        expected_final_token_count = min(
+            self.tokenizer_token_count, self.maximum_sequence_length
+        )
+        if self.final_token_count != expected_final_token_count:
+            raise ValueError(
+                "final_token_count must match the post-limit token count."
+            )
         if self.truncation_applied != (
             self.character_truncation_applied or self.token_truncation_applied
         ):
@@ -203,6 +229,8 @@ class ArticleSentiment:
             "character_count": self.character_count,
             "original_character_count": self.original_character_count,
             "tokenizer_token_count": self.tokenizer_token_count,
+            "final_token_count": self.final_token_count,
+            "truncation_side": self.truncation_side,
             "truncation_applied": self.truncation_applied,
             "character_truncation_applied": self.character_truncation_applied,
             "token_truncation_applied": self.token_truncation_applied,

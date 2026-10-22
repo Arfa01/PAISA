@@ -24,9 +24,10 @@ import sqlite3
 from typing import Any
 
 
-DATABASE_SCHEMA_VERSION = 5
+DATABASE_SCHEMA_VERSION = 6
 NEWS_RECORD_SCHEMA_VERSION = "1.0"
 QUALITY_REPORT_SCHEMA_VERSION = "2.0"
+SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION = "2.0"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SUPPORTED_DEDUPLICATION_RULES = frozenset(
@@ -1549,6 +1550,467 @@ END;
 """
 
 
+_SCHEMA_V6_SQL = """
+-- Version 5 treated the declared repository/revision tuple as globally unique.
+-- Version 6 makes the reviewed file inventory part of model identity, so an
+-- unverified legacy row and a new hash-bound row must be able to coexist for
+-- the same upstream revisions. The migration driver temporarily disables
+-- enforcement while holding its write lock, rebuilds this parent under a
+-- temporary name, validates every foreign key, and re-enables enforcement.
+-- Existing run/output references therefore continue to identify the untouched
+-- legacy row instead of retroactively certifying it with hashes it never had.
+
+CREATE TABLE sentiment_model_revisions_v6 (
+    model_revision_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    model_repository TEXT NOT NULL,
+    model_revision TEXT NOT NULL,
+    tokenizer_repository TEXT NOT NULL,
+    tokenizer_revision TEXT NOT NULL,
+    original_labels_json TEXT NOT NULL,
+    label_mapping_json TEXT NOT NULL,
+    license_identifier TEXT NOT NULL,
+    library_versions_json TEXT NOT NULL,
+    model_config_sha256 TEXT,
+    tokenizer_config_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    backend_identity_sha256 TEXT UNIQUE,
+    snapshot_inventory_json TEXT,
+    model_weights_sha256 TEXT,
+    tokenizer_vocabulary_sha256 TEXT,
+    tokenizer_special_tokens_sha256 TEXT,
+    CHECK (json_valid(original_labels_json) = 1),
+    CHECK (json_type(original_labels_json) IN ('array', 'object')),
+    CHECK (json_valid(label_mapping_json) = 1),
+    CHECK (json_type(label_mapping_json) = 'object'),
+    CHECK (json_valid(library_versions_json) = 1),
+    CHECK (json_type(library_versions_json) = 'object'),
+    CHECK (
+        model_config_sha256 IS NULL OR length(model_config_sha256) = 64
+    ),
+    CHECK (
+        tokenizer_config_sha256 IS NULL OR length(tokenizer_config_sha256) = 64
+    ),
+    CHECK (
+        backend_identity_sha256 IS NULL
+        OR length(backend_identity_sha256) = 64
+    ),
+    CHECK (
+        snapshot_inventory_json IS NULL OR (
+            json_valid(snapshot_inventory_json) = 1
+            AND json_type(snapshot_inventory_json) = 'array'
+        )
+    ),
+    CHECK (
+        model_weights_sha256 IS NULL OR length(model_weights_sha256) = 64
+    ),
+    CHECK (
+        tokenizer_vocabulary_sha256 IS NULL
+        OR length(tokenizer_vocabulary_sha256) = 64
+    ),
+    CHECK (
+        tokenizer_special_tokens_sha256 IS NULL
+        OR length(tokenizer_special_tokens_sha256) = 64
+    )
+);
+
+INSERT INTO sentiment_model_revisions_v6(
+    model_revision_id, schema_version, model_repository, model_revision,
+    tokenizer_repository, tokenizer_revision, original_labels_json,
+    label_mapping_json, license_identifier, library_versions_json,
+    model_config_sha256, tokenizer_config_sha256, created_at
+)
+SELECT model_revision_id, schema_version, model_repository, model_revision,
+       tokenizer_repository, tokenizer_revision, original_labels_json,
+       label_mapping_json, license_identifier, library_versions_json,
+       model_config_sha256, tokenizer_config_sha256, created_at
+FROM sentiment_model_revisions;
+
+DROP TABLE sentiment_model_revisions;
+ALTER TABLE sentiment_model_revisions_v6 RENAME TO sentiment_model_revisions;
+
+CREATE TRIGGER trg_sentiment_model_revisions_immutable_update
+BEFORE UPDATE ON sentiment_model_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment model revisions are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_model_revisions_immutable_delete
+BEFORE DELETE ON sentiment_model_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment model revisions are immutable');
+END;
+
+CREATE TRIGGER trg_sentiment_model_revisions_hashed_identity_insert
+BEFORE INSERT ON sentiment_model_revisions
+WHEN NEW.backend_identity_sha256 IS NULL
+  OR NEW.snapshot_inventory_json IS NULL
+  OR json_valid(NEW.snapshot_inventory_json) <> 1
+  OR json_type(NEW.snapshot_inventory_json) <> 'array'
+  OR json_array_length(NEW.snapshot_inventory_json) = 0
+  OR NEW.model_config_sha256 IS NULL
+  OR NEW.tokenizer_config_sha256 IS NULL
+  OR NEW.model_weights_sha256 IS NULL
+  OR NEW.tokenizer_vocabulary_sha256 IS NULL
+  OR NEW.tokenizer_special_tokens_sha256 IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment model revision requires hashed snapshot identity');
+END;
+
+ALTER TABLE sentiment_inference_runs
+ADD COLUMN sealed_payload_inventory_sha256 TEXT CHECK (
+    sealed_payload_inventory_sha256 IS NULL
+    OR length(sealed_payload_inventory_sha256) = 64
+);
+
+ALTER TABLE sentiment_inference_runs
+ADD COLUMN run_manifest_contract_sha256 TEXT CHECK (
+    run_manifest_contract_sha256 IS NULL
+    OR length(run_manifest_contract_sha256) = 64
+);
+
+ALTER TABLE article_sentiment_outputs
+ADD COLUMN final_token_count INTEGER CHECK (
+    final_token_count IS NULL OR final_token_count > 0
+);
+
+ALTER TABLE article_sentiment_outputs
+ADD COLUMN truncation_side TEXT CHECK (
+    truncation_side IS NULL OR truncation_side = 'right'
+);
+
+CREATE TRIGGER trg_article_sentiment_outputs_truncation_insert
+BEFORE INSERT ON article_sentiment_outputs
+WHEN NEW.final_token_count IS NULL
+  OR NEW.truncation_side <> 'right'
+  OR NEW.final_token_count <> min(
+      NEW.tokenizer_token_count, NEW.maximum_sequence_length
+  )
+  OR NEW.token_truncation_applied <> (
+      NEW.final_token_count < NEW.tokenizer_token_count
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment output truncation evidence is invalid');
+END;
+
+CREATE TABLE sentiment_run_articles (
+    inference_run_id TEXT NOT NULL,
+    article_id TEXT NOT NULL,
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal >= 0),
+    outcome TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+        outcome IN ('PENDING', 'GENERATED', 'REUSED', 'SKIPPED', 'FAILED')
+    ),
+    sentiment_output_id TEXT,
+    error_id TEXT,
+    PRIMARY KEY (inference_run_id, article_id),
+    UNIQUE (inference_run_id, input_ordinal),
+    CHECK (
+        (outcome = 'PENDING' AND sentiment_output_id IS NULL AND error_id IS NULL)
+        OR (
+            outcome IN ('GENERATED', 'REUSED')
+            AND sentiment_output_id IS NOT NULL AND error_id IS NULL
+        )
+        OR (
+            outcome IN ('SKIPPED', 'FAILED')
+            AND sentiment_output_id IS NULL AND error_id IS NOT NULL
+        )
+    ),
+    FOREIGN KEY (inference_run_id) REFERENCES sentiment_inference_runs(run_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (article_id) REFERENCES normalized_articles(article_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (sentiment_output_id)
+        REFERENCES article_sentiment_outputs(sentiment_output_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (error_id) REFERENCES sentiment_inference_errors(error_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_sentiment_run_articles_output
+ON sentiment_run_articles(sentiment_output_id)
+WHERE sentiment_output_id IS NOT NULL;
+
+-- Backfill the ownership relationship for finalized version-5 output.  The
+-- old schema did not retain explicit reused/input associations, so migration
+-- does not invent those missing facts.
+INSERT INTO sentiment_run_articles(
+    inference_run_id, article_id, input_ordinal, outcome, sentiment_output_id
+)
+SELECT output.inference_run_id, output.article_id,
+       row_number() OVER (
+           PARTITION BY output.inference_run_id ORDER BY output.article_id
+       ) - 1,
+       'GENERATED', output.sentiment_output_id
+FROM article_sentiment_outputs AS output
+JOIN sentiment_inference_runs AS owner
+  ON owner.run_id = output.inference_run_id
+WHERE owner.status IN ('PASS', 'PARTIAL')
+  AND owner.completed_at IS NOT NULL;
+
+CREATE TRIGGER trg_sentiment_run_articles_context_insert
+BEFORE INSERT ON sentiment_run_articles
+WHEN NEW.outcome <> 'PENDING'
+  OR NOT EXISTS (
+      SELECT 1
+      FROM sentiment_inference_runs AS run
+      JOIN article_ingestions AS occurrence
+        ON occurrence.ingestion_run_id = run.source_ingestion_run_id
+       AND occurrence.canonical_article_id = NEW.article_id
+      WHERE run.run_id = NEW.inference_run_id
+        AND run.status = 'RUNNING'
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment run input does not match running source evidence');
+END;
+
+CREATE TRIGGER trg_sentiment_run_articles_context_update
+BEFORE UPDATE ON sentiment_run_articles
+WHEN OLD.outcome <> 'PENDING'
+  OR NEW.inference_run_id <> OLD.inference_run_id
+  OR NEW.article_id <> OLD.article_id
+  OR NEW.input_ordinal <> OLD.input_ordinal
+  OR NOT EXISTS (
+      SELECT 1 FROM sentiment_inference_runs AS run
+      WHERE run.run_id = OLD.inference_run_id AND run.status = 'RUNNING'
+  )
+  OR (
+      NEW.outcome IN ('GENERATED', 'REUSED')
+      AND NOT EXISTS (
+          SELECT 1
+          FROM article_sentiment_outputs AS output
+          JOIN sentiment_inference_runs AS consumer
+            ON consumer.run_id = NEW.inference_run_id
+          JOIN sentiment_inference_runs AS owner
+            ON owner.run_id = output.inference_run_id
+          WHERE output.sentiment_output_id = NEW.sentiment_output_id
+            AND output.article_id = NEW.article_id
+            AND output.source_ingestion_run_id = consumer.source_ingestion_run_id
+            AND output.model_revision_id = consumer.model_revision_id
+            AND output.input_policy_id = consumer.input_policy_id
+            AND (
+                (NEW.outcome = 'GENERATED'
+                 AND output.inference_run_id = NEW.inference_run_id)
+                OR
+                (NEW.outcome = 'REUSED'
+                 AND output.inference_run_id <> NEW.inference_run_id
+                 AND owner.status IN ('PASS', 'PARTIAL')
+                 AND owner.completed_at IS NOT NULL
+                 AND owner.sealed_payload_inventory_sha256 IS NOT NULL
+                 AND owner.run_manifest_contract_sha256 IS NOT NULL)
+            )
+      )
+  )
+  OR (
+      NEW.outcome IN ('SKIPPED', 'FAILED')
+      AND NOT EXISTS (
+          SELECT 1 FROM sentiment_inference_errors AS error
+          WHERE error.error_id = NEW.error_id
+            AND error.inference_run_id = NEW.inference_run_id
+            AND error.article_id = NEW.article_id
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment run outcome contradicts persisted evidence');
+END;
+
+CREATE TRIGGER trg_sentiment_run_articles_immutable_delete
+BEFORE DELETE ON sentiment_run_articles
+WHEN COALESCE((
+    SELECT status FROM sentiment_inference_runs
+    WHERE run_id = OLD.inference_run_id
+), '') <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized sentiment run associations are immutable');
+END;
+
+DROP TRIGGER trg_article_sentiment_outputs_immutable_delete;
+CREATE TRIGGER trg_article_sentiment_outputs_immutable_delete
+BEFORE DELETE ON article_sentiment_outputs
+WHEN COALESCE((
+    SELECT status FROM sentiment_inference_runs
+    WHERE run_id = OLD.inference_run_id
+), '') <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized article sentiment outputs are immutable');
+END;
+
+DROP TRIGGER trg_sentiment_inference_errors_immutable_delete;
+CREATE TRIGGER trg_sentiment_inference_errors_immutable_delete
+BEFORE DELETE ON sentiment_inference_errors
+WHEN COALESCE((
+    SELECT status FROM sentiment_inference_runs
+    WHERE run_id = OLD.inference_run_id
+), '') <> 'RUNNING'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized sentiment inference errors are immutable');
+END;
+
+DROP TRIGGER trg_sentiment_runs_final_status_shape;
+CREATE TRIGGER trg_sentiment_runs_final_status_shape
+BEFORE UPDATE OF status ON sentiment_inference_runs
+WHEN NEW.status <> 'RUNNING' AND (
+    NEW.completed_at IS NULL
+    OR json_valid(NEW.summary_json) <> 1
+    OR json_type(NEW.summary_json) <> 'object'
+    OR json_extract(NEW.summary_json, '$.summary_schema_version') IS NOT '2.0'
+    OR json_extract(NEW.summary_json, '$.schema_version') IS NOT OLD.schema_version
+    OR json_extract(NEW.summary_json, '$.run_id') IS NOT OLD.run_id
+    OR json_extract(NEW.summary_json, '$.status') IS NOT NEW.status
+    OR json_extract(NEW.summary_json, '$.source_ingestion_run_id')
+       IS NOT OLD.source_ingestion_run_id
+    OR json_extract(NEW.summary_json, '$.completed_at') IS NOT NEW.completed_at
+    OR json_extract(NEW.summary_json, '$.model_repository') IS NOT (
+        SELECT model_repository FROM sentiment_model_revisions
+        WHERE model_revision_id = OLD.model_revision_id
+    )
+    OR json_extract(NEW.summary_json, '$.model_revision') IS NOT (
+        SELECT model_revision FROM sentiment_model_revisions
+        WHERE model_revision_id = OLD.model_revision_id
+    )
+    OR json_extract(NEW.summary_json, '$.tokenizer_revision') IS NOT (
+        SELECT tokenizer_revision FROM sentiment_model_revisions
+        WHERE model_revision_id = OLD.model_revision_id
+    )
+    OR json_extract(NEW.summary_json, '$.device') IS NOT OLD.device
+    OR json_extract(NEW.summary_json, '$.artifact_directory')
+       IS NOT OLD.artifact_directory
+    OR json_extract(NEW.summary_json, '$.academic_use_only') IS NOT 1
+    OR json_extract(NEW.summary_json, '$.financial_advice') IS NOT 0
+    OR json_extract(NEW.summary_json, '$.any_articles_failed') IS NOT (
+        EXISTS (
+            SELECT 1 FROM sentiment_run_articles
+            WHERE inference_run_id = OLD.run_id AND outcome = 'FAILED'
+        )
+        OR EXISTS (
+            SELECT 1 FROM sentiment_inference_errors
+            WHERE inference_run_id = OLD.run_id AND article_id IS NULL
+        )
+        OR EXISTS (
+            SELECT 1 FROM article_sentiment_outputs
+            WHERE inference_run_id = OLD.run_id AND error_code IS NOT NULL
+        )
+    )
+    OR (
+        NEW.status = 'FAIL'
+        AND EXISTS (
+            SELECT 1 FROM article_sentiment_outputs
+            WHERE inference_run_id = OLD.run_id
+        )
+    )
+    OR (
+        NEW.status IN ('PASS', 'PARTIAL')
+        AND (
+            NEW.sealed_payload_inventory_sha256 IS NULL
+            OR NEW.run_manifest_contract_sha256 IS NULL
+            OR json_extract(
+                NEW.summary_json, '$.sealed_payload_inventory_sha256'
+            ) IS NOT NEW.sealed_payload_inventory_sha256
+            OR json_extract(
+                NEW.summary_json, '$.run_manifest_contract_sha256'
+            ) IS NOT NEW.run_manifest_contract_sha256
+            OR (SELECT count(*) FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id) = 0
+            OR EXISTS (
+                SELECT 1 FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id AND outcome = 'PENDING'
+            )
+            OR json_extract(NEW.summary_json, '$.articles_requested') IS NOT
+               (SELECT count(*) FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id)
+            OR json_extract(NEW.summary_json, '$.unique_canonical_articles') IS NOT
+               (SELECT count(*) FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id)
+            OR json_extract(
+                NEW.summary_json, '$.articles_successfully_scored'
+            ) IS NOT (SELECT count(*) FROM sentiment_run_articles
+                  WHERE inference_run_id = OLD.run_id
+                    AND outcome = 'GENERATED')
+            OR json_extract(NEW.summary_json, '$.articles_skipped') IS NOT
+               (SELECT count(*) FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id
+                  AND outcome IN ('REUSED', 'SKIPPED'))
+            OR json_extract(NEW.summary_json, '$.articles_failed') IS NOT
+               (SELECT count(*) FROM sentiment_run_articles
+                WHERE inference_run_id = OLD.run_id AND outcome = 'FAILED')
+            OR json_extract(NEW.summary_json, '$.truncated_input_count') IS NOT
+               (SELECT count(*)
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = OLD.run_id
+                  AND input.outcome = 'GENERATED'
+                  AND output.truncation_applied = 1)
+            OR json_extract(
+                NEW.summary_json, '$.ogdc_linked_articles_scored'
+            ) IS NOT (
+                SELECT count(*)
+                FROM sentiment_run_articles AS input
+                WHERE input.inference_run_id = OLD.run_id
+                  AND input.outcome = 'GENERATED'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM article_ingestions AS occurrence
+                      JOIN article_company_links AS link
+                        ON link.occurrence_id = occurrence.occurrence_id
+                      WHERE occurrence.ingestion_run_id = OLD.source_ingestion_run_id
+                        AND occurrence.canonical_article_id = input.article_id
+                        AND upper(link.ticker) = 'OGDC'
+                  )
+            )
+            OR json_extract(NEW.summary_json, '$.label_counts.negative') IS NOT
+               (SELECT count(*)
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = OLD.run_id
+                  AND input.outcome = 'GENERATED'
+                  AND output.predicted_label = 'negative')
+            OR json_extract(NEW.summary_json, '$.label_counts.neutral') IS NOT
+               (SELECT count(*)
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = OLD.run_id
+                  AND input.outcome = 'GENERATED'
+                  AND output.predicted_label = 'neutral')
+            OR json_extract(NEW.summary_json, '$.label_counts.positive') IS NOT
+               (SELECT count(*)
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = OLD.run_id
+                  AND input.outcome = 'GENERATED'
+                  AND output.predicted_label = 'positive')
+            OR (
+                NEW.status = 'PASS'
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM sentiment_inference_errors
+                        WHERE inference_run_id = OLD.run_id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM sentiment_run_articles
+                        WHERE inference_run_id = OLD.run_id
+                          AND outcome IN ('SKIPPED', 'FAILED')
+                    )
+                )
+            )
+            OR (
+                NEW.status = 'PARTIAL'
+                AND NOT EXISTS (
+                    SELECT 1 FROM sentiment_inference_errors
+                    WHERE inference_run_id = OLD.run_id
+                )
+            )
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sentiment final status contradicts certified evidence');
+END;
+"""
+
+
 # The retained PR #12 database was produced by a short-lived version-3 schema
 # immediately before the final constraint hardening landed.  Its object set,
 # indexes, and triggers match version 3 exactly; only these three table
@@ -1885,6 +2347,43 @@ def _sealed_inventory(value: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
     return sorted(entries, key=lambda item: item["path"])
 
 
+def _model_snapshot_inventory(
+    value: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize the reviewed model file identity without requiring a download."""
+
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("snapshot_inventory must be a sequence of mappings")
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_entry in value:
+        if not isinstance(raw_entry, Mapping):
+            raise TypeError("every snapshot inventory entry must be a mapping")
+        path = _artifact_reference(raw_entry.get("path"), field="snapshot path")
+        if len(PurePosixPath(path).parts) != 1:
+            raise ValueError("snapshot inventory entries must be file names")
+        if path in seen:
+            raise ValueError(f"snapshot_inventory contains a duplicate path: {path}")
+        seen.add(path)
+        entry: dict[str, Any] = {
+            "path": path,
+            "sha256": _sha256(
+                raw_entry.get("sha256"), field="snapshot inventory sha256"
+            ),
+        }
+        size = raw_entry.get("size_bytes")
+        if size is not None:
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError(
+                    "snapshot inventory size_bytes must be a non-negative integer"
+                )
+            entry["size_bytes"] = size
+        entries.append(entry)
+    if not entries:
+        raise ValueError("snapshot_inventory cannot be empty")
+    return sorted(entries, key=lambda item: item["path"])
+
+
 def _normalized_title(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
@@ -1950,6 +2449,7 @@ _MIGRATION_NAMES = {
     3: "news_storage_cross_run_integrity",
     4: "news_storage_sealed_finalization",
     5: "financial_sentiment_foundation",
+    6: "sentiment_run_certification",
 }
 
 
@@ -1976,14 +2476,35 @@ def _schema_stage_sql(version: int) -> str:
         return _SCHEMA_V4_SQL
     elif version == 5:
         return _SCHEMA_V5_SQL
+    elif version == 6:
+        return _SCHEMA_V6_SQL
     raise ValueError(f"Unsupported news schema stage: {version}")
 
 
 def _apply_schema_stage(
     connection: sqlite3.Connection, version: int, *, begin: bool = False
 ) -> None:
-    prefix = "BEGIN IMMEDIATE;\n" if begin else ""
-    connection.executescript(prefix + _schema_stage_sql(version))
+    # ``Connection.executescript`` may implicitly commit an already-open
+    # transaction before executing its script.  That behaviour would release a
+    # migration's write lock between validation and the schema mutation.  Feed
+    # complete SQLite statements to ``execute`` instead so a caller-acquired
+    # ``BEGIN IMMEDIATE`` remains in force for the whole stage.  In particular,
+    # ``sqlite3.complete_statement`` keeps trigger bodies together despite the
+    # semicolons inside ``BEGIN ... END``.
+    if begin:
+        connection.execute("BEGIN IMMEDIATE")
+    pending: list[str] = []
+    for line in _schema_stage_sql(version).splitlines(keepends=True):
+        pending.append(line)
+        statement = "".join(pending)
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                connection.execute(statement)
+            pending.clear()
+    if "".join(pending).strip():
+        raise RuntimeError(
+            f"News schema stage {version} ended with an incomplete SQL statement"
+        )
 
 
 def _expected_schema_objects(version: int) -> dict[tuple[str, str], str]:
@@ -2068,46 +2589,6 @@ def _is_recognized_legacy_v3_schema(connection: sqlite3.Connection) -> bool:
 def _repair_recognized_legacy_v3_schema(connection: sqlite3.Connection) -> None:
     """Rebuild only the exact retained pre-hardening v3 table signatures."""
 
-    if not _is_recognized_legacy_v3_schema(connection):
-        raise RuntimeError("Refusing to repair an unrecognized news schema")
-
-    invalid_article = connection.execute(
-        """
-        SELECT article_id FROM normalized_articles
-        WHERE julianday(available_at) IS NULL
-           OR julianday(fetched_at) IS NULL
-           OR julianday(available_at) < julianday(fetched_at)
-           OR (
-               published_at IS NOT NULL AND (
-                   julianday(published_at) IS NULL
-                   OR julianday(available_at) < julianday(published_at)
-               )
-           )
-        LIMIT 1
-        """
-    ).fetchone()
-    invalid_occurrence = connection.execute(
-        """
-        SELECT occurrence_id FROM article_ingestions
-        WHERE raw_evidence_id IS NULL
-           OR julianday(available_at) IS NULL
-           OR julianday(fetched_at) IS NULL
-           OR julianday(available_at) < julianday(fetched_at)
-        LIMIT 1
-        """
-    ).fetchone()
-    invalid_quality = connection.execute(
-        """
-        SELECT ingestion_run_id FROM quality_reports
-        WHERE quality_status NOT IN ('PASS', 'WARN', 'FAIL')
-        LIMIT 1
-        """
-    ).fetchone()
-    if invalid_article is not None or invalid_occurrence is not None or invalid_quality is not None:
-        raise RuntimeError(
-            "Recognized legacy news schema contains rows that violate the hardened contract"
-        )
-
     targets = tuple(_RECOGNIZED_LEGACY_V3_TABLE_SQL)
     definitions = _expected_schema_definitions(3)
     expected_tables = {
@@ -2129,6 +2610,55 @@ def _repair_recognized_legacy_v3_schema(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = OFF")
     try:
         connection.execute("BEGIN IMMEDIATE")
+        # Both the structural signature and every data precondition must be
+        # evaluated after the write lock is held.  Otherwise a concurrent
+        # writer can invalidate the checked state before the rebuilt tables are
+        # installed and the migration is stamped successful.
+        if not _is_recognized_legacy_v3_schema(connection):
+            raise RuntimeError("Refusing to repair an unrecognized news schema")
+
+        invalid_article = connection.execute(
+            """
+            SELECT article_id FROM normalized_articles
+            WHERE julianday(available_at) IS NULL
+               OR julianday(fetched_at) IS NULL
+               OR julianday(available_at) < julianday(fetched_at)
+               OR (
+                   published_at IS NOT NULL AND (
+                       julianday(published_at) IS NULL
+                       OR julianday(available_at) < julianday(published_at)
+                   )
+               )
+            LIMIT 1
+            """
+        ).fetchone()
+        invalid_occurrence = connection.execute(
+            """
+            SELECT occurrence_id FROM article_ingestions
+            WHERE raw_evidence_id IS NULL
+               OR julianday(available_at) IS NULL
+               OR julianday(fetched_at) IS NULL
+               OR julianday(available_at) < julianday(fetched_at)
+            LIMIT 1
+            """
+        ).fetchone()
+        invalid_quality = connection.execute(
+            """
+            SELECT ingestion_run_id FROM quality_reports
+            WHERE quality_status NOT IN ('PASS', 'WARN', 'FAIL')
+            LIMIT 1
+            """
+        ).fetchone()
+        if (
+            invalid_article is not None
+            or invalid_occurrence is not None
+            or invalid_quality is not None
+        ):
+            raise RuntimeError(
+                "Recognized legacy news schema contains rows that violate "
+                "the hardened contract"
+            )
+
         for trigger in trigger_names:
             connection.execute(f"DROP TRIGGER {trigger}")
         for table in targets:
@@ -2289,19 +2819,61 @@ def _validate_v4_migration_preconditions(
         )
 
 
+def _validate_v6_migration_preconditions(
+    connection: sqlite3.Connection,
+) -> None:
+    """Reject legacy failed output that cannot remain safely idempotent.
+
+    Version 5 used a global article/model/policy uniqueness key.  A finalized
+    failed owner cannot be discarded, and version 6 deliberately refuses to
+    treat failed output as reusable evidence.  Preserve that database for
+    audit, but fail closed instead of carrying a permanently poisoned key into
+    the certified schema.
+    """
+
+    failed_output = connection.execute(
+        """
+        SELECT output.sentiment_output_id
+        FROM article_sentiment_outputs AS output
+        JOIN sentiment_inference_runs AS owner
+          ON owner.run_id = output.inference_run_id
+        WHERE owner.status = 'FAIL'
+        LIMIT 1
+        """
+    ).fetchone()
+    if failed_output is not None:
+        raise RuntimeError(
+            "Cannot migrate version-5 sentiment output owned by a failed run: "
+            f"{failed_output['sentiment_output_id']}"
+        )
+
+
 def _migrate_schema(
     connection: sqlite3.Connection, from_version: int, to_version: int
 ) -> None:
     if to_version != from_version + 1:
         raise ValueError("News schema migrations must advance one version at a time")
-    _verify_schema(connection, from_version)
-    if to_version == 3:
-        _validate_existing_deduplication_integrity(connection)
-    if to_version == 4:
-        _validate_existing_deduplication_integrity(connection)
-        _validate_v4_migration_preconditions(connection)
+    rebuilds_model_parent = to_version == 6
+    if rebuilds_model_parent:
+        # SQLite cannot drop/recreate a referenced parent while enforcement is
+        # enabled. Disable it only before the transaction, then hold the write
+        # lock across source verification, the rebuild, and an explicit full
+        # foreign-key check. No other writer can enter the unchecked window.
+        connection.execute("PRAGMA foreign_keys = OFF")
     try:
-        _apply_schema_stage(connection, to_version, begin=True)
+        # Lock before reading any schema or data precondition.  The verified
+        # source state, DDL, migration ledger, and user_version now form one
+        # serializable transaction.
+        connection.execute("BEGIN IMMEDIATE")
+        _verify_schema(connection, from_version)
+        if to_version == 3:
+            _validate_existing_deduplication_integrity(connection)
+        if to_version == 4:
+            _validate_existing_deduplication_integrity(connection)
+            _validate_v4_migration_preconditions(connection)
+        if to_version == 6:
+            _validate_v6_migration_preconditions(connection)
+        _apply_schema_stage(connection, to_version)
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, applied_at)
@@ -2311,25 +2883,41 @@ def _migrate_schema(
         )
         connection.execute(f"PRAGMA user_version = {to_version}")
         _verify_schema(connection, to_version)
+        if rebuilds_model_parent:
+            foreign_key_error = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
+            if foreign_key_error is not None:
+                raise RuntimeError(
+                    "News schema migration produced invalid foreign-key evidence"
+                )
         connection.commit()
     except BaseException:
         connection.rollback()
         raise
+    finally:
+        if rebuilds_model_parent:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _bootstrap_schema(connection: sqlite3.Connection) -> None:
-    existing = connection.execute(
-        """
-        SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-        """
-    ).fetchall()
-    if existing:
-        raise RuntimeError(
-            "Refusing to stamp an unversioned, nonempty news database"
-        )
     try:
-        _apply_schema_stage(connection, 1, begin=True)
+        connection.execute("BEGIN IMMEDIATE")
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 0:
+            raise RuntimeError(
+                "Refusing to bootstrap a concurrently versioned news database"
+            )
+        existing = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+        if existing:
+            raise RuntimeError(
+                "Refusing to stamp an unversioned, nonempty news database"
+            )
+        _apply_schema_stage(connection, 1)
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, applied_at)
@@ -3797,14 +4385,29 @@ class NewsStorage:
         tokenizer_revision = _optional_text(data.get("tokenizer_revision")) or model_revision
         model_config_sha256 = _optional_text(data.get("model_config_sha256"))
         tokenizer_config_sha256 = _optional_text(data.get("tokenizer_config_sha256"))
-        if model_config_sha256 is not None:
-            model_config_sha256 = _sha256(
-                model_config_sha256, field="model_config_sha256"
-            )
-        if tokenizer_config_sha256 is not None:
-            tokenizer_config_sha256 = _sha256(
-                tokenizer_config_sha256, field="tokenizer_config_sha256"
-            )
+        backend_identity_sha256 = _sha256(
+            data.get("backend_identity_sha256"), field="backend_identity_sha256"
+        )
+        snapshot_inventory = _model_snapshot_inventory(
+            data.get("snapshot_inventory", ())
+        )
+        model_config_sha256 = _sha256(
+            model_config_sha256, field="model_config_sha256"
+        )
+        tokenizer_config_sha256 = _sha256(
+            tokenizer_config_sha256, field="tokenizer_config_sha256"
+        )
+        model_weights_sha256 = _sha256(
+            data.get("model_weights_sha256"), field="model_weights_sha256"
+        )
+        tokenizer_vocabulary_sha256 = _sha256(
+            data.get("tokenizer_vocabulary_sha256"),
+            field="tokenizer_vocabulary_sha256",
+        )
+        tokenizer_special_tokens_sha256 = _sha256(
+            data.get("tokenizer_special_tokens_sha256"),
+            field="tokenizer_special_tokens_sha256",
+        )
         row = {
             "model_revision_id": identifier,
             "schema_version": str(data.get("schema_version", "1.0")),
@@ -3824,37 +4427,65 @@ class NewsStorage:
             ),
             "model_config_sha256": model_config_sha256,
             "tokenizer_config_sha256": tokenizer_config_sha256,
+            "backend_identity_sha256": backend_identity_sha256,
+            "snapshot_inventory_json": _json_text(
+                snapshot_inventory, default=[]
+            ),
+            "model_weights_sha256": model_weights_sha256,
+            "tokenizer_vocabulary_sha256": tokenizer_vocabulary_sha256,
+            "tokenizer_special_tokens_sha256": tokenizer_special_tokens_sha256,
             "created_at": _timestamp(
                 data.get("created_at", utc_now_z()), field="created_at"
             ),
         }
-        identity_columns = (
-            "model_revision_id",
-            "model_repository",
-            "model_revision",
-            "tokenizer_repository",
-            "tokenizer_revision",
-        )
         with self.transaction() as connection:
-            existing = connection.execute(
+            existing_by_id = connection.execute(
                 """
                 SELECT * FROM sentiment_model_revisions
-                WHERE model_revision_id = ? OR (
-                    model_repository = ? AND model_revision = ?
-                    AND tokenizer_repository = ? AND tokenizer_revision = ?
-                )
+                WHERE model_revision_id = ?
                 """,
-                tuple(row[column] for column in identity_columns),
+                (identifier,),
             ).fetchone()
-            if existing is not None:
+            if existing_by_id is not None:
                 comparable = tuple(
                     column for column in row if column != "created_at"
                 )
-                if any(existing[column] != row[column] for column in comparable):
+                if any(
+                    existing_by_id[column] != row[column]
+                    for column in comparable
+                ):
                     raise ValueError(
                         "Sentiment model revision identity already has different metadata"
                     )
-                return str(existing["model_revision_id"])
+                return str(existing_by_id["model_revision_id"])
+
+            # A caller-supplied identifier is only an alias for the immutable
+            # hash-bound identity.  Return the already registered canonical ID
+            # when every other field agrees.  Legacy version-5 rows have a NULL
+            # backend identity and therefore never masquerade as reviewed
+            # version-6 evidence merely because their repository/revision tuple
+            # happens to match.
+            existing_by_identity = connection.execute(
+                """
+                SELECT * FROM sentiment_model_revisions
+                WHERE backend_identity_sha256 = ?
+                """,
+                (backend_identity_sha256,),
+            ).fetchone()
+            if existing_by_identity is not None:
+                comparable = tuple(
+                    column
+                    for column in row
+                    if column not in {"model_revision_id", "created_at"}
+                )
+                if any(
+                    existing_by_identity[column] != row[column]
+                    for column in comparable
+                ):
+                    raise ValueError(
+                        "Sentiment model revision identity already has different metadata"
+                    )
+                return str(existing_by_identity["model_revision_id"])
             connection.execute(
                 """
                 INSERT INTO sentiment_model_revisions(
@@ -3862,8 +4493,11 @@ class NewsStorage:
                     model_revision, tokenizer_repository, tokenizer_revision,
                     original_labels_json, label_mapping_json, license_identifier,
                     library_versions_json, model_config_sha256,
-                    tokenizer_config_sha256, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tokenizer_config_sha256, backend_identity_sha256,
+                    snapshot_inventory_json, model_weights_sha256,
+                    tokenizer_vocabulary_sha256,
+                    tokenizer_special_tokens_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(row.values()),
             )
@@ -4051,14 +4685,26 @@ class NewsStorage:
         model_revision_id: str,
         input_policy_id: str,
     ) -> dict[str, Any] | None:
-        """Return the immutable result for one idempotency triple, if present."""
+        """Return a reusable result owned by a finalized run, if present.
+
+        Outputs written by an interrupted ``RUNNING`` owner are intentionally
+        invisible to global idempotency.  They can only be removed through the
+        explicit atomic stale-run discard operation.
+        """
 
         with self.connection() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM article_sentiment_outputs
-                WHERE article_id = ? AND model_revision_id = ?
-                  AND input_policy_id = ?
+                SELECT output.*
+                FROM article_sentiment_outputs AS output
+                JOIN sentiment_inference_runs AS owner
+                  ON owner.run_id = output.inference_run_id
+                WHERE output.article_id = ? AND output.model_revision_id = ?
+                  AND output.input_policy_id = ?
+                  AND owner.status IN ('PASS', 'PARTIAL')
+                  AND owner.completed_at IS NOT NULL
+                  AND owner.sealed_payload_inventory_sha256 IS NOT NULL
+                  AND owner.run_manifest_contract_sha256 IS NOT NULL
                 """,
                 (
                     _safe_id(article_id, field="article_id"),
@@ -4067,6 +4713,162 @@ class NewsStorage:
                 ),
             ).fetchone()
         return None if row is None else dict(row)
+
+    def register_sentiment_run_input(
+        self,
+        run_id: str,
+        article_id: str,
+        *,
+        input_ordinal: int,
+    ) -> None:
+        """Persist one ordered input before inference or idempotent reuse."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        article = _safe_id(article_id, field="article_id")
+        if isinstance(input_ordinal, bool) or not isinstance(input_ordinal, int):
+            raise ValueError("input_ordinal must be a non-negative integer")
+        if input_ordinal < 0:
+            raise ValueError("input_ordinal must be a non-negative integer")
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sentiment_run_articles(
+                    inference_run_id, article_id, input_ordinal
+                ) VALUES (?, ?, ?)
+                """,
+                (identifier, article, input_ordinal),
+            )
+
+    def complete_sentiment_run_input(
+        self,
+        run_id: str,
+        article_id: str,
+        *,
+        outcome: str,
+        sentiment_output_id: str | None = None,
+        error_id: str | None = None,
+    ) -> None:
+        """Bind one input to its generated/reused output or retained error."""
+
+        identifier = _safe_id(run_id, field="run_id")
+        article = _safe_id(article_id, field="article_id")
+        normalized_outcome = str(outcome).strip().upper()
+        if normalized_outcome not in {"GENERATED", "REUSED", "SKIPPED", "FAILED"}:
+            raise ValueError("sentiment input outcome is invalid")
+        output = (
+            None
+            if sentiment_output_id is None
+            else _safe_id(sentiment_output_id, field="sentiment_output_id")
+        )
+        error = None if error_id is None else _safe_id(error_id, field="error_id")
+        with self.transaction() as connection:
+            result = connection.execute(
+                """
+                UPDATE sentiment_run_articles
+                SET outcome = ?, sentiment_output_id = ?, error_id = ?
+                WHERE inference_run_id = ? AND article_id = ?
+                  AND outcome = 'PENDING'
+                """,
+                (normalized_outcome, output, error, identifier, article),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    "Sentiment run input is missing or already has a terminal outcome"
+                )
+
+    def discard_running_sentiment_run(self, run_id: str) -> None:
+        """Atomically discard one explicitly selected unfinished run.
+
+        Finalized evidence is never eligible.  Callers must name the exact run
+        identity, which keeps recovery deliberate instead of guessing whether
+        another process is still active.
+        """
+
+        identifier = _safe_id(run_id, field="run_id")
+        with self.transaction() as connection:
+            current = connection.execute(
+                "SELECT status FROM sentiment_inference_runs WHERE run_id = ?",
+                (identifier,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown sentiment inference run: {identifier}")
+            if current["status"] != "RUNNING":
+                raise RuntimeError("Only a RUNNING sentiment run can be discarded")
+            connection.execute(
+                "DELETE FROM sentiment_run_articles WHERE inference_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM sentiment_inference_errors WHERE inference_run_id = ?",
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM article_sentiment_outputs WHERE inference_run_id = ?",
+                (identifier,),
+            )
+            result = connection.execute(
+                "DELETE FROM sentiment_inference_runs WHERE run_id = ? AND status = 'RUNNING'",
+                (identifier,),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("Could not discard the RUNNING sentiment run")
+
+    def reset_unpublished_sentiment_outputs(self, run_id: str) -> None:
+        """Remove generated outputs after artifact construction fails.
+
+        The run and its ordered input rows remain. Generated inputs return to
+        ``PENDING`` so the run can be retained as truthful ``FAIL`` evidence
+        without leaving an uncertified globally unique result for later reuse.
+        """
+
+        identifier = _safe_id(run_id, field="run_id")
+        with self.transaction() as connection:
+            current = connection.execute(
+                "SELECT status FROM sentiment_inference_runs WHERE run_id = ?",
+                (identifier,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown sentiment inference run: {identifier}")
+            if current["status"] != "RUNNING":
+                raise RuntimeError(
+                    "Only a RUNNING sentiment run can reset unpublished outputs"
+                )
+
+            generated_inputs = connection.execute(
+                """
+                SELECT input.article_id, input.input_ordinal
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = ?
+                  AND input.outcome = 'GENERATED'
+                  AND output.inference_run_id = ?
+                ORDER BY input.input_ordinal
+                """,
+                (identifier, identifier),
+            ).fetchall()
+            connection.execute(
+                """
+                DELETE FROM sentiment_run_articles
+                WHERE inference_run_id = ? AND outcome = 'GENERATED'
+                """,
+                (identifier,),
+            )
+            connection.execute(
+                "DELETE FROM article_sentiment_outputs WHERE inference_run_id = ?",
+                (identifier,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO sentiment_run_articles(
+                    inference_run_id, article_id, input_ordinal
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    (identifier, str(row["article_id"]), int(row["input_ordinal"]))
+                    for row in generated_inputs
+                ),
+            )
 
     def save_article_sentiment(
         self, record: Any | None = None, **values: Any
@@ -4228,8 +5030,37 @@ class NewsStorage:
                 data.get("tokenizer_token_count"),
                 field="tokenizer_token_count",
             )
+            if data.get("final_token_count") is None:
+                raise ValueError(
+                    "final_token_count is required as observed tokenizer output"
+                )
+            final_token_count = _positive_integer(
+                data.get("final_token_count"),
+                field="final_token_count",
+            )
+            if final_token_count > maximum_sequence_length:
+                raise ValueError(
+                    "final_token_count cannot exceed maximum_sequence_length"
+                )
+            if final_token_count > tokenizer_token_count:
+                raise ValueError(
+                    "final_token_count cannot exceed tokenizer_token_count"
+                )
+            if data.get("truncation_side") is None:
+                raise ValueError(
+                    "truncation_side is required as observed tokenizer configuration"
+                )
+            truncation_side = str(data.get("truncation_side")).strip().lower()
+            if truncation_side != "right":
+                raise ValueError("truncation_side must be right")
+            if final_token_count != min(
+                tokenizer_token_count, maximum_sequence_length
+            ):
+                raise ValueError(
+                    "final_token_count must match the post-limit token count"
+                )
             if token_truncation_applied != int(
-                tokenizer_token_count > maximum_sequence_length
+                final_token_count < tokenizer_token_count
             ):
                 raise ValueError(
                     "token_truncation_applied must match the tokenizer count and limit"
@@ -4252,6 +5083,8 @@ class NewsStorage:
                 "token_truncation_applied": token_truncation_applied,
                 "maximum_input_characters": maximum_input_characters,
                 "tokenizer_token_count": tokenizer_token_count,
+                "final_token_count": final_token_count,
+                "truncation_side": truncation_side,
                 "truncation_applied": truncation_applied,
                 "maximum_sequence_length": maximum_sequence_length,
                 "class_labels_json": class_labels_json,
@@ -4263,13 +5096,24 @@ class NewsStorage:
             }
             existing = connection.execute(
                 """
-                SELECT * FROM article_sentiment_outputs
-                WHERE article_id = ? AND model_revision_id = ?
-                  AND input_policy_id = ?
+                SELECT output.*, owner.status AS owner_status
+                FROM article_sentiment_outputs AS output
+                JOIN sentiment_inference_runs AS owner
+                  ON owner.run_id = output.inference_run_id
+                WHERE output.article_id = ? AND output.model_revision_id = ?
+                  AND output.input_policy_id = ?
                 """,
                 (article_id, model_revision_id, input_policy_id),
             ).fetchone()
             if existing is not None:
+                if (
+                    existing["owner_status"] == "RUNNING"
+                    and existing["inference_run_id"] != run_id
+                ):
+                    raise RuntimeError(
+                        "Sentiment output is owned by an unfinished run; "
+                        "discard or recover that exact run before retrying"
+                    )
                 for field, expected in semantic_values.items():
                     observed = existing[field]
                     if isinstance(expected, float):
@@ -4321,7 +5165,8 @@ class NewsStorage:
                     character_count, original_character_count,
                     character_truncation_applied, token_truncation_applied,
                     maximum_input_characters, tokenizer_token_count,
-                    truncation_applied, maximum_sequence_length,
+                    final_token_count, truncation_side, truncation_applied,
+                    maximum_sequence_length,
                     original_language, published_at, available_at, fetched_at,
                     class_labels_json,
                     negative_probability, neutral_probability,
@@ -4331,7 +5176,7 @@ class NewsStorage:
                     error_code, error_message
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -4350,6 +5195,8 @@ class NewsStorage:
                     semantic_values["token_truncation_applied"],
                     semantic_values["maximum_input_characters"],
                     semantic_values["tokenizer_token_count"],
+                    semantic_values["final_token_count"],
+                    semantic_values["truncation_side"],
                     semantic_values["truncation_applied"],
                     maximum_sequence_length,
                     _optional_text(data.get("original_language")),
@@ -4477,7 +5324,7 @@ class NewsStorage:
         summary: Mapping[str, Any] | None = None,
         error_message: str | None = None,
     ) -> None:
-        """Finalize a sentiment run without permitting an error-bearing PASS."""
+        """Finalize a run from database-derived, checksum-bound evidence."""
 
         identifier = _safe_id(run_id, field="run_id")
         final_status = str(status).strip().upper()
@@ -4485,7 +5332,7 @@ class NewsStorage:
             raise ValueError("Final sentiment status must be PASS, PARTIAL, or FAIL")
         with self.transaction() as connection:
             current = connection.execute(
-                "SELECT status FROM sentiment_inference_runs WHERE run_id = ?",
+                "SELECT * FROM sentiment_inference_runs WHERE run_id = ?",
                 (identifier,),
             ).fetchone()
             if current is None:
@@ -4494,6 +5341,16 @@ class NewsStorage:
                 raise RuntimeError(
                     f"Sentiment inference run is already finalized: {identifier}"
                 )
+            model_revision = connection.execute(
+                """
+                SELECT model_repository, model_revision, tokenizer_revision
+                FROM sentiment_model_revisions
+                WHERE model_revision_id = ?
+                """,
+                (current["model_revision_id"],),
+            ).fetchone()
+            if model_revision is None:
+                raise RuntimeError("Sentiment run model revision is missing")
             error_count = int(
                 connection.execute(
                     """
@@ -4513,23 +5370,179 @@ class NewsStorage:
                 ).fetchone()[0]
             )
             error_count += output_error_count
+            run_error_count = int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM sentiment_inference_errors
+                    WHERE inference_run_id = ? AND article_id IS NULL
+                    """,
+                    (identifier,),
+                ).fetchone()[0]
+            )
             if final_status == "PASS" and error_count:
                 raise RuntimeError("A PASS sentiment run cannot contain errors")
             if final_status == "PARTIAL" and not error_count:
                 raise RuntimeError("A PARTIAL sentiment run requires retained errors")
+
+            evidence = connection.execute(
+                """
+                SELECT
+                    count(*) AS input_count,
+                    sum(outcome = 'PENDING') AS pending_count,
+                    sum(outcome = 'GENERATED') AS generated_count,
+                    sum(outcome = 'REUSED') AS reused_count,
+                    sum(outcome = 'SKIPPED') AS skipped_count,
+                    sum(outcome = 'FAILED') AS failed_count
+                FROM sentiment_run_articles
+                WHERE inference_run_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            assert evidence is not None
+            counts = {
+                key: int(evidence[key] or 0)
+                for key in (
+                    "input_count",
+                    "pending_count",
+                    "generated_count",
+                    "reused_count",
+                    "skipped_count",
+                    "failed_count",
+                )
+            }
+            if final_status in {"PASS", "PARTIAL"}:
+                if counts["input_count"] == 0:
+                    raise RuntimeError(
+                        "A completed sentiment run requires persisted input evidence"
+                    )
+                if counts["pending_count"]:
+                    raise RuntimeError(
+                        "A completed sentiment run cannot contain pending inputs"
+                    )
+
+            generated_rows = connection.execute(
+                """
+                SELECT output.predicted_label, output.truncation_applied,
+                       output.article_id
+                FROM sentiment_run_articles AS input
+                JOIN article_sentiment_outputs AS output
+                  ON output.sentiment_output_id = input.sentiment_output_id
+                WHERE input.inference_run_id = ?
+                  AND input.outcome = 'GENERATED'
+                """,
+                (identifier,),
+            ).fetchall()
+            label_counts = {label: 0 for label in ("negative", "neutral", "positive")}
+            for generated in generated_rows:
+                label_counts[str(generated["predicted_label"])] += 1
+            ogdc_linked = int(
+                connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM sentiment_run_articles AS input
+                    WHERE input.inference_run_id = ?
+                      AND input.outcome = 'GENERATED'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM sentiment_inference_runs AS run
+                          JOIN article_ingestions AS occurrence
+                            ON occurrence.ingestion_run_id = run.source_ingestion_run_id
+                           AND occurrence.canonical_article_id = input.article_id
+                          JOIN article_company_links AS link
+                            ON link.occurrence_id = occurrence.occurrence_id
+                          WHERE run.run_id = input.inference_run_id
+                            AND upper(link.ticker) = 'OGDC'
+                      )
+                    """,
+                    (identifier,),
+                ).fetchone()[0]
+            )
+            completed = _timestamp(
+                completed_at or utc_now_z(), field="completed_at"
+            )
+            normalized_summary = dict(summary or {})
+            normalized_summary.update(
+                {
+                    "summary_schema_version": SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION,
+                    "schema_version": str(current["schema_version"]),
+                    "run_id": identifier,
+                    "status": final_status,
+                    "source_ingestion_run_id": str(
+                        current["source_ingestion_run_id"]
+                    ),
+                    "model_repository": str(model_revision["model_repository"]),
+                    "model_revision": str(model_revision["model_revision"]),
+                    "tokenizer_revision": str(
+                        model_revision["tokenizer_revision"]
+                    ),
+                    "device": str(current["device"]),
+                    "artifact_directory": str(current["artifact_directory"]),
+                    "completed_at": completed,
+                    "articles_requested": counts["input_count"],
+                    "unique_canonical_articles": counts["input_count"],
+                    "articles_successfully_scored": counts["generated_count"],
+                    "articles_skipped": counts["reused_count"]
+                    + counts["skipped_count"],
+                    "articles_failed": counts["failed_count"],
+                    "label_counts": label_counts,
+                    "truncated_input_count": sum(
+                        int(row["truncation_applied"]) for row in generated_rows
+                    ),
+                    "ogdc_linked_articles_scored": ogdc_linked,
+                    "any_articles_failed": bool(
+                        counts["failed_count"]
+                        or run_error_count
+                        or output_error_count
+                    ),
+                    "academic_use_only": True,
+                    "financial_advice": False,
+                }
+            )
+            payload_seal = normalized_summary.get(
+                "sealed_payload_inventory_sha256"
+            )
+            contract_seal = normalized_summary.get("run_manifest_contract_sha256")
+            if final_status in {"PASS", "PARTIAL"}:
+                payload_seal = _sha256(
+                    payload_seal,
+                    field="sealed_payload_inventory_sha256",
+                )
+                contract_seal = _sha256(
+                    contract_seal,
+                    field="run_manifest_contract_sha256",
+                )
+            else:
+                payload_seal = (
+                    None
+                    if payload_seal is None
+                    else _sha256(
+                        payload_seal,
+                        field="sealed_payload_inventory_sha256",
+                    )
+                )
+                contract_seal = (
+                    None
+                    if contract_seal is None
+                    else _sha256(
+                        contract_seal,
+                        field="run_manifest_contract_sha256",
+                    )
+                )
             result = connection.execute(
                 """
                 UPDATE sentiment_inference_runs
-                SET completed_at = ?, status = ?, summary_json = ?, error_message = ?
+                SET completed_at = ?, status = ?, summary_json = ?, error_message = ?,
+                    sealed_payload_inventory_sha256 = ?,
+                    run_manifest_contract_sha256 = ?
                 WHERE run_id = ? AND status = 'RUNNING'
                 """,
                 (
-                    _timestamp(
-                        completed_at or utc_now_z(), field="completed_at"
-                    ),
+                    completed,
                     final_status,
-                    _json_text(summary, default={}),
+                    _json_text(normalized_summary, default={}),
                     _optional_text(error_message),
+                    payload_seal,
+                    contract_seal,
                     identifier,
                 ),
             )
@@ -4664,6 +5677,7 @@ SQLiteNewsRepository = NewsStorage
 __all__ = [
     "DATABASE_SCHEMA_VERSION",
     "NEWS_RECORD_SCHEMA_VERSION",
+    "SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION",
     "NewsRepository",
     "NewsStorage",
     "SQLiteNewsRepository",

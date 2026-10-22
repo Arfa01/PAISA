@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
@@ -15,7 +16,10 @@ import paisa.sentiment.pipeline as sentiment_pipeline
 from paisa.sentiment.artifacts import SentimentRunCollisionError
 from paisa.sentiment.config import FINBERT_MODEL_REVISION
 from paisa.sentiment.inference import SentimentInferenceConfig
-from paisa.sentiment.pipeline import run_sentiment_inference
+from paisa.sentiment.pipeline import (
+    _run_sentiment_inference_with_backend_for_testing,
+    run_sentiment_inference,
+)
 
 
 SOURCE_RUN_ID = "NEWS-20261022-100000-feedbeef"
@@ -60,8 +64,14 @@ def _create_source_run(tmp_path: Path, *, second_language: str = "en-us") -> Pat
     return database
 
 
-def _run(tmp_path: Path, mock_backend, *, run_id: str = SENTIMENT_RUN_ID):
-    return run_sentiment_inference(
+def _run(
+    tmp_path: Path,
+    mock_backend,
+    *,
+    run_id: str = SENTIMENT_RUN_ID,
+    discard_stale_running: bool = False,
+):
+    return _run_sentiment_inference_with_backend_for_testing(
         source_ingestion_run_id=SOURCE_RUN_ID,
         database_path=tmp_path / "data" / "news.sqlite3",
         output_dir=tmp_path / "artifacts" / "sentiment_inference",
@@ -71,6 +81,7 @@ def _run(tmp_path: Path, mock_backend, *, run_id: str = SENTIMENT_RUN_ID):
         backend=mock_backend,
         config=SentimentInferenceConfig(batch_size=1, maximum_articles=10),
         audit_sample_size=1,
+        discard_stale_running=discard_stale_running,
     )
 
 
@@ -126,10 +137,84 @@ def test_pipeline_publishes_checksum_bound_body_free_run(
     assert len(rows) == 2
     assert all(row["available_at"] == "2026-10-22T10:00:00Z" for row in rows)
     assert all(row["inference_timestamp"] != row["available_at"] for row in rows)
+    assert all(row["truncation_side"] == "right" for row in rows)
+    assert all(int(row["final_token_count"]) <= int(row["tokenizer_token_count"]) for row in rows)
+
+    model_manifest = json.loads((root / "model_manifest.json").read_text())
+    assert len(model_manifest["backend_identity_sha256"]) == 64
+    assert {row["path"] for row in model_manifest["reviewed_snapshot_files"]} == {
+        "config.json",
+        "model.safetensors",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "vocab.txt",
+    }
+    with (root / "audit_sample.csv").open(newline="", encoding="utf-8") as handle:
+        audit_row = next(csv.DictReader(handle))
+    assert audit_row["truncation_side"] == "right"
+    assert audit_row["final_token_count"]
+    assert audit_row["maximum_sequence_length"] == "512"
+    assert audit_row["token_truncation_applied"] in {"True", "False"}
 
     storage = NewsStorage(database).initialize()
     assert storage.get_run(SOURCE_RUN_ID)["status"] == "PASS"
     assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "PASS"
+
+
+def test_public_pipeline_does_not_accept_an_arbitrary_backend(mock_backend):
+    assert "backend" not in inspect.signature(run_sentiment_inference).parameters
+    with pytest.raises(TypeError, match="unexpected keyword argument 'backend'"):
+        run_sentiment_inference(  # type: ignore[call-arg]
+            source_ingestion_run_id=SOURCE_RUN_ID,
+            backend=mock_backend,
+        )
+
+
+def test_pipeline_uses_canonical_registered_model_identity(tmp_path, mock_backend):
+    database = _create_source_run(tmp_path)
+    identity = mock_backend.identity
+    canonical_id = "SMR-preexisting-hashbound"
+    storage = NewsStorage(database).initialize()
+    assert storage.register_sentiment_model_revision(
+        model_revision_id=canonical_id,
+        schema_version="1.0",
+        model_repository=identity.model_repository,
+        model_revision=identity.model_revision,
+        tokenizer_repository=identity.tokenizer_repository,
+        tokenizer_revision=identity.tokenizer_revision,
+        original_labels=list(identity.original_labels_by_index),
+        label_mapping=dict(identity.canonical_probability_index_mapping),
+        license_identifier=identity.license_identifier,
+        library_versions=sentiment_pipeline._PINNED_RUNTIME_REQUIREMENTS,
+        backend_identity_sha256=identity.identity_sha256,
+        snapshot_inventory=[
+            {"path": path, "sha256": digest}
+            for path, digest in sorted(identity.snapshot_files_sha256.items())
+        ],
+        model_config_sha256=identity.snapshot_files_sha256["config.json"],
+        tokenizer_config_sha256=identity.snapshot_files_sha256[
+            "tokenizer_config.json"
+        ],
+        model_weights_sha256=identity.snapshot_files_sha256[
+            "model.safetensors"
+        ],
+        tokenizer_vocabulary_sha256=identity.snapshot_files_sha256["vocab.txt"],
+        tokenizer_special_tokens_sha256=identity.snapshot_files_sha256[
+            "special_tokens_map.json"
+        ],
+        created_at="2026-10-22T10:00:00Z",
+    ) == canonical_id
+
+    summary = _run(tmp_path, mock_backend)
+
+    assert summary.status == "PASS"
+    persisted = storage.get_sentiment_run(SENTIMENT_RUN_ID)
+    assert persisted is not None
+    assert persisted["model_revision_id"] == canonical_id
+    manifest = json.loads(
+        (_artifact_root(tmp_path) / "model_manifest.json").read_text()
+    )
+    assert manifest["model_revision_id"] == canonical_id
 
 
 def test_exact_rerun_is_idempotently_skipped_without_model_call(tmp_path, mock_backend):
@@ -234,7 +319,7 @@ def test_watchdog_bounds_the_entire_multi_batch_invocation(
     ticks = iter((0.0, 0.25, 1.25, 1.5))
     monkeypatch.setattr(sentiment_pipeline, "monotonic", lambda: next(ticks))
 
-    summary = run_sentiment_inference(
+    summary = _run_sentiment_inference_with_backend_for_testing(
         source_ingestion_run_id=SOURCE_RUN_ID,
         database_path=database,
         output_dir=tmp_path / "artifacts" / "sentiment_inference",
@@ -250,8 +335,9 @@ def test_watchdog_bounds_the_entire_multi_batch_invocation(
         audit_sample_size=1,
     )
 
-    assert summary.status == "FAIL"
+    assert summary.status == "PARTIAL"
     assert summary.articles_successfully_scored == 1
+    assert summary.articles_failed == 1
     assert len(mock_backend.batches) == 1
     errors = json.loads(
         (_artifact_root(tmp_path) / "inference_errors.json").read_text()
@@ -263,6 +349,7 @@ def test_artifact_write_failure_finalizes_database_as_fail(
     tmp_path, mock_backend, monkeypatch
 ):
     database = _create_source_run(tmp_path)
+    original_write_json = sentiment_pipeline.write_json
 
     def fail_write(*_args, **_kwargs):
         raise OSError("private filesystem detail")
@@ -277,7 +364,21 @@ def test_artifact_write_failure_finalizes_database_as_fail(
     assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "FAIL"
     errors = storage.list_sentiment_errors(SENTIMENT_RUN_ID)
     assert errors[-1]["error_type"] == "artifact_publication_failed"
+    assert storage.list_article_sentiments_for_run(SENTIMENT_RUN_ID) == []
     assert not _artifact_root(tmp_path).exists()
+
+    monkeypatch.setattr(sentiment_pipeline, "write_json", original_write_json)
+    retry_backend = type(mock_backend)()
+    retry = _run(
+        tmp_path,
+        retry_backend,
+        run_id="SENT-20261022-110001-artretry",
+    )
+
+    assert retry.status == "PASS"
+    assert retry.articles_successfully_scored == 2
+    assert retry.articles_skipped == 0
+    assert [len(batch) for batch in retry_backend.batches] == [1, 1]
 
 
 def test_sqlite_finalization_failure_publishes_only_truthful_fail(
@@ -331,7 +432,7 @@ def test_driver_error_after_exact_commit_publishes_matching_pack(
     assert json.loads(persisted["summary_json"]) == artifact_summary
 
 
-def test_driver_error_after_mismatched_commit_refuses_publication(
+def test_database_derives_counts_before_post_commit_driver_error(
     tmp_path, mock_backend, monkeypatch
 ):
     database = _create_source_run(tmp_path)
@@ -349,21 +450,23 @@ def test_driver_error_after_mismatched_commit_refuses_publication(
         commit_different_summary_then_raise,
     )
 
-    with pytest.raises(RuntimeError, match="does not match the staged run"):
-        _run(tmp_path, mock_backend)
+    summary = _run(tmp_path, mock_backend)
 
-    assert not _artifact_root(tmp_path).exists()
+    assert summary.status == "PASS"
+    assert _artifact_root(tmp_path).exists()
     storage = NewsStorage(database).initialize()
     persisted = storage.get_sentiment_run(SENTIMENT_RUN_ID)
     assert persisted is not None
     assert persisted["status"] == "PASS"
-    assert json.loads(persisted["summary_json"])["articles_requested"] == 999
+    assert json.loads(persisted["summary_json"])["articles_requested"] == 2
 
 
 def test_interruption_before_database_finalization_never_exposes_pass(
     tmp_path, mock_backend, monkeypatch
 ):
     database = _create_source_run(tmp_path)
+
+    original = NewsStorage.finalize_sentiment_run
 
     def interrupt_finalization(*_args, **_kwargs):
         raise KeyboardInterrupt
@@ -381,6 +484,100 @@ def test_interruption_before_database_finalization_never_exposes_pass(
     storage = NewsStorage(database).initialize()
     assert storage.get_run(SOURCE_RUN_ID)["status"] == "PASS"
     assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "RUNNING"
+
+    monkeypatch.setattr(NewsStorage, "finalize_sentiment_run", original)
+    recovered = _run(
+        tmp_path,
+        type(mock_backend)(),
+        discard_stale_running=True,
+    )
+    assert recovered.status == "PASS"
+    assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "PASS"
+
+
+def test_interruption_before_first_batch_requires_explicit_same_id_discard(
+    tmp_path, mock_backend
+):
+    database = _create_source_run(tmp_path)
+
+    class InterruptBeforeBatch(type(mock_backend)):
+        @property
+        def library_versions(self):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(tmp_path, InterruptBeforeBatch())
+
+    storage = NewsStorage(database).initialize()
+    assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "RUNNING"
+    with pytest.raises(SentimentRunCollisionError, match="already exists"):
+        _run(tmp_path, type(mock_backend)())
+
+    recovered = _run(
+        tmp_path,
+        type(mock_backend)(),
+        discard_stale_running=True,
+    )
+    assert recovered.status == "PASS"
+
+
+def test_interruption_during_batch_cannot_poison_replacement_idempotency(
+    tmp_path, mock_backend, monkeypatch
+):
+    database = _create_source_run(tmp_path)
+    original = NewsStorage.save_article_sentiment
+    calls = 0
+
+    def persist_then_interrupt(self, *args, **kwargs):
+        nonlocal calls
+        result = original(self, *args, **kwargs)
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(
+        NewsStorage,
+        "save_article_sentiment",
+        persist_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _run(tmp_path, mock_backend)
+    monkeypatch.setattr(NewsStorage, "save_article_sentiment", original)
+
+    storage = NewsStorage(database).initialize()
+    assert storage.get_sentiment_run(SENTIMENT_RUN_ID)["status"] == "RUNNING"
+    with storage.connection() as connection:
+        assert connection.execute(
+            """
+            SELECT count(*) FROM article_sentiment_outputs
+            WHERE inference_run_id = ?
+            """,
+            (SENTIMENT_RUN_ID,),
+        ).fetchone()[0] == 1
+
+    replacement_id = "SENT-20261022-110300-bad0cafe"
+    replacement = _run(
+        tmp_path,
+        type(mock_backend)(),
+        run_id=replacement_id,
+    )
+    assert replacement.status == "FAIL"
+    with storage.connection() as connection:
+        assert connection.execute(
+            """
+            SELECT count(*) FROM sentiment_run_articles
+            WHERE inference_run_id = ? AND outcome = 'REUSED'
+            """,
+            (replacement_id,),
+        ).fetchone()[0] == 0
+
+    recovered = _run(
+        tmp_path,
+        type(mock_backend)(),
+        discard_stale_running=True,
+    )
+    assert recovered.status == "PASS"
 
 
 def test_publication_failure_after_database_commit_is_recoverable(

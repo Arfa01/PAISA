@@ -46,14 +46,16 @@ Run `SENT-20261022-172211-real0002` completed with `PASS` on CPU against
 `NEWS-20261022-131242-5ddffd2d`: all `30` requested unique canonical articles
 were scored, none were skipped or failed, one was OGDC-linked, the label counts
 were `negative=11`, `neutral=9`, and `positive=10`, and `17` inputs were
-truncated. Its schema migrated to version `5`; generated artifacts remain
+truncated. Its retained execution used schema version `5`; current code targets
+schema `6`. Generated artifacts remain
 outside Git at
 `artifacts/sentiment_inference/SENT-20261022-172211-real0002`.
 
 Remaining gate: review the retained audit sample and outputs before defining
 daily aggregation. The accepted ingestion artifacts still record their
 historical schema version `3`, while the working
-`data/news/paisa_news.sqlite3` is now schema version `5`. Preserve the ignored,
+`data/news/paisa_news.sqlite3` was retained at schema version `5` and is
+upgraded to `6` by current code. Preserve the ignored,
 uncommitted pre-migration copy at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified as
 schema version `3` with `31` canonical articles, `150` article occurrences,

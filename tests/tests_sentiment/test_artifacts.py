@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
+import os
 
 import pytest
 
@@ -42,16 +43,111 @@ def test_artifact_inventory_is_exact_and_checksum_bound(tmp_path: Path) -> None:
         artifact_inventory(tmp_path, expected_files=("quality_report.json",))
 
 
+def test_artifact_inventory_rejects_symlinked_payload(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.json"
+    outside.write_text('{"secret": true}\n', encoding="utf-8")
+    os.symlink(outside, tmp_path / "quality_report.json")
+
+    with pytest.raises(ValueError, match="regular files"):
+        artifact_inventory(tmp_path, expected_files=("quality_report.json",))
+
+
+def test_publish_is_atomically_no_replace_during_check_use_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "SENT-20261022-130405-deadbeef"
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    (staging / "evidence.txt").write_text("new", encoding="utf-8")
+
+    from paisa.sentiment import artifacts
+
+    original = artifacts._rename_noreplace
+
+    expected = artifact_inventory(staging, expected_files=("evidence.txt",))
+
+    def race(source: Path, target: Path, **kwargs) -> None:
+        target.mkdir()
+        (target / "incumbent.txt").write_text("old", encoding="utf-8")
+        original(source, target, **kwargs)
+
+    monkeypatch.setattr(artifacts, "_rename_noreplace", race)
+    with pytest.raises(SentimentRunCollisionError):
+        publish_staged_run(staging, destination, expected_inventory=expected)
+
+    assert (destination / "incumbent.txt").read_text(encoding="utf-8") == "old"
+    assert staging.is_dir()
+
+
 def test_publish_refuses_immutable_run_collision(tmp_path: Path) -> None:
     destination = tmp_path / "SENT-20261022-130405-deadbeef"
     destination.mkdir()
     staging = tmp_path / ".staging"
     staging.mkdir()
+    (staging / "evidence.txt").write_text("new", encoding="utf-8")
+    expected = artifact_inventory(staging, expected_files=("evidence.txt",))
 
     with pytest.raises(SentimentRunCollisionError):
-        publish_staged_run(staging, destination)
+        publish_staged_run(staging, destination, expected_inventory=expected)
 
     assert staging.exists()
+
+
+def test_publish_rejects_staging_root_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "SENT-20261022-130405-deadbeef"
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    (staging / "evidence.txt").write_text("sealed", encoding="utf-8")
+    expected = artifact_inventory(staging, expected_files=("evidence.txt",))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evidence.txt").write_text("external", encoding="utf-8")
+    displaced = tmp_path / ".displaced"
+
+    from paisa.sentiment import artifacts
+
+    original = artifacts._rename_noreplace
+
+    def swap_root(source: Path, target: Path, **kwargs) -> None:
+        source.rename(displaced)
+        source.symlink_to(outside, target_is_directory=True)
+        original(source, target, **kwargs)
+
+    monkeypatch.setattr(artifacts, "_rename_noreplace", swap_root)
+    with pytest.raises(RuntimeError, match="staging root changed"):
+        publish_staged_run(staging, destination, expected_inventory=expected)
+
+    assert not destination.exists()
+    assert staging.is_symlink()
+
+
+def test_publish_rejects_leaf_replacement_after_initial_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "SENT-20261022-130405-deadbeef"
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    evidence = staging / "evidence.txt"
+    evidence.write_text("sealed", encoding="utf-8")
+    expected = artifact_inventory(staging, expected_files=("evidence.txt",))
+
+    from paisa.sentiment import artifacts
+
+    original = artifacts._rename_noreplace
+
+    def replace_leaf(source: Path, target: Path, **kwargs) -> None:
+        evidence.unlink()
+        evidence.write_text("different", encoding="utf-8")
+        original(source, target, **kwargs)
+
+    monkeypatch.setattr(artifacts, "_rename_noreplace", replace_leaf)
+    with pytest.raises(RuntimeError, match="artifact bytes changed"):
+        publish_staged_run(staging, destination, expected_inventory=expected)
+
+    assert staging.is_dir()
+    assert not destination.exists()
 
 
 def test_generated_model_weights_and_cache_are_ignored_by_git() -> None:

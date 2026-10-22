@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "timeout_seconds": 20,
+  "user_agent": "PAISA academic news ingestion/0.1 (+https://github.com/Arfa01/PAISA)",
+  "sources": [
+    {
+      "source_id": "dawn-business",
+      "name": "Dawn Business",
+      "url": "https://www.dawn.com/feeds/business",
+      "source_type": "rss",
+      "language": "en",
+      "default_timezone": "Asia/Karachi",
+      "enabled": true
+    }
+  ]
+}

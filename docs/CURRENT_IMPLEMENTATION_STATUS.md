@@ -2,7 +2,7 @@
 
 Status date: 22 October 2026
 
-Code baseline: `origin/main` at `826c371` after PR #10
+Feature base: `origin/main` at `418d6b5` after PR #11
 
 Retained demonstration run: `VSL-20261020-OGDC-main-02`
 
@@ -19,9 +19,10 @@ portfolio curves, and simulated returns are not financial advice.
 | Decision and simulation | Predictions pass through a separate threshold policy into separate long-only portfolio ledgers. The retained run uses buy at `probability_up >= 0.60`, sell at `probability_up <= 0.40`, a 50% maximum allocation, whole shares, 10-basis-point execution fees, next-session-open execution, and close valuation. |
 | Independent comparisons | Each model has its own experiment, portfolio, trades, cash, holdings, and snapshots. Cash-only and 50%-allocated buy-and-hold benchmarks use the common test window and cost assumptions. |
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
+| News-ingestion foundation | The isolated `paisa.news` package captures configured RSS/Atom responses or permitted manual CSV imports; preserves raw bytes and acquisition metadata; normalizes schema `1.0`; keeps publication, fetch, and defensible availability timestamps distinct; applies layered deterministic deduplication; links boundary-safe controlled OGDC aliases; persists canonical and per-ingestion evidence in local SQLite; and publishes immutable quality reports. It does not run sentiment or alter the price/model stack. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
-| Verification | On 22 October 2026 the pre-documentation branch baseline passed `276` Python tests with `1` optional TensorFlow test skipped, all `57` frontend tests, frontend lint, frontend build, and `pip check`. |
+| Verification | The news-feature branch passes `384` Python tests with `1` optional TensorFlow test skipped, all `57` frontend tests, frontend lint, frontend production build, `pip check`, bytecode compilation for the news package/CLI, and `git diff --check`. Pytest reports the existing Starlette/httpx deprecation warning; the frontend build reports the existing large-bundle advisory. |
 
 ## Retained real-run evidence
 
@@ -50,6 +51,35 @@ The run reports separate conclusions:
   return with a 12.79045% maximum drawdown.
 - No model portfolio beats buy-and-hold in total return in this run.
 
+### Accepted news-ingestion execution
+
+The accepted network-acquired RSS run `NEWS-20261022-131242-5ddffd2d`
+reached run/quality status `PASS`/`PASS` against one configured Dawn Business
+feed. It recorded `30` raw and `30` normalized occurrences, `29` duplicates,
+`1` OGDC-linked occurrence, `0` missing publication times, and a publication
+range from `2026-10-19T18:56:40Z` through `2026-10-22T13:07:31Z`. The source
+response was acquired at `2026-10-22T13:12:43.088883Z`, after the run start at
+`2026-10-22T13:12:42.772512Z`, and its declared and observed SHA-256 values
+match. Evidence is under
+`artifacts/news_ingestion/NEWS-20261022-131242-5ddffd2d/` and is ignored by
+Git.
+
+The `29` duplicates match canonical evidence retained from earlier acquisitions;
+one newly observed feed article became new canonical evidence. The accepted run
+still retains every raw response and normalized occurrence. The earlier
+`NEWS-20261022-115232-03d0fc4c` run remains immutable but is superseded because
+its acquisition timestamp was taken too early. The intermediate corrected run
+`NEWS-20261022-120012-31d811b1` is also retained but superseded because its
+manifest reported an obsolete database schema version. The later
+`NEWS-20261022-120133-43a51981` run remains immutable but is superseded by the
+storage-integrity hardening, while `NEWS-20261022-130023-470cb7a7` predates the
+final time-evidence, secret-redaction, and recoverable-finalization hardening.
+The accepted manifest reports finalization state `COMMITTED` and SQLite schema
+version `3`. The accepted run demonstrates only
+one publisher's current feed snapshot; it does not establish historical
+completeness, stable future availability, licensing beyond the publisher's
+feed terms, sentiment quality, or predictive/model value.
+
 ## Current research prototypes
 
 - The four price-only classifiers are controlled comparative experiments, not
@@ -64,6 +94,8 @@ The run reports separate conclusions:
   run.
 - Stored Random Forest feature importance is preliminary explainability. SHAP
   explanations have not been implemented.
+- News entity linking is a deterministic first stage for controlled OGDC
+  aliases only. It is not general NER, sentiment, or event reasoning.
 - The verified-cache migration is a provenance-preserving continuity mechanism;
   it does not turn the retained data into a fresh or cryptographically signed
   provider response.
@@ -73,16 +105,16 @@ The run reports separate conclusions:
 | Approved objective | Status |
 |---|---|
 | Collect, preprocess, and structure historical stock data | Partly complete. The reusable pipeline supports multiple symbols, while the retained vertical slice and its conclusions are OGDC-only and daily-only. |
-| Continuously update financial news, economic reports, and global events | Not implemented. Current workflows are explicit commands, not scheduled feeds. |
+| Continuously update financial news, economic reports, and global events | Partly complete. Reproducible explicit RSS/Atom and imported-CSV runs now preserve news evidence, timing, quality, and failures. Scheduling, broad economic/global source coverage, and production operations are not implemented. |
 | Train and compare multiple prediction models | Implemented for three Random Forest configurations and one XGBoost configuration on one frozen OGDC split. The optional LSTM workflow is not promoted into this run. |
 | Compare models with and without sentiment | Not implemented. The current comparison is price-only. |
 | Deploy the best-performing model as the prediction engine | Not complete. The v1 API deliberately serves retained results and does not load `M-001` for live inference; the legacy `/predict/{ticker}` route remains the v0 baseline compatibility path. |
-| Add event-driven company/sector reasoning | Not implemented. |
+| Add event-driven company/sector reasoning | Partly complete only at the ingestion boundary: reviewed OGDC aliases are linked deterministically with evidence. General entities, sectors, events, graphs, and propagation are not implemented. |
 | Deliver predictions, visualizations, explanations, and current feeds | Partly complete. Historical results and provenance are visible in FastAPI and React; sentiment, event explanations, SHAP, and current feeds remain. |
 
 ## Remaining work
 
-The next research sequence is financial-news ingestion, company/entity linking,
+The next research sequence is broader reviewed entity/source coverage,
 FinBERT sentiment, daily sentiment aggregation, price-only versus
 price-plus-sentiment comparison, LSTM under the same split contract, SHAP,
 additional stocks, and sector/event relationships. Production storage,

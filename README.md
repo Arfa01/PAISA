@@ -1,6 +1,8 @@
 # PAISA v0 — Predictive AI Stock Assessment
 
-PAISA v0 is the first implementation slice of the FYP: a PSX-first stock-data layer that fetches historical market data, cleans it, builds technical features and labels, trains a baseline model, and exposes the outputs through a FastAPI backend.
+PAISA began as a PSX-first stock-data layer and now also includes an additive,
+reproducible financial-news ingestion foundation. The price/model/backtest/API
+and dashboard contracts remain separate from news acquisition and evidence.
 
 This is **not financial advice** and does not produce buy/sell recommendations. It is an academic prototype for data engineering, ML evaluation, and dashboard integration.
 
@@ -22,6 +24,9 @@ proposal and early-v0 context.
 | [Supervisor demo script](docs/SUPERVISOR_DEMO_SCRIPT.md) | Fail-fast preflight and timed demonstration walkthrough. |
 | [Team handoff](docs/TEAM_HANDOFF.md) | Ownership, exact demo-artifact restore, regeneration, and continuation commands. |
 | [Next-phase plan](docs/NEXT_PHASE_PLAN.md) | Ordered plan for news, sentiment, LSTM, explainability, and expansion. |
+| [News ingestion runbook](docs/NEWS_INGESTION.md) | RSS/manual acquisition, immutable artifacts, quality policy, and reproduction commands. |
+| [News data contract](docs/NEWS_DATA_CONTRACT.md) | Versioned normalized record, provider evidence, deduplication, entity-link, and SQLite semantics. |
+| [News time alignment](docs/NEWS_TIME_ALIGNMENT.md) | Publication/acquisition/availability rules and the future-feature cutoff boundary. |
 | [Historical project context](PROJECT_CONTEXT.md) | Original proposal and superseded PAISA v0 snapshot; not a current-status source. |
 
 ## What v0 includes
@@ -37,6 +42,9 @@ proposal and early-v0 context.
 - Baseline RandomForest model.
 - FastAPI endpoints for prices, features, dataset, metrics, and prediction.
 - Pytest tests for pipeline, preprocessing, and API.
+- Separate RSS/Atom and manual-CSV news adapters with immutable raw evidence.
+- Versioned normalized news records, deterministic deduplication, first-stage
+  OGDC alias linking, SQLite persistence, and quality/coverage reports.
 
 ## Recommended first run
 
@@ -51,7 +59,7 @@ pip install -e .
 python scripts/run_v0_pipeline.py --provider sample --symbols OGDC HBL MCB --start 2021-01-01 --end 2023-12-31 --train
 
 # Run tests
-pytest
+python -m pytest
 
 # Start API
 uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
@@ -121,6 +129,42 @@ python scripts/run_v0_pipeline.py --provider manual-csv --manual-csv-dir data/ex
 ```
 
 Accepted column variants include `date`, `open`, `open_price`, `close`, `close_price`, `volume`, `high`, and `low`.
+
+## Financial-news ingestion foundation
+
+News acquisition is an explicit, separate workflow. It does not run FinBERT,
+add sentiment to a stock dataset, retrain a model, or change any API/dashboard
+result. The RSS adapter requests explicitly configured publisher feed URLs,
+rejects redirects, and never fetches linked article pages. Relative entry links
+are resolved against the feed URL while the unresolved value remains in raw
+evidence:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider rss \
+  --config configs/news/ogdc_sources.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+A permitted local dataset can instead be imported and is always labelled
+`imported`, never live:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider manual-csv \
+  --input /absolute/path/to/news.csv \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+After valid argument parsing, the command prints one structured summary and
+creates a collision-refusing `artifacts/news_ingestion/<run_id>/` evidence
+pack. Generated news databases, raw responses, and run outputs are ignored by
+Git. See the
+[news runbook](docs/NEWS_INGESTION.md),
+[record contract](docs/NEWS_DATA_CONTRACT.md), and
+[time-alignment contract](docs/NEWS_TIME_ALIGNMENT.md).
 
 ## Versioned OGDC model experiments
 
@@ -457,7 +501,7 @@ configure it from the repository root:
 
 ```bash
 cd frontend
-npm install
+npm ci
 cp .env.example .env.local
 ```
 
@@ -516,7 +560,9 @@ PAISA/
 │   ├── raw/          # generated raw provider outputs
 │   ├── processed/    # generated prices/features/dataset/metadata
 │   ├── external/     # manually downloaded CSVs
+│   ├── news/         # generated local news SQLite database
 │   └── metadata/     # stock universe
+├── configs/news/     # versioned news-provider examples
 ├── docs/
 ├── frontend/         # React + TypeScript read-only results dashboard
 ├── models/           # generated model artifacts
@@ -524,6 +570,7 @@ PAISA/
 ├── src/paisa/
 │   ├── api/
 │   ├── models/
+│   ├── news/         # isolated news providers, contracts, storage, and pipeline
 │   ├── providers/
 │   ├── features.py
 │   ├── pipeline.py
@@ -548,8 +595,9 @@ v0 is considered successful when:
 
 ## Current roadmap
 
-The earlier v1–v5 sequence placed news and sentiment before the dashboard. The
-dated OGDC vertical-slice sprint supersedes that order for 19–24 October 2026;
-news, sentiment, SHAP, and relationship graphs are deferred. See
-[`docs/OCT19_24_SPRINT.md`](docs/OCT19_24_SPRINT.md) for the active scope and
+The price-only OGDC vertical slice and dashboard are complete. The additive
+news-ingestion and deterministic OGDC-linking foundation is now implemented;
+FinBERT, daily sentiment aggregation, controlled price-only versus
+price-plus-sentiment experiments, SHAP, and relationship graphs remain future
+work. See [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the current
 dependency order.

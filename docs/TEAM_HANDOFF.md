@@ -39,7 +39,7 @@ Work on a task branch, never directly on `main`:
 git fetch origin
 git switch main
 git pull --ff-only origin main
-PAISA_TASK_BRANCH="feature/news-ingestion"
+PAISA_TASK_BRANCH="feature/task-summary"
 git switch -c "$PAISA_TASK_BRANCH"
 
 python3 -m venv .venv
@@ -49,7 +49,7 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 
 cd frontend
-npm install
+npm ci
 cp .env.example .env.local
 cd ..
 ```
@@ -69,6 +69,7 @@ machine it is not available outside that environment.
 | Backtesting and benchmarks | `src/paisa/backtesting/engine.py`, `src/paisa/backtesting/metrics.py`, `src/paisa/backtesting/benchmarks.py`, `src/paisa/backtesting/reports.py`, `scripts/run_backtest.py` |
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
 | Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
+| News acquisition and evidence | `src/paisa/news/`, `scripts/run_news_pipeline.py`, `configs/news/`, `docs/NEWS_*.md` |
 | FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
 | React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
 | Tests | `tests/`, `frontend/src/**/*.test.ts`, `frontend/src/**/*.test.tsx` |
@@ -101,10 +102,24 @@ experiment_configs/
 experiments/<experiment_id>/
 ```
 
-Other generated roots are `runs/<experiment_id>/` for standalone backtests and
-`artifacts/lstm/<model_id>/` for optional LSTM registration. Never overwrite an
-existing model, experiment, portfolio, or run ID. Do not commit datasets, model
-binaries, run artifacts, `frontend/dist/`, local environments, or secrets.
+Other generated roots are `runs/<experiment_id>/` for standalone backtests,
+`artifacts/lstm/<model_id>/` for optional LSTM registration, and
+`artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
+news evidence. Never overwrite an existing model, experiment, portfolio, or
+run ID. Do not commit datasets, model binaries, run artifacts,
+`frontend/dist/`, local environments, or secrets.
+
+The accepted local RSS run `NEWS-20261022-131242-5ddffd2d` is final
+non-fixture evidence for this foundation: one source, `30` raw and `30`
+normalized occurrences, `29` cross-run duplicates, `1` OGDC-linked
+occurrence, publication range `2026-10-19T18:56:40Z` through
+`2026-10-22T13:07:31Z`, `0` missing publication times, and `PASS` quality.
+Its response acquisition timestamp is later than run start and the response
+checksum was verified. The manifest records finalization state `COMMITTED` and
+SQLite schema version `3`.
+The duplicate count reflects canonical evidence from retained earlier
+acquisitions, not discarded input; all acquisitions are preserved. Generated
+evidence remains outside Git.
 
 ### Restore the exact supervisor demo pair
 
@@ -300,8 +315,9 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
 
 ## Task handoff: Arfa
 
-1. Own the price/news feature join and declare publication cutoffs before adding
-   a column to `src/paisa/experiments/training_features.py`.
+1. Own the price/news feature join and declare decision cutoffs before adding a
+   column to `src/paisa/experiments/training_features.py`; include an article
+   only when `available_at <= decision_cutoff`.
 2. Keep the current price-only feature set as the control; prepare paired
    price-only and price-plus-sentiment configurations with identical splits.
 3. Train and evaluate the paired Random Forest/XGBoost/LSTM experiments without
@@ -315,11 +331,12 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
 
 ## Task handoff: Waqas
 
-1. Implement source-attributed financial-news ingestion with offline fixtures
-   and separate provider/network checks.
-2. Build the ticker/company alias registry and reviewable entity-linking output.
+1. Operate and extend the source-attributed news-ingestion foundation with
+   reviewed sources, offline fixtures, and separate provider/network checks.
+2. Expand the current OGDC aliases into a versioned ticker/company registry and
+   reviewable entity-linking output.
 3. Implement pinned FinBERT inference and leakage-safe daily aggregation with
-   publication-time cutoffs.
+   the `available_at <= decision_cutoff` rule.
 4. Develop the LSTM and relationship/knowledge-graph components behind the
    current prediction and artifact contracts.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
@@ -333,6 +350,14 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
 ```bash
 # Legacy/offline pipeline smoke
 python scripts/run_v0_pipeline.py --provider sample --symbols OGDC HBL MCB --start 2021-01-01 --end 2023-12-31 --train
+
+# Review the news CLI and source policy, then use a new immutable run ID.
+python scripts/run_news_pipeline.py --help
+python scripts/run_news_pipeline.py \
+  --provider rss \
+  --config configs/news/ogdc_sources.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
 
 # Four versioned price-only models from the retained, standardized snapshot
 PAISA_NEW_TRAINING_RUN_ID="TRN-20261022-team-handoff-01"
@@ -364,6 +389,7 @@ From the repository root with `.venv` active:
 python -m pytest
 python -m pip check
 cd frontend
+npm ci
 npm run test
 npm run lint
 npm run build

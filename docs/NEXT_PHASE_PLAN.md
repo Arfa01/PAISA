@@ -8,18 +8,21 @@ outputs remain academic simulations and are not financial advice.
 
 ### 1. Financial-news ingestion
 
-Build a reproducible collector for dated Pakistan-market financial news. Retain
-the source URL, publisher, publication and retrieval timestamps, headline,
-body or permitted extract, language, content hash, and provider response status.
-Keep network/provider checks outside the default offline tests and never commit
-bulk article data.
+**Foundation implemented.** PAISA now has explicit RSS/Atom and manual-CSV
+adapters, raw response/import evidence, a versioned normalized record, distinct
+publication/fetch/availability time, deterministic deduplication, local SQLite,
+immutable run packs, and data-quality reports. Network/provider checks remain
+outside the default offline suite and bulk article data remains outside Git.
 
-Acceptance gate: the same bounded date request produces a deduplicated,
-schema-validated manifest with explicit failures and immutable raw evidence.
+Remaining work is reviewed source expansion, bounded historical provider
+semantics where feeds support them, scheduling, retention/backup policy, and
+production operations. An explicit run is not a continuously updating service.
 
 ### 2. Company and entity linking
 
-Create a versioned alias registry for PSX tickers, legal company names,
+**First OGDC stage implemented.** Boundary-aware controlled aliases now record
+matched alias, method, location, and confidence without fuzzy or forced
+matching. Continue by creating a versioned registry for PSX tickers, legal company names,
 subsidiaries, sectors, industries, places, and event actors. Preserve the raw
 mention, linked identifier, method, confidence, and unresolved state; do not
 force ambiguous mentions to a company.
@@ -44,8 +47,9 @@ available by the declared feature cutoff. Define after-close and non-trading-day
 handling, source counts, confidence weighting, missing-news indicators, and
 lookback windows before running experiments.
 
-Acceptance gate: tests prove no article published after a feature cutoff enters
-that feature row and no validation/test statistics are used to fit transforms.
+Acceptance gate: tests prove no article with `available_at` after a decision
+cutoff enters that feature row and no validation/test statistics are used to
+fit transforms.
 
 ### 5. Price-only versus price-plus-sentiment comparison
 
@@ -105,6 +109,9 @@ the feature date, and tested for ambiguous, conflicting, and expired evidence.
 
 - Preserve distinct `feature_date`, `target_date`, `signal_date`, and
   `execution_date` fields.
+- A news record may enter a future feature only when its UTC `available_at` is
+  no later than the declared decision cutoff; never backfill missing publication
+  times with historical guesses.
 - Fit every learned transformation on training data only and split time series
   chronologically by target date.
 - Preserve price-only baselines and use immutable experiment/model IDs; never

@@ -103,9 +103,24 @@ buy-and-hold position.
 ### No sentiment features yet
 
 The current models use price-, volume-, lag-, moving-average-, volatility-,
-RSI-, and MACD-derived daily features. Financial-news ingestion, FinBERT
-scoring, daily sentiment aggregation, and price-plus-sentiment comparison have
-not yet been integrated into the retained run.
+RSI-, and MACD-derived daily features. A separate news-ingestion foundation now
+captures and links permitted records, but FinBERT scoring, daily sentiment
+aggregation, and price-plus-sentiment comparison have not been integrated into
+the retained price/model run.
+
+### News coverage is provider-limited
+
+RSS history and fields depend on each configured publisher. The foundation is
+an explicit command, not a scheduler, and it does not crawl linked pages for
+missing bodies. Manual CSV data is imported evidence, not live acquisition.
+The first-stage entity linker recognizes controlled OGDC aliases only; it is
+not general NER and does not infer sectors or events. RSS acquisition is
+streamed with compressed/decoded byte, XML depth/element, entry, field, and
+total-time limits; DTD/entities and non-public destinations are rejected by
+default. These controls reduce resource-exhaustion and SSRF risk but do not
+establish a publisher's reliability, completeness, licensing, or long-term
+availability. The explicit private-network source opt-in is for reviewed
+deployments only.
 
 ### No knowledge graph yet
 
@@ -126,10 +141,19 @@ movement.
 ### No production database yet
 
 The vertical slice uses immutable filesystem artifacts and read-only artifact
-APIs. It does not use a production database, migrations, access control,
+APIs. News ingestion adds a generated local SQLite evidence store with a
+versioned schema, but this is not a production database service. PAISA does not
+provide production migrations across engines, access control,
 multi-user tenancy, backup/restore service, scheduled ingestion, or production
 observability. Local artifact availability and integrity are prerequisites for
 the API and dashboard.
+
+News-run marker replacement is atomic and has a sealed retry journal, but the
+local prototype does not `fsync` files and directories for power-loss
+durability. Public markers remain pending until the database commits; a final
+completion marker is published last, and recovery fails closed if the sealed
+artifact set changed. A permanent storage failure can retain a pending sealed
+run for an explicit retry. This is not a production transaction coordinator.
 
 ### No broker integration
 

@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "timeout_seconds": 20,
+  "connect_timeout_seconds": 10,
+  "read_timeout_seconds": 15,
+  "total_timeout_seconds": 30,
+  "max_compressed_bytes": 2097152,
+  "max_decoded_bytes": 8388608,
+  "max_entries": 500,
+  "max_xml_depth": 48,
+  "max_xml_elements": 20000,
+  "max_field_characters": 1048576,
+  "user_agent": "PAISA academic news ingestion/0.1 (+https://github.com/Arfa01/PAISA)",
+  "sources": [
+    {
+      "source_id": "dawn-business",
+      "name": "Dawn Business",
+      "url": "https://www.dawn.com/feeds/business",
+      "source_type": "rss",
+      "language": "en",
+      "default_timezone": "Asia/Karachi",
+      "allow_private_network": false,
+      "enabled": true
+    }
+  ]
+}

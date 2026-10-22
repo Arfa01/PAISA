@@ -58,10 +58,42 @@ The legacy `GET /stocks` and `GET /stocks/{ticker}/prices` routes read
 `data/processed/psx_prices.csv`. They intentionally return `404` if that v0
 pipeline output is absent; the immutable-run API below does not depend on it.
 
+## 4a. Run the separate news-ingestion foundation
+
+This workflow is independent of prices, model training, portfolios, API, and
+dashboard state. It requests configured publisher RSS/Atom feed URLs, rejects
+redirects, and never fetches linked article pages. Relative entry links are
+resolved against the feed URL while their original values remain in raw
+evidence. To acquire a configured feed:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider rss \
+  --config configs/news/ogdc_sources.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+Or import a permitted local dataset, which will be labelled `imported`:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider manual-csv \
+  --input /absolute/path/to/news.csv \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+After valid argument parsing, one structured result prints the immutable run ID
+and locations. `FAIL` exits non-zero. Existing run IDs are never overwritten,
+provider failures never fall back to fixtures, and generated
+databases/artifacts remain outside Git. See
+[`docs/NEWS_INGESTION.md`](docs/NEWS_INGESTION.md) before configuring a source.
+
 ## 5. Run tests
 
 ```bash
-pytest
+python -m pytest
 ```
 
 Expected: all collected tests pass. The count will grow as components are added.
@@ -225,7 +257,7 @@ the committed example configuration:
 
 ```bash
 cd frontend
-npm install
+npm ci
 cp .env.example .env.local
 ```
 

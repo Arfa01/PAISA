@@ -29,12 +29,14 @@ CONTINUATION_DOCUMENTS = (
     "docs/REMAINING_ROADMAP.md",
     "docs/ISSUE_BACKLOG.md",
     "docs/REPRODUCTION_COMMANDS.md",
+    "docs/UNIFIED_PRICE_MODEL_COMPARISON.md",
     "docs/FREE_PLAN_WORKFLOW.md",
     "docs/CODEX_PROMPT_LIBRARY.md",
 )
 CONTINUATION_LINK_DOCUMENTS = ("README.md", *CONTINUATION_DOCUMENTS)
 CERTIFIED_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-02"
 HISTORICAL_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-01"
+UNIFIED_COMPARISON_ID = "CMP-20261024-OGDC-price-only-01"
 ALLOWED_ACTIONS = {
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": 3,
     "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": 2,
@@ -983,8 +985,16 @@ def test_project_state_preserves_canonical_research_boundaries() -> None:
     )
 
     assert "common 184-date test intersection" in state
-    assert "shared project holdout, not a globally untouched test" in state
-    assert "globally untouched 184-date test" not in state
+    assert "shared project holdout" in state
+    assert "globally untouched" not in state
+    assert UNIFIED_COMPARISON_ID.lower() in state
+    assert "6482b22da616907f1f9bc1b6fc621f5a193b0bffeb3d41ad59ab353595ab2129" in state
+
+    unified = _normalized(_read("docs/UNIFIED_PRICE_MODEL_COMPARISON.md"))
+    assert UNIFIED_COMPARISON_ID.lower() in unified
+    assert "shared project holdout" in unified
+    assert "globally untouched" not in unified
+    assert "universal winner" not in unified
 
     assert (
         "| ogdc vertical slice | `vsl-20261020-ogdc-main-02` | completed `pass`"

@@ -141,6 +141,41 @@ external file. A controlled path/provenance rewrite may reseal only an
 orchestrator-owned run that has not been published; an existing or
 caller-supplied run is never silently resealed.
 
+### Unified price-model comparison pack
+
+The derived M-001 through M-006 price-only comparison is a read-only evidence
+transform, not a training, inference, policy, or backtesting component. It
+accepts only the explicitly allowlisted completed training, vertical-slice, and
+LSTM roots; validates their integrity roots and relationships; and copies only
+the persisted prediction, split, portfolio-configuration, snapshot, and trade
+evidence needed for offline replay. Fitted model binaries and raw price data do
+not belong in this pack.
+
+Prediction metrics are recomputed from copied prediction rows. The
+majority-class baseline derives its class from training labels, while the
+previous-direction baseline uses the persisted prior row whose `target_date`
+equals the scored row's `feature_date`. Portfolio metrics are recomputed from
+the copied snapshots and trades without re-executing a decision policy. All six
+strategy ledgers and their cash-only and buy-and-hold ledgers retain distinct
+portfolio IDs even when benchmark economics agree.
+
+Validation-only selection remains separate from descriptive results on the
+**shared project holdout**. Balanced accuracy, F1, simulated return, drawdown,
+fees, buy-and-hold, and the validation-selected model are separate reported
+outcomes; the pack must not collapse them into one cross-criterion score or
+ranking.
+
+The comparison directory uses an exact SHA-256 inventory that excludes only
+its own `manifest.json`. Publication refuses existing directory, ZIP, or
+checksum destinations. The deterministic ZIP contains one ID-matched top-level
+directory and canonical member metadata; its adjacent checksum sidecar is
+mandatory and is authenticated before archive extraction. The offline verifier
+rejects unsafe paths, links, special or additional files, digest changes, source-identity
+changes, assumption drift, date/label misalignment, persisted-metric drift, and
+any mismatch between the human report and semantic replay. The complete schema,
+commands, and canonical source digests are documented in
+[`UNIFIED_PRICE_MODEL_COMPARISON.md`](UNIFIED_PRICE_MODEL_COMPARISON.md).
+
 ## A. Model artifact contract
 
 The model artifact is the manifest plus its referenced fitted binary. The

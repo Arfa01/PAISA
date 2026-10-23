@@ -448,6 +448,67 @@ print(f"PASS LSTM experiment: {result.run_id}")
 PY
 ```
 
+## Unified price-only comparison
+
+The retained `PAISA-RM-003` comparison derives M-001 through M-006 metrics
+from persisted prediction and portfolio evidence. It neither retrains models
+nor reruns backtests. Its 184 dates are the reused **shared project holdout**,
+not a fresh independent holdout. See
+[`UNIFIED_PRICE_MODEL_COMPARISON.md`](UNIFIED_PRICE_MODEL_COMPARISON.md) for the
+schema and interpretation contract.
+
+Build the canonical immutable directory, portable ZIP, and ZIP checksum from
+the three authoritative completed source roots:
+
+```bash
+source .venv/bin/activate
+python scripts/build_unified_price_model_comparison.py \
+  --comparison-id CMP-20261024-OGDC-price-only-01 \
+  --output-dir artifacts/model_comparisons \
+  --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --lstm-run artifacts/lstm_experiments/LSTM-20261024-OGDC-price-only-02
+```
+
+Existing targets are never overwritten. Verify the published directory and
+rebind it to the original sources:
+
+```bash
+python scripts/verify_unified_price_model_comparison.py \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01 \
+  --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --lstm-run artifacts/lstm_experiments/LSTM-20261024-OGDC-price-only-02
+```
+
+The ZIP/sidecar pair is portable and can be verified without the source roots:
+
+```bash
+python scripts/verify_unified_price_model_comparison.py \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip \
+  --checksum artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip.sha256
+```
+
+Run the full offline Python and frontend validation matrix before handoff:
+
+```bash
+source .venv/bin/activate
+python -m pip check
+python -m compileall -q src scripts tests
+python -m pytest
+
+cd frontend
+npm ci
+npm run test
+npm run lint
+npm run build
+cd ..
+
+git diff --check
+git diff --check origin/main...HEAD
+git status --short
+```
+
 ## Final handoff checks
 
 Run the complete validation matrix, report the observed results, and confirm

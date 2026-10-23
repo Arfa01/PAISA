@@ -27,6 +27,7 @@ proposal and early-v0 context.
 | [October 2026 progress report](docs/PROGRESS_REPORT_OCTOBER_2026.md) | Dated delivery summary, verified results, test evidence, and next milestones. |
 | [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
 | [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
+| [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Immutable M-001–M-006 comparison pack, semantic verifier, portable ZIP/checksum, and separate outcome interpretation. |
 | [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
 | [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
@@ -566,8 +567,7 @@ result does not make it the validation-selected variant.
 
 That test window is post-freeze only for the M-005/M-006 selection: the same
 184 dates and M-001–M-004 outcomes had already been exposed by the baseline
-experiment. It is a reused shared project holdout, not a globally untouched
-holdout.
+experiment. It is the reused shared project holdout.
 
 The corresponding model portfolios ended at PKR 96,359.29 for `M-005`
 (-3.64071%) and PKR 96,110.91 for `M-006` (-3.88909%). Neither beat the
@@ -662,7 +662,7 @@ real-data workflow: fetch and clean daily OGDC data, train `M-001` through
 `M-004`, pass each model's held-out test predictions directly to an isolated
 portfolio backtest, calculate cash-only and buy-and-hold benchmarks, and publish
 one comparison report. Those test outcomes were subsequently reused for the
-M-005/M-006 comparison, so that window is no longer globally untouched.
+M-005/M-006 comparison, so that period is the shared project holdout.
 
 Install the normal, machine-learning, backtesting, and test dependencies from
 the aggregate requirements file, then run:

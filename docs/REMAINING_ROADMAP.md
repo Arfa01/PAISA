@@ -2,8 +2,8 @@
 
 Status date: 24 October 2026
 
-Base: `origin/main` at `d7015cbb2f630dd1be4a077e407fca961b92f8a6`
-after merged PR #16.
+Base: `origin/main` at `a80594d80a884dcef129f2d4a9c896217c6793c5`
+after merged PR #17.
 
 PAISA is an academic simulation. Predictions, signals, trades, portfolio curves,
 and simulated returns are not financial advice.
@@ -80,6 +80,12 @@ the gate pass.
 | `PAISA-RM-021` | MUST | Reproducible final report | `PAISA-RM-005`, `PAISA-RM-008`; `PAISA-RM-013` only if `G3` opens | Verified evidence-lane disposition; `G5` for paired claims | Tables are generated from verified artifacts; a blocking overlap result or gated paired result, limitations, and all deferred SHOULD/STRETCH work are explicit. |
 | `PAISA-RM-022` | MUST | Final demo pack and release rehearsal | `PAISA-RM-021` | Release acceptance | Clean-clone fixture workflow, artifact-restored official workflow, API, dashboard, and fallback narrative are rehearsed. |
 
+The `PAISA-RM-003` evidence-only implementation is present on
+`feature/unified-price-model-comparison`, with canonical local pack
+`CMP-20261024-OGDC-price-only-01`. It was explicitly authorized before
+`PAISA-RM-001`; it does not clear `G1-LSTM-READ`, provide a committed fixture,
+or change the remaining API/dashboard dependency order.
+
 ## Recommended execution sequence
 
 ### Track A: integrate the completed LSTM evidence
@@ -118,7 +124,8 @@ article-level model identity, daily feature artifact, stock model, decision
 policy, and portfolio as separate components. The paired experiment must add
 sentiment features without changing the price-only target or evaluation
 assumptions. Reusing the 2025-12-16 through 2026-09-15 test window must be
-reported as repeated shared-holdout evaluation, not a globally untouched test.
+reported as repeated evaluation on the shared project holdout, not as a fresh
+independent evaluation.
 
 ### Track D: explainability, scaling, and events
 

@@ -2,10 +2,10 @@
 
 Repository: `Arfa01/PAISA`
 
-Snapshot base: `origin/main` at `d7015cbb2f630dd1be4a077e407fca961b92f8a6`
-after merge of PR #16
+Snapshot base: `origin/main` at `a80594d80a884dcef129f2d4a9c896217c6793c5`
+after merge of PR #17
 
-Current continuity work: `docs/project-continuation-and-ci`
+Current comparison work: `feature/unified-price-model-comparison`
 
 PAISA is an academic research prototype. Every prediction, signal, trade,
 portfolio value, curve, and return is an academic simulation and is **not
@@ -13,8 +13,9 @@ financial advice**.
 
 This file is the dated continuation snapshot. For detailed contracts and
 evidence, follow [Current Implementation Status](CURRENT_IMPLEMENTATION_STATUS.md),
-[Team Handoff](TEAM_HANDOFF.md), and
-[LSTM Price-Only Experiments](LSTM_PRICE_ONLY_EXPERIMENTS.md).
+[Team Handoff](TEAM_HANDOFF.md),
+[LSTM Price-Only Experiments](LSTM_PRICE_ONLY_EXPERIMENTS.md), and
+[Unified Price-Only Model Comparison](UNIFIED_PRICE_MODEL_COMPARISON.md).
 
 ## Snapshot boundary
 
@@ -37,6 +38,7 @@ evidence, follow [Current Implementation Status](CURRENT_IMPLEMENTATION_STATUS.m
 | Leakage-safe experiment foundation | Chronological target-date splits, train-only learned transforms, ordered features, fixed seeds, immutable manifests, exact inventories, and distinct feature/target/signal/execution dates are enforced. |
 | Price-only baselines | Three Random Forest variants (`M-001`–`M-003`) and one XGBoost variant (`M-004`) use the same frozen OGDC evidence and comparison contract. |
 | Price-only LSTM | The optional TensorFlow workflow trains `M-005` and `M-006`, selects on validation evidence, performs one post-freeze test pass, backtests independent ledgers, and publishes a sealed run. |
+| Unified price-only comparison | A deterministic read-only builder and offline verifier recompute M-001–M-006, reference-baseline, model-portfolio, cash-only, and controlled buy-and-hold metrics from checksum-bound persisted evidence. The exact common dates, assumptions, separate rankings, portable ZIP, and checksum are sealed without retraining, inference, or backtest execution. |
 | Policy, portfolio, and backtesting | Threshold policy, next-session-open execution, fees, independent strategy ledgers, cash-only and controlled buy-and-hold benchmarks, trades, snapshots, drawdowns, and reports are implemented. |
 | OGDC vertical slice | One collision-refusing command connects acquisition, preparation, training, prediction, policy, simulation, validation, and reports for daily OGDC data. |
 | Results delivery | A read-only `/api/v1` validates immutable vertical-slice artifacts; the React/TypeScript/Plotly dashboard presents history, model and portfolio comparisons, experiment detail, provenance, limitations, and the disclaimer. |
@@ -68,6 +70,7 @@ dashboard presents results without recomputing them.
 | #14 | `31fe4ad` | Historical-news coverage audit |
 | #15 | `cf897e1` | Contemporaneous historical evidence |
 | #16 | `d7015cb` | Price-only LSTM experiments and certified evidence |
+| #17 | `a80594d` | Project continuation roadmap and offline CI |
 
 Tags currently retained in Git are:
 
@@ -75,8 +78,9 @@ Tags currently retained in Git are:
 - `v0.1.0-ogdc-vertical-slice` at `826c371`;
 - `v0.2.0-news-ingestion-foundation` at `578eeec`;
 - `v0.3.0-finbert-sentiment-foundation` at `9dc4b3a`; and
-- `v0.4.0-historical-news-coverage-audit` at `31fe4ad`; and
-- `v0.6.0-lstm-price-only` at `d7015cb`.
+- `v0.4.0-historical-news-coverage-audit` at `31fe4ad`;
+- `v0.6.0-lstm-price-only` at `d7015cb`; and
+- `v0.7.0-continuation-ci` at `a80594d`.
 
 The LSTM tag points to `main` after PRs #15 and #16. PR #15 has no separate
 milestone tag of its own.
@@ -90,6 +94,7 @@ These paths are local, generated, and ignored by Git.
 | OGDC vertical slice | `VSL-20261020-OGDC-main-02` | Completed `PASS` demonstration run. |
 | Baseline training | `TRN-20261020-191815-624662-nogit` | Frozen input, split, registered models, predictions, reports, and exact inventory used by the vertical slice and LSTM comparison. |
 | LSTM comparison | `LSTM-20261024-OGDC-price-only-02` | Certified `PASS` result. Its `run_manifest.json` uses schema `1.0`; its authoritative `final_summary.json` uses schema `1.1` and carries the final status. The earlier `LSTM-20261024-OGDC-price-only-01` run is immutable pre-hardening history, not the certified result. Run-manifest SHA-256: `e475e077f375071c79ce8743425831d8cd9cf5ceb37f42eca0acfa65a100f3d0`; ZIP SHA-256: `f9d3ef10bb80528388a9137e7f169a7d870e7429f779f46e074a6254a26d8821`. |
+| Unified price-only comparison | `CMP-20261024-OGDC-price-only-01` | Schema-`1.0` `PASS` pack derived only from the three authoritative price-only sources. Both the 57-file directory and portable ZIP passed semantic replay and external-source verification. ZIP SHA-256: `6482b22da616907f1f9bc1b6fc621f5a193b0bffeb3d41ad59ab353595ab2129`. |
 | Accepted RSS acquisition | `NEWS-20261022-131242-5ddffd2d` | Historical accepted run, retained for evidence and sentiment input. It predates current news sealing/schema contracts and must not be relabelled as a current verifier pass. |
 | Retained GDELT DOC acquisition | `NEWS-20261023-060000-gdelt-ogdc2` | Sealed `PARTIAL/WARN`; its exact permission-reviewed metadata controls are allowlisted, but acquisition is incomplete. |
 | Historical RSS coverage | `COVERAGE-20261023-120000-real0002` | Immutable coverage-v2 `NO_OVERLAP`; passed only at its producing revision. |
@@ -134,9 +139,28 @@ Registered model identities are:
 - `M-006` has the highest balanced accuracy across all six models on the common
   184-date test intersection, but it is not the validation-selected LSTM. The
   dates and baseline outcomes were already exposed, so this is a shared project
-  holdout, not a globally untouched test.
+  holdout rather than a fresh independent evaluation.
 - The LSTM portfolios end at PKR `96,359.29` (`-3.64071%`) for `M-005` and PKR
   `96,110.91` (`-3.88909%`) for `M-006`. Neither beats `M-002` or buy-and-hold.
+
+### Unified price-only comparison
+
+- The validation-only rule selects `M-001` across all six models at balanced
+  accuracy `0.5302041802585478`; within the LSTM family, validation prefers
+  `M-005` at `0.4792799323426362`.
+- On the 184-date shared project holdout, `M-006` has the best model balanced
+  accuracy (`0.544251447477254`) and `M-005` has the best model F1
+  (`0.6396761133603239`). The majority-class baseline records balanced
+  accuracy `0.5` and F1 `0.0`; the previous-direction baseline records
+  `0.5271771239513174` and `0.5245901639344263`, respectively.
+- `M-002` is the best simulated model portfolio at PKR `105,987.04`
+  (`+5.98704%`). `M-003` has both the lowest model drawdown (`1.18467%`) and
+  lowest model fees (PKR `98.93`). Cash remains PKR `100,000.00`; controlled
+  buy-and-hold ends at PKR `106,247.89` (`+6.24789%`). No model beats
+  buy-and-hold in simulated total return.
+- These are separate outcomes. Shared project holdout prediction rankings do
+  not replace validation selection, and portfolio results do not select a
+  prediction model.
 
 ### News, sentiment, and contemporaneous evidence
 
@@ -160,11 +184,17 @@ Registered model identities are:
 The last certified LSTM checkout reported `1,036 passed, 1 skipped` backend
 tests, 57 passing frontend tests, and passing frontend lint/build, `pip check`,
 `compileall`, and diff checks. That is retained validation evidence for source
-commit `2bd20ed`; every new branch must report its own results.
+commit `2bd20ed`. This comparison branch reports `1,082 passed, 1 skipped`
+backend tests with six dependency deprecation warnings, 57 passing frontend
+tests, and passing frontend lint/build, `pip check`, `compileall`, focused
+comparison/documentation tests, and diff checks. The frontend build retains its
+known large-chunk warning.
 
 ## Active and open work
 
-- The continuity and CI work is active on `docs/project-continuation-and-ci`.
+- The unified comparison pack is active on
+  `feature/unified-price-model-comparison`; its generated canonical artifacts
+  remain local and Git-ignored.
 - GitHub reports zero open issues at this snapshot.
 - Legacy PR #1 (`feature/v0.1-data-quality`) and PR #2
   (`feature/ogdc-rf-training-stage`) remain open. Their work appears superseded
@@ -195,8 +225,10 @@ commit `2bd20ed`; every new branch must report its own results.
    multi-stock evaluation, daily sentiment aggregation, and controlled
    price-plus-sentiment comparison are not complete.
 6. **Delivery gap:** the certified LSTM run remains separate from the
-   vertical-slice API and dashboard. There is no fixture-backed read-only LSTM
-   artifact surface or unified six-model presentation yet.
+   vertical-slice API and dashboard, while the verified unified comparison is
+   a local, Git-ignored derived artifact. There is no fixture-backed read-only
+   LSTM or unified-comparison API and no unified six-model dashboard
+   presentation.
 7. **Operational scope:** there is no production database service,
    authentication, scheduled ingestion/retraining, broker integration, live
    trading, or production deployment evidence.
@@ -218,9 +250,10 @@ Create one narrow, fixture-backed PR for **read-only LSTM artifact integration**
 
 Keep the PR independent of the retained private artifacts. It must not retrain a
 model, mutate or reseal `VSL-20261020-OGDC-main-02`, recompute metrics in a GET
-request, change the legacy API, or add a combined dashboard ranking. Build the
-unified `M-001`–`M-006` comparison as a separate follow-up PR after this artifact
-contract is reviewed.
+request, change the legacy API, or add a combined dashboard ranking. The unified
+comparison was produced early under an explicit evidence-only task; that does
+not satisfy the fixture-backed LSTM read gate or authorize using the private
+comparison pack in clean-clone tests.
 
 This task is unblocked by the historical-news permission problem and preserves
 the existing model, policy, portfolio, API, and presentation boundaries.

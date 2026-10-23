@@ -83,6 +83,7 @@ python -m pip install -r requirements-sentiment.txt
 | Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
 | News acquisition and evidence | `src/paisa/news/`, `scripts/run_news_pipeline.py`, `configs/news/`, `docs/NEWS_*.md` |
 | Historical source and coverage audit | `src/paisa/news/coverage.py`, `src/paisa/news/providers/gdelt_doc.py`, `scripts/audit_news_price_overlap.py`, `configs/news/gdelt_ogdc_history.example.json`, `configs/news/historical_source_permissions.json`, `configs/news_coverage/`, `docs/HISTORICAL_NEWS_*.md`, `docs/NEWS_PRICE_OVERLAP_CONTRACT.md` |
+| Contemporaneous GKG/PSX evidence | `src/paisa/evidence/`, `scripts/run_gdelt_gkg_evidence.py`, `scripts/import_psx_announcements.py`, `scripts/audit_contemporaneous_evidence.py`, `configs/evidence/`, `docs/GDELT_GKG_HISTORICAL_EVIDENCE.md`, `docs/PSX_ANNOUNCEMENT_*.md`, `docs/CONTEMPORANEOUS_EVIDENCE_TIME_POLICY.md` |
 | Article-level sentiment | `src/paisa/sentiment/`, `scripts/run_sentiment_inference.py`, `docs/FINBERT_SENTIMENT.md`, `docs/SENTIMENT_*.md` |
 | FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
 | React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
@@ -121,7 +122,10 @@ Other generated roots are `runs/<experiment_id>/` for standalone backtests,
 `artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
 news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
 audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
-evidence. Never overwrite an existing model, experiment, portfolio, or run ID.
+evidence. Contemporaneous source packs use
+`artifacts/contemporaneous_evidence/<run_id>/`, while four-profile audits use
+`artifacts/evidence_coverage/<run_id>/`. Never overwrite an existing model,
+experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
 
@@ -314,6 +318,70 @@ schema version `3` with `31` canonical articles, `150` article occurrences,
 and an `ok` integrity check. Preserve it and the historical ingestion artifact
 pack, and never describe database compatibility as retroactive artifact
 validation.
+
+### Contemporaneous evidence handoff
+
+This path is separate from GDELT DOC ingestion. GKG uses official raw GKG 2.1
+archives, accepts only `WEB=1`, assigns availability from the batch timestamp
+encoded in `GKGRECORDID`, retains `V2.1DATE` as publication time, verifies
+bounded archives, and never dereferences publisher URLs. The completed bounded
+execution covered the official `2026-09-04 09:00`, `09:15`, and `09:30` UTC
+15-minute partitions inside the requested `2025-12-16`--`2026-09-15` interval.
+It scanned `2,957` rows and retained `0` exact OGDC records; do not describe
+that three-partition check as full historical coverage.
+
+The PSX path is an offline exact-`OGDC` import only. Timed announcements retain
+their official offset-aware posting time. Date-only announcements retain null
+timestamps and are eligible only on the next observed trading session. The
+current reviewed status is `REVIEW_REQUIRED`, no authorized input was supplied,
+and its count remains `0`; do not automate the public pages or weaken the two
+authorization-hash checks.
+
+The evidence types are `gdelt_metadata`, `exchange_announcement`, and
+`publisher_news`. Their separate/combined profiles are `gdelt_gkg_ogdc`,
+`psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+`general_financial_news`. The restored publisher-news run contributes `656`
+general records and `42` exact OGDC-linked combined records, but every profile
+has `0 / 853` train, `0 / 182` validation, and `0 / 184` test overlap. All four
+readiness results are `NO_OVERLAP`; aggregation and downstream model work stay
+blocked. These are academic simulation results and are not financial advice.
+
+Use automatically generated fresh immutable IDs unless an externally managed
+identity is required:
+
+```bash
+python scripts/run_gdelt_gkg_evidence.py \
+  --config configs/evidence/gdelt_gkg_test_subset.json \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+
+python scripts/verify_evidence_run.py \
+  --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
+
+# This fails closed while the policy remains REVIEW_REQUIRED. Run it only after
+# reviewed policy bytes bind both supplied authorization values by SHA-256.
+python scripts/import_psx_announcements.py \
+  --input /absolute/path/to/authorized-ogdc-announcements.csv \
+  --authorization-attestation-file /absolute/path/to/attestation.txt \
+  --authorization-reference-file /absolute/path/to/authorization-reference.txt \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+
+python scripts/audit_contemporaneous_evidence.py \
+  --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
+  --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --output-dir artifacts/evidence_coverage
+
+python scripts/verify_evidence_coverage.py \
+  --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
+```
+
+The evidence-run verifier replays normalized evidence semantics. The coverage
+verifier checks its sealed pack and reconciles its internal tables, but it is
+not source-evidence-bound; retain the checksum-bound input references with the
+pack.
 
 ### Restore the exact supervisor demo pair
 

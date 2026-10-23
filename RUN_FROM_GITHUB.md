@@ -271,7 +271,72 @@ database or permission policy that was not supplied. For a pack that supports
 energy coverage, also provide its exact external contract with
 `--energy-sector-link-contract`; omit that option for unsupported energy.
 
-## 4c. Run article-level FinBERT sentiment inference
+## 4c. Run the bounded contemporaneous-evidence audit
+
+This artifact-present workflow is separate from the GDELT DOC news-ingestion
+path above. It reads official GDELT GKG 2.1 raw archives and does not fetch
+publisher pages. The configured subset contains the official 15-minute
+partitions at `2026-09-04 09:00`, `09:15`, and `09:30` UTC within the requested
+`2025-12-16`--`2026-09-15` interval. Its real execution scanned `2,957` rows
+and retained `0` exact OGDC records; the subset does not establish full-period
+completeness.
+
+```bash
+python scripts/run_gdelt_gkg_evidence.py \
+  --config configs/evidence/gdelt_gkg_test_subset.json \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+
+python scripts/verify_evidence_run.py \
+  --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
+```
+
+GKG `available_at` is the batch timestamp encoded by `GKGRECORDID`;
+`V2.1DATE` remains the publication timestamp. Only `WEB=1` rows are eligible,
+and publisher URLs are identifiers rather than fetch targets.
+
+The PSX announcement path is offline and exact-ticker only. Timed rows retain
+the official offset-aware posting time. Date-only rows retain null posting and
+availability times and map conservatively to the next observed session. The
+current policy status is `REVIEW_REQUIRED`, so the command below must fail
+closed until reviewed policy bytes bind both supplied authorization hashes:
+
+```bash
+python scripts/import_psx_announcements.py \
+  --input /absolute/path/to/authorized-ogdc-announcements.csv \
+  --authorization-attestation-file /absolute/path/to/attestation.txt \
+  --authorization-reference-file /absolute/path/to/authorization-reference.txt \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+```
+
+With the ignored GKG, publisher-news, stock, split, and SQLite evidence
+restored, generate the immutable four-profile coverage pack:
+
+```bash
+python scripts/audit_contemporaneous_evidence.py \
+  --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
+  --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --output-dir artifacts/evidence_coverage
+
+python scripts/verify_evidence_coverage.py \
+  --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
+```
+
+The evidence types are `gdelt_metadata`, `exchange_announcement`, and
+`publisher_news`; the profiles are `gdelt_gkg_ogdc`,
+`psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+`general_financial_news`. The measured PSX population is blocked at `0`; the
+publisher-news input contributes `656` general records and `42` exact
+OGDC-linked combined records. Every profile nevertheless has `0 / 853` train,
+`0 / 182` validation, and `0 / 184` test overlap, so all are `NO_OVERLAP`.
+The coverage verifier is an offline sealed-pack semantic check, not a replay of
+the source evidence. These results are an academic simulation and are not
+financial advice.
+
+## 4d. Run article-level FinBERT sentiment inference
 
 This stage reads canonical normalized articles from one completed news run. It
 does not fetch publishers, aggregate daily sentiment, join stock prices,

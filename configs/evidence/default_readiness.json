@@ -1,0 +1,9 @@
+{
+  "partial_minimum_coverage_percent_each_split": 1.0,
+  "partial_minimum_covered_sessions_each_split": 1,
+  "purpose": "Engineering coverage gates only; not statistical sufficiency or evidence of predictive value.",
+  "ready_maximum_missing_gap_sessions_each_split": 20,
+  "ready_minimum_coverage_percent_each_split": 20.0,
+  "ready_minimum_covered_sessions_each_split": 2,
+  "schema_version": "1.0"
+}

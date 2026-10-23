@@ -1,0 +1,44 @@
+{
+  "archive_index_url": "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt",
+  "connect_timeout_seconds": 15.0,
+  "max_compressed_bytes": 16777216,
+  "max_compressed_bytes_per_file": 8388608,
+  "max_decompressed_bytes": 67108864,
+  "max_decompressed_bytes_per_file": 25165824,
+  "max_field_characters": 1000000,
+  "max_files": 3,
+  "max_records": 10000,
+  "max_row_bytes": 2097152,
+  "maximum_errors": 5000,
+  "partitions": [
+    {
+      "archive_url": "https://data.gdeltproject.org/gdeltv2/20260904090000.gkg.csv.zip",
+      "expected_md5": "0cb0e039f3086fa728074f616117fee9",
+      "expected_sha256": "99c2aa48e03c0f5818ee144cddb55f581475d94acf103edfd588810a0b288ccb",
+      "expected_size_bytes": 3825920,
+      "partition_id": "20260904090000"
+    },
+    {
+      "archive_url": "https://data.gdeltproject.org/gdeltv2/20260904091500.gkg.csv.zip",
+      "expected_md5": "0def240cfecf8dce9f96919bd7d2ad83",
+      "expected_sha256": "1689519473ac34a164e1e8a27f04f50ac5e39730be0183b273781a2969251765",
+      "expected_size_bytes": 4467410,
+      "partition_id": "20260904091500"
+    },
+    {
+      "archive_url": "https://data.gdeltproject.org/gdeltv2/20260904093000.gkg.csv.zip",
+      "expected_md5": "cccab457c6e5ed94455dc175164ff3b3",
+      "expected_sha256": "c79c034a7113d9a90b570644228522463b3a6774d4e7d9af5d24be19e16a2741",
+      "expected_size_bytes": 3932053,
+      "partition_id": "20260904093000"
+    }
+  ],
+  "permission_policy_id": "contemporaneous-evidence-permissions-v1",
+  "provider": "gdelt-gkg-2.1",
+  "publication_after_batch_tolerance_seconds": 86400.0,
+  "read_timeout_seconds": 90.0,
+  "requested_end": "2026-09-15T23:59:59Z",
+  "requested_start": "2025-12-16T00:00:00Z",
+  "schema_version": "1.0",
+  "user_agent": "PAISA-FYP/0.1 academic GDELT GKG metadata research; contact repository owner"
+}

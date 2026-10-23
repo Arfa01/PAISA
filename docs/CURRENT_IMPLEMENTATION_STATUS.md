@@ -21,6 +21,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
 | News-ingestion foundation | The isolated `paisa.news` package captures configured RSS/Atom responses or permitted manual CSV imports; preserves raw bytes and acquisition metadata; writes normalized schema `1.1` while retaining explicit read compatibility for `1.0`; keeps publication, source observation, fetch, and defensible availability timestamps distinct; applies layered deterministic deduplication; links boundary-safe controlled OGDC aliases; persists canonical and per-ingestion evidence in local SQLite; and publishes immutable quality reports. The ingestion command does not run sentiment or alter the price/model stack. |
 | Historical-news source and coverage audit | The news package now also exposes a bounded metadata-only GDELT DOC 2.0 adapter and a licence-note-gated manual import path. A separate checksum-validating audit consumes immutable news, price, and exact target-split evidence; enforces the checksum-bound source-permission policy; maps each canonical article's conservative `available_at` to a configurable market cutoff; reports occurrence/canonical, all-news/OGDC/sector, split/month/source/language/completeness/gap metrics; and publishes collision-refusing `COVERAGE-...` artifacts under explicit readiness thresholds. It does not aggregate sentiment or alter models, policies, portfolios, APIs, or the dashboard. |
+| Contemporaneous historical evidence | The isolated `paisa.evidence` package adds official GDELT GKG 2.1 raw-archive metadata and an offline PSX OGDC announcement contract. It preserves batch/publication/import timing, separates `gdelt_metadata`, `exchange_announcement`, and `publisher_news`, publishes immutable `EVID-...` packs, and audits four separate/combined profiles into immutable `ECOV-...` packs. Public PSX automation is prohibited and the controlled manual path remains `REVIEW_REQUIRED`. No aggregation or downstream model/API/dashboard integration is included. |
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
@@ -200,6 +201,34 @@ The adapter never fetches linked publisher pages or stores publisher bodies.
 GDELT metadata use remains subject to the reviewed source-permission policy,
 required attribution, service limits, and underlying publisher rights. No
 licensed manual historical dataset was supplied in this task.
+
+### Contemporaneous GKG and PSX evidence status
+
+The new GKG path uses raw GKG 2.1 archives rather than GDELT DOC. It accepts
+only `WEB=1`, treats the batch timestamp in `GKGRECORDID` as the defensible
+historical `available_at`, retains `V2.1DATE` as publication time, verifies
+archive size and checksums, and never follows publisher URLs. The bounded real
+execution processed the official `2026-09-04 09:00`, `09:15`, and `09:30` UTC
+15-minute partitions within the requested `2025-12-16`--`2026-09-15` interval.
+It scanned `2,957` rows and retained `0` exact OGDC matches; this is bounded
+execution evidence, not full-period completeness.
+
+The PSX path accepts only exact `OGDC` announcement metadata supplied offline.
+Timed rows require the official offset-aware posting time. Date-only rows keep
+timestamps null and become eligible strictly on the next observed trading
+session. The reviewed permission decision is still `REVIEW_REQUIRED`, so no
+authorized input was imported and the count is `0`; public-page automation is
+not used.
+
+The four coverage profiles are `gdelt_gkg_ogdc`,
+`psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+`general_financial_news`. The restored publisher-news evidence contributes
+`656` general inputs, including `42` exact OGDC-linked inputs to the combined
+profile. None is cutoff-eligible inside the immutable model period. Every
+profile reports `0 / 853` train, `0 / 182` validation, and `0 / 184` test
+overlap and readiness `NO_OVERLAP`. The immutable coverage verifier performs
+sealed-pack semantic reconciliation and explicitly does not claim a source
+replay. These are academic simulation results, not financial advice.
 
 ### FinBERT article-sentiment implementation
 

@@ -106,6 +106,37 @@ acquisition/import time in `available_at`. Scheduling,
 retention/backup policy, and production operations also remain. An explicit run
 is not a continuously updating service.
 
+### 1a. Contemporaneous GKG and official-event evidence
+
+**Foundation implemented; downstream work remains blocked.** PAISA now keeps
+three normalized evidence types separate: GDELT GKG `gdelt_metadata`, official
+PSX `exchange_announcement`, and existing `publisher_news`. Coverage reports
+`gdelt_gkg_ogdc`, `psx_ogdc_announcements`,
+`combined_ogdc_evidence`, and `general_financial_news` independently before any
+future aggregation.
+
+The bounded GKG 2.1 raw-archive execution used the official 15-minute
+partitions at `2026-09-04 09:00`, `09:15`, and `09:30` UTC inside the requested
+`2025-12-16`--`2026-09-15` interval. It scanned `2,957` rows and found no exact
+OGDC match. GKG batch time controls availability, `V2.1DATE` remains source
+publication time, only `WEB=1` is retained, and publisher pages are never
+fetched. This subset validates the bounded mechanism but is not a full history.
+
+The PSX manual-import decision remains `REVIEW_REQUIRED`, so `0` announcement
+rows were admitted and automation stays blocked. A date-only official event
+must retain null timestamps and map strictly to the next observed session; it
+must never receive an invented same-day time. The publisher-news input supplies
+`656` general records and `42` exact OGDC-linked combined records, but all four
+profiles still measure `0 / 853`, `0 / 182`, and `0 / 184` overlap across
+train, validation, and test and therefore remain `NO_OVERLAP`.
+
+Next, obtain separately reviewed source authorization and a sufficiently broad,
+historically contemporaneous corpus. Re-run immutable evidence and coverage
+packs under fresh IDs, then require nonzero split coverage and the configured
+readiness gates before designing aggregation. Do not proceed to features,
+sentiment joins, models, signals, portfolios, API, or dashboard work from the
+current result. This is an academic simulation and not financial advice.
+
 ### 2. Company and entity linking
 
 **First OGDC stage implemented.** Boundary-aware controlled aliases now record

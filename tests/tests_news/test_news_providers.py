@@ -8,7 +8,10 @@ import json
 import pytest
 
 from paisa.news.providers.fixture import FixtureNewsProvider
-from paisa.news.providers.manual_csv import ManualCsvNewsProvider
+from paisa.news.providers.manual_csv import (
+    LICENSING_REVIEW_REQUIRED,
+    ManualCsvNewsProvider,
+)
 from paisa.news.providers.rss import (
     RssNewsProvider,
     RssSourceConfig,
@@ -17,6 +20,9 @@ from paisa.news.providers.rss import (
 
 
 NOW = datetime(2026, 10, 22, 9, 30, tzinfo=timezone.utc)
+MANUAL_LICENSE_NOTE = (
+    "Licensed academic import; supplied title, summary, URL, and body may be stored."
+)
 
 
 class FakeRawStream:
@@ -662,7 +668,11 @@ def test_manual_csv_preserves_bytes_and_flexible_columns_as_imported(tmp_path):
         "2026-10-21 10:00:00,+05:00,Example Publisher,en\n",
         encoding="utf-8",
     )
-    provider = ManualCsvNewsProvider(path, clock=lambda: NOW)
+    provider = ManualCsvNewsProvider(
+        path,
+        licensing_usage_note=MANUAL_LICENSE_NOTE,
+        clock=lambda: NOW,
+    )
 
     result = provider.fetch()
 
@@ -675,6 +685,9 @@ def test_manual_csv_preserves_bytes_and_flexible_columns_as_imported(tmp_path):
     assert record.body == "Permitted body"
     assert record.published_timezone == "+05:00"
     assert record.source_name == "Example Publisher"
+    assert record.raw_payload["provider_mode"] == "manual_import"
+    assert record.raw_payload["licensing_usage_note"] == MANUAL_LICENSE_NOTE
+    assert provider.effective_config["licensing_usage_note"] == MANUAL_LICENSE_NOTE
     payload = path.read_bytes()
     assert result.captures[0].content == payload
     assert result.captures[0].response_sha256 == hashlib.sha256(payload).hexdigest()
@@ -685,7 +698,11 @@ def test_manual_csv_parse_error_keeps_raw_evidence(tmp_path):
     path = tmp_path / "invalid.csv"
     path.write_bytes(b"\xff\xfe-not-utf8")
 
-    result = ManualCsvNewsProvider(path, clock=lambda: NOW).fetch()
+    result = ManualCsvNewsProvider(
+        path,
+        licensing_usage_note=MANUAL_LICENSE_NOTE,
+        clock=lambda: NOW,
+    ).fetch()
 
     assert result.records == ()
     assert result.errors[0].error_type == "csv_parse_error"
@@ -697,11 +714,38 @@ def test_manual_csv_provider_never_persists_absolute_input_path(tmp_path):
     path = tmp_path / "private-input.csv"
     path.write_text("title\nOGDC update\n", encoding="utf-8")
 
-    result = ManualCsvNewsProvider(path, clock=lambda: NOW).fetch()
+    result = ManualCsvNewsProvider(
+        path,
+        licensing_usage_note=MANUAL_LICENSE_NOTE,
+        clock=lambda: NOW,
+    ).fetch()
     serialized = _serialized_provider_result(result)
 
     assert str(tmp_path) not in serialized
     assert "manual-csv:private-input.csv" in serialized
+
+
+def test_manual_csv_requires_nonblank_licensing_usage_note(tmp_path):
+    path = tmp_path / "news.csv"
+    path.write_text("title\nOGDC update\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="licensing_usage_note cannot be blank"):
+        ManualCsvNewsProvider(path, licensing_usage_note="   ")
+
+
+def test_manual_csv_programmatic_default_marks_licensing_review_required(tmp_path):
+    path = tmp_path / "news.csv"
+    path.write_text("title\nOGDC update\n", encoding="utf-8")
+
+    provider = ManualCsvNewsProvider(path, clock=lambda: NOW)
+    result = provider.fetch()
+
+    assert provider.effective_config["licensing_usage_note"] == (
+        LICENSING_REVIEW_REQUIRED
+    )
+    assert result.records[0].raw_payload["licensing_usage_note"] == (
+        LICENSING_REVIEW_REQUIRED
+    )
 
 
 def test_fixture_provider_is_deterministic_and_unambiguously_marked_fixture():

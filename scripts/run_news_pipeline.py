@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from paisa.news.pipeline import make_news_run_id, run_news_pipeline  # noqa: E402
+from paisa.news.providers.gdelt_doc import GdeltDocNewsProvider  # noqa: E402
 from paisa.news.providers.manual_csv import ManualCsvNewsProvider  # noqa: E402
 from paisa.news.providers.rss import RssNewsProvider  # noqa: E402
 
@@ -21,7 +22,8 @@ from paisa.news.providers.rss import RssNewsProvider  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Acquire permitted RSS/Atom or manually imported financial-news "
+            "Acquire permitted RSS/Atom, GDELT DOC archive metadata, or manually "
+            "imported financial-news "
             "records and publish one immutable, normalized evidence pack. "
             "This command does not run sentiment analysis and is not financial advice."
         )
@@ -29,12 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         required=True,
-        choices=("rss", "manual-csv"),
+        choices=("rss", "gdelt-doc", "manual-csv"),
         help="News acquisition adapter. Fixture data is never a CLI option.",
     )
     parser.add_argument(
         "--config",
-        help="Versioned RSS/Atom source configuration; required for --provider rss.",
+        help=(
+            "Versioned source configuration; required for --provider rss or "
+            "--provider gdelt-doc."
+        ),
     )
     parser.add_argument(
         "--input",
@@ -47,6 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--default-language",
         help="Default language tag for manual CSV rows that omit it, for example en.",
+    )
+    parser.add_argument(
+        "--licensing-usage-note",
+        help=(
+            "Required permission/licensing note for a manual CSV import; records "
+            "the allowed academic storage and use of the supplied fields."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -89,29 +101,36 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.provider == "rss":
+    if args.provider in {"rss", "gdelt-doc"}:
         if not args.config:
-            parser.error("--provider rss requires --config")
+            parser.error(f"--provider {args.provider} requires --config")
         if args.input:
             parser.error("--input is only valid with --provider manual-csv")
-        if args.source_name or args.default_language:
+        if args.source_name or args.default_language or args.licensing_usage_note:
             parser.error(
-                "--source-name and --default-language are only valid with "
-                "--provider manual-csv"
+                "--source-name, --default-language, and --licensing-usage-note "
+                "are only valid with --provider manual-csv"
             )
     else:
         if not args.input:
             parser.error("--provider manual-csv requires --input")
+        if not args.licensing_usage_note or not args.licensing_usage_note.strip():
+            parser.error("--provider manual-csv requires --licensing-usage-note")
         if args.config:
-            parser.error("--config is only valid with --provider rss")
+            parser.error(
+                "--config is only valid with --provider rss or --provider gdelt-doc"
+            )
     return args
 
 
 def _build_provider(args: argparse.Namespace) -> Any:
     if args.provider == "rss":
         return RssNewsProvider.from_config(args.config)
+    if args.provider == "gdelt-doc":
+        return GdeltDocNewsProvider.from_config(args.config)
     return ManualCsvNewsProvider(
         args.input,
+        licensing_usage_note=args.licensing_usage_note,
         source_name=args.source_name,
         default_language=args.default_language,
     )

@@ -59,12 +59,49 @@ Network/provider checks are intentionally outside the default offline test
 suite. One source can fail without fixture substitution; the source error is
 retained and the run cannot be represented as a clean `PASS`.
 
+## Run a bounded historical GDELT metadata acquisition
+
+The historical adapter uses only the fixed public GDELT DOC 2.0 ArticleList
+endpoint. It issues sequential, explicitly bounded UTC-window queries, rejects
+redirects and unsafe destinations, bounds compressed/decoded responses, and
+deterministically splits saturated windows or fails closed. It never follows a
+returned publisher URL or stores publisher article bodies/images.
+DNS resolution, connection, response headers, and payload reading share one
+bounded request deadline. In new schema-`1.1` runs, every provider error identifies the exact capture and
+attempt, split path, target/request bounds, and sanitized query/request
+fingerprints even when no response arrives. Valid `Retry-After` delays are
+honoured up to the configured wait ceiling; a larger requested delay fails the
+window without an early retry. Captures and terminal errors record parsed
+requested and actually applied delay evidence without retaining the raw header.
+
+Review [`HISTORICAL_NEWS_SOURCE_ASSESSMENT.md`](HISTORICAL_NEWS_SOURCE_ASSESSMENT.md)
+and edit the query windows before every run:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --storage-root . \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+GDELT `seendate` is retained as first-class `source_observed_at` audit evidence,
+never as `published_at` or eligibility evidence under
+`news-availability-v1`. Missing, malformed, and out-of-window values quarantine
+the historical response. Normalized
+`available_at` uses the PAISA fetch time for these records, so a present-day
+archive query cannot be backdated into a historical model cutoff. The configuration
+must retain the reviewed permission basis, licensing/usage note, and required
+GDELT attribution; it contains no credentials.
+
 ## Import a permitted CSV
 
 ```bash
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /absolute/path/to/permitted_news.csv \
+  --licensing-usage-note "Licence and permitted stored fields reviewed on YYYY-MM-DD" \
   --storage-root . \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
@@ -94,6 +131,12 @@ without it, the input filename stem is used. Use `--default-language` to supply
 a fallback language tag for rows that omit one. A missing `source_type`
 defaults to `manual_csv`. Immutable evidence stores a logical source label,
 not the host's absolute input path.
+
+`--licensing-usage-note` is mandatory in the CLI and is copied into sanitized
+provider configuration and every raw row. It records the operator's permission
+review but does not create or broaden a licence. The programmatic constructor
+retains compatibility by defaulting to `LICENSING_REVIEW_REQUIRED`; real-mode
+coverage rejects that marker until a reviewed note is supplied.
 
 ## CLI result and exit behavior
 
@@ -135,6 +178,11 @@ final_summary.json
 completion.json
 ```
 
+The pipeline creates `raw/` with mode `0700` and every file beneath it with
+mode `0600`, independently of the caller's umask. These permissions protect
+locally retained licensed response bytes and unredacted acquisition evidence;
+they do not change the checksum-bound contents or confer reuse rights.
+
 `run_manifest.json` contains status, timestamps, provider classification,
 counts, limitations, and a sorted checksum/size inventory. Public manifest and
 summary markers remain `PENDING` while the expected immutable file set is
@@ -173,7 +221,9 @@ relationships and must not be interpreted as only within-feed collapses.
 every relationship. The report also includes missing title, publication time,
 and body counts, invalid URLs, language/provider counts, daily counts,
 OGDC-linked count, publication/availability ranges, rejections with exact
-reasons, and provider errors.
+reasons, and provider errors. Coverage artifacts additionally retain the
+`source_observed_at` range and row-level provenance with an explicit audit-only,
+non-eligibility semantic.
 
 - `FAIL`: no raw records or no normalized records, or persistence failed.
 - `WARN`: usable records exist but provider errors, rejected rows, missing
@@ -218,7 +268,7 @@ Run the offline validation suite with:
 ```bash
 python -m pytest
 python -m pip check
-git diff --check
+git diff --check origin/main...HEAD
 ```
 
 See `NEWS_DATA_CONTRACT.md` for field/database semantics and
@@ -229,8 +279,8 @@ See `NEWS_DATA_CONTRACT.md` for field/database semantics and
 - Configure only publisher-provided feeds or datasets whose use is permitted.
 - Do not add page scraping, authentication bypass, paywall/CAPTCHA handling, or
   rate-limit circumvention.
-- RSS availability, history, metadata completeness, and licensing vary by
-  publisher and can change.
+- RSS and archive availability, history, metadata completeness, and licensing
+  vary by provider/publisher and can change.
 - Resource limits make malformed or unexpectedly large feeds fail closed; they
   do not make an untrusted feed or private-network opt-in inherently safe.
 - Body text is stored only when the feed or permitted import supplies it.

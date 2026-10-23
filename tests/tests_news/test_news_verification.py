@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,6 +19,81 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_news_run.py"
 STARTED = datetime(2026, 10, 22, 16, 0, tzinfo=timezone.utc)
 CAPTURE = b"retained feed response for offline replay\n"
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _seal_artifact_mutations(run_dir: Path) -> None:
+    """Rebuild the public hashes after intentional semantic test mutations."""
+
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    inventory = []
+    for entry in manifest["artifact_inventory"]:
+        artifact = run_dir / entry["path"]
+        inventory.append(
+            {
+                "path": entry["path"],
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "size_bytes": artifact.stat().st_size,
+            }
+        )
+    manifest["artifact_inventory"] = inventory
+    inventory_payload = json.dumps(
+        inventory,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    inventory_digest = hashlib.sha256(inventory_payload).hexdigest()
+    manifest["artifact_inventory_sha256"] = inventory_digest
+    _write_json(manifest_path, manifest)
+
+    summary_path = run_dir / "final_summary.json"
+    completion_path = run_dir / "completion.json"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["artifact_inventory_sha256"] = inventory_digest
+    completion["manifest_sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    completion["summary_sha256"] = hashlib.sha256(
+        summary_path.read_bytes()
+    ).hexdigest()
+    _write_json(completion_path, completion)
+
+
+def _rewrite_context_schema(run_dir: Path, field: str, value: str) -> None:
+    """Rewrite and rebind a context declaration for semantic-verifier tests."""
+
+    context_path = run_dir / "deduplication_context.json"
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    context[field] = value
+    context_without_hash = dict(context)
+    context_without_hash.pop("context_sha256", None)
+    context["context_sha256"] = hashlib.sha256(
+        json.dumps(
+            context_without_hash,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    _write_json(context_path, context)
+
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["deduplication_context"]["sha256"] = hashlib.sha256(
+        context_path.read_bytes()
+    ).hexdigest()
+    manifest["deduplication_context"]["context_sha256"] = context[
+        "context_sha256"
+    ]
+    _write_json(manifest_path, manifest)
 
 
 class VerificationProvider:
@@ -118,6 +194,126 @@ def test_completed_run_requires_matching_database_seal_when_requested(tmp_path):
     assert verified.to_dict()["completion_acceptance"] == (
         "DATABASE_AND_ARTIFACT_BOUND"
     )
+
+
+def test_verifier_retains_explicit_schema_1_0_artifact_compatibility(tmp_path):
+    run_dir, _ = _completed_run(tmp_path)
+
+    normalized_path = run_dir / "normalized_articles.csv"
+    with normalized_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    legacy_fields = [
+        field for field in rows[0] if field != "source_observed_at"
+    ]
+    with normalized_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=legacy_fields)
+        writer.writeheader()
+        writer.writerows(
+            {
+                field: "1.0" if field == "schema_version" else value
+                for field, value in row.items()
+                if field in legacy_fields
+            }
+            for row in rows
+        )
+
+    raw_record_path = run_dir / "raw" / "record-000001.json"
+    raw_record = json.loads(raw_record_path.read_text(encoding="utf-8"))
+    raw_record.pop("source_observed_at_raw")
+    _write_json(raw_record_path, raw_record)
+
+    for relative in (
+        "provider_config.json",
+        "run_manifest.json",
+        "completion.json",
+    ):
+        path = run_dir / relative
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("availability_policy_version")
+        _write_json(path, payload)
+
+    for relative, field in (
+        ("raw/index.json", "schema_version"),
+        ("provider_config.json", "schema_version"),
+        ("provider_errors.json", "schema_version"),
+        ("quality_report.json", "news_record_schema_version"),
+        ("final_summary.json", "schema_version"),
+        ("run_manifest.json", "schema_version"),
+        ("completion.json", "news_record_schema_version"),
+    ):
+        path = run_dir / relative
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload[field] = "1.0"
+        _write_json(path, payload)
+    _rewrite_context_schema(run_dir, "news_record_schema_version", "1.0")
+    _seal_artifact_mutations(run_dir)
+
+    verified = verify_news_run(run_dir)
+
+    assert verified.status == "PASS"
+    assert verified.normalized_record_count == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", "2.0"),
+        ("news_record_schema_version", "totally-invalid"),
+    ],
+)
+def test_verifier_rejects_inconsistent_deduplication_context_schema(
+    tmp_path, field, value
+):
+    run_dir, _ = _completed_run(tmp_path)
+    _rewrite_context_schema(run_dir, field, value)
+    _seal_artifact_mutations(run_dir)
+
+    with pytest.raises(
+        NewsRunVerificationError, match="Deduplication context.*schema"
+    ):
+        verify_news_run(run_dir)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "value"),
+    [
+        ("final_summary.json", "schema_version", "1.0"),
+        ("completion.json", "news_record_schema_version", "1.0"),
+        (
+            "completion.json",
+            "availability_policy_version",
+            "unreviewed-policy-v999",
+        ),
+    ],
+)
+def test_verifier_rejects_inconsistent_news_record_schema_declarations(
+    tmp_path, artifact, field, value
+):
+    """Every unsealed schema declaration must agree with the sealed manifest."""
+
+    run_dir, _ = _completed_run(tmp_path)
+    target = run_dir / artifact
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload[field] = value
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    # These two files are bound by digests in completion.json rather than by
+    # the immutable artifact inventory.  Rebind the deliberately inconsistent
+    # declaration so this exercises semantic verification, not byte integrity.
+    completion_path = run_dir / "completion.json"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    if artifact == "final_summary.json":
+        completion["summary_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+        completion_path.write_text(
+            json.dumps(completion, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(NewsRunVerificationError, match="schema|policy"):
+        verify_news_run(run_dir)
 
 
 def test_historical_dedup_replay_uses_frozen_index_not_live_database(tmp_path):

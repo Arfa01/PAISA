@@ -137,6 +137,8 @@ def calculate_quality(
     entity_links: Sequence[ArticleEntityLink],
     rejected_records: Sequence[Any],
     provider_errors: Sequence[ProviderError | Mapping[str, Any]],
+    *,
+    news_record_schema_version: str = NEWS_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     """Return a deterministic, JSON-serializable ingestion quality report.
 
@@ -263,7 +265,7 @@ def calculate_quality(
 
     return {
         "schema_version": QUALITY_REPORT_SCHEMA_VERSION,
-        "news_record_schema_version": NEWS_SCHEMA_VERSION,
+        "news_record_schema_version": news_record_schema_version,
         "quality_status": quality_status,
         "minimum_quality_status": quality_status,
         "quality_criteria": QUALITY_CRITERIA,

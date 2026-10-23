@@ -50,7 +50,11 @@ python -m pip install -e .
 
 cd frontend
 npm ci
-cp .env.example .env.local
+if [ ! -e .env.local ] && [ ! -L .env.local ]; then
+  cp .env.example .env.local
+else
+  printf 'Keeping existing frontend/.env.local\n'
+fi
 cd ..
 ```
 
@@ -78,6 +82,7 @@ python -m pip install -r requirements-sentiment.txt
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
 | Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
 | News acquisition and evidence | `src/paisa/news/`, `scripts/run_news_pipeline.py`, `configs/news/`, `docs/NEWS_*.md` |
+| Historical source and coverage audit | `src/paisa/news/coverage.py`, `src/paisa/news/providers/gdelt_doc.py`, `scripts/audit_news_price_overlap.py`, `configs/news/gdelt_ogdc_history.example.json`, `configs/news/historical_source_permissions.json`, `configs/news_coverage/`, `docs/HISTORICAL_NEWS_*.md`, `docs/NEWS_PRICE_OVERLAP_CONTRACT.md` |
 | Article-level sentiment | `src/paisa/sentiment/`, `scripts/run_sentiment_inference.py`, `docs/FINBERT_SENTIMENT.md`, `docs/SENTIMENT_*.md` |
 | FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
 | React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
@@ -114,10 +119,11 @@ experiments/<experiment_id>/
 Other generated roots are `runs/<experiment_id>/` for standalone backtests,
 `artifacts/lstm/<model_id>/` for optional LSTM registration,
 `artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
-news evidence, and `artifacts/sentiment_inference/<run_id>/` for article-level
-sentiment evidence. Never overwrite an existing model, experiment, portfolio,
-or run ID. Do not commit datasets, downloaded transformer weights, model binaries, run artifacts,
-`frontend/dist/`, local environments, or secrets.
+news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
+audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
+evidence. Never overwrite an existing model, experiment, portfolio, or run ID.
+Do not commit datasets, downloaded transformer weights, model binaries, run
+artifacts, `frontend/dist/`, local environments, or secrets.
 
 The accepted local RSS run `NEWS-20261022-131242-5ddffd2d` is final
 non-fixture evidence for this foundation: one source, `30` raw and `30`
@@ -131,6 +137,135 @@ The duplicate count reflects canonical evidence from retained earlier
 acquisitions, not discarded input; all acquisitions are preserved. Generated
 evidence remains outside Git.
 
+### Historical source and coverage status
+
+The permission review is
+`docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md`, with executable decisions in
+`configs/news/historical_source_permissions.json`. It selects GDELT DOC 2.0
+only for bounded metadata and source-URL retrieval: retain the GDELT-returned
+title, URL, observation/source metadata, request evidence, and checksums, but
+never follow publisher links or store publisher bodies. Cite GDELT and re-check
+its current terms and limits before every future real acquisition. The current
+decision allowlists only `NEWS-20261023-060000-gdelt-ogdc2` and binds its
+permission-relevant metadata-only controls; a new run requires another review
+and explicit policy update. Publisher rights remain separate. The licensed
+manual-CSV path is also supported, but each real
+import must record its provider, acquisition and licence evidence, field-level
+storage permissions, academic-use basis, attribution, and retention/
+redistribution limits. An import is never described as live retrieval.
+
+The completed live metadata-only run `NEWS-20261023-060000-gdelt-ogdc2` is
+sealed historical `PARTIAL/WARN` evidence. Its news-ingestion seal verifies
+`PASS (DATABASE_AND_ARTIFACT_BOUND)` when the ignored pack and database are
+present. It
+contains `656` raw rows and `656` normalized canonical rows unique under the
+current exact URL/content/title-source-time rules, `42` exact OGDC-linked rows,
+and `93` returned source domains, with no exact-rule duplicate relationships or
+rejected records. A conservative publisher document-ID diagnostic flags `17`
+candidate groups (`36` rows) for later adjudication, so the count is not an
+article-level uniqueness claim. Every record preserves missing `published_at`.
+Raw GDELT
+`seendate` evidence spans `2023-06-18T12:15:00Z` through
+`2024-06-14T15:00:00Z`; conservative `available_at` is the later range
+`2026-10-23T06:26:32.440746Z` through `2026-10-23T06:29:25.858147Z`. The run is
+partial because it records `22` provider errors: `15` `ReadTimeout` failures, `4`
+quarantined out-of-window responses, and `3` exhausted HTTP 429 responses.
+It predates news schema `1.1`, so its source observation remains raw evidence
+and its errors identify root windows rather than exact request attempts. New
+acquisitions preserve audit-only `source_observed_at` under
+`news-availability-v1`, quarantine missing/malformed historical observation
+times, bind errors to exact request-tile/attempt fingerprints, enforce one
+bounded DNS/request deadline, and record applied or refused `Retry-After`
+decisions. Do not backfill those facts into this immutable retained run.
+
+The historical audit implementation and interface are defined by
+`docs/HISTORICAL_NEWS_COVERAGE.md` and
+`docs/NEWS_PRICE_OVERLAP_CONTRACT.md`. It validates immutable news, vertical-
+slice, price, training, and exact split-manifest checksums; applies the
+checksum-bound permission policy and the versioned thresholds in
+`configs/news_coverage/default_readiness.json`; keeps
+publication overlap separate from cutoff-eligible `available_at` overlap; and
+publishes a unique `COVERAGE-...` directory without overwriting prior evidence.
+
+The existing historical schema-`1.0` / `news-price-coverage-v2` preflight is
+`artifacts/news_coverage/COVERAGE-20261023-100000-preflight003/`. Its inputs are
+the five retained legacy `PASS` ingestion packs
+(`NEWS-20261022-115232-03d0fc4c`,
+`NEWS-20261022-120012-31d811b1`, `NEWS-20261022-120133-43a51981`,
+`NEWS-20261022-130023-470cb7a7`, and
+`NEWS-20261022-131242-5ddffd2d`). Together they contain `150` occurrences,
+`31` represented canonical articles, and `119` duplicate occurrences. One
+canonical is deterministically OGDC-linked and is represented by `5`
+occurrences. The only source is Dawn Business. Publication evidence spans
+2026-10-19 through 2026-10-22; availability evidence is on 2026-10-22. No
+deterministic sector link exists, so energy-sector coverage is `UNSUPPORTED`
+rather than inferred from general news.
+
+All five selected manifests have zero provider errors and zero rejected
+records, so the reported `ingestion_completeness` prerequisite passes. Source
+permission is a separate hard prerequisite and remains unresolved for Dawn;
+the machine-readable policy records each RSS run as `REVIEW_REQUIRED`. The
+SQLite database is copied once into an immutable online-backup image used for
+every seal check and fingerprint, but all five packs are legacy unsealed, so
+`database_provenance.passed` is false and their run IDs are reported in
+`unsealed_run_ids`. None of these prerequisites overrides the more fundamental
+overlap status below.
+OGDC linkage is reconciled against each pack's checksum-bound
+`article_entity_links.csv`, and `ogdc_linked_articles.csv` retains the exact
+JSON link evidence rather than only a generic link label. The exhaustive
+`article_session_mappings.csv` records every occurrence/population pair and its
+population-specific canonical assignment for the later aggregation stage.
+
+The compared OGDC artifact contains `1,239` observed daily sessions from
+2021-09-16 through 2026-09-15. Exact split-manifest denominators are `853`
+train, `182` validation, and `184` test sessions. The audit found zero
+publication-date overlap and zero cutoff-eligible availability overlap; every
+split has zero covered sessions and the readiness result is `NO_OVERLAP`.
+Daily sentiment aggregation and every price-plus-sentiment experiment remain
+blocked until a permitted corpus has overlapping defensible availability and
+passes the configured engineering/data-coverage gates. These findings are
+academic data-engineering results, not financial advice, and even a later
+`READY_FOR_AGGREGATION` result would not prove statistical or predictive value.
+
+The RSS preflight predates the current coverage completion seal and is
+descriptive rather than the official final. The retained official RSS artifact
+is `artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. It verified
+`PASS` at its producing revision, contains `11` payload artifacts and `450`
+mapping rows, and retains
+`NO_OVERLAP`; source permission and legacy database provenance fail, while
+ingestion completeness passes. Its manifest SHA-256 is
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`
+and its inventory SHA-256 is
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`.
+
+The GDELT run has a distinct historical schema-`1.0` /
+`news-price-coverage-v2` preflight,
+`COVERAGE-20261023-110000-gdeltpre1`. Source permission and database provenance
+pass; ingestion completeness fails because the pack is
+`PARTIAL` with `22` provider errors. Publication and availability
+calendar-overlap ranges are `null`, and supported all-news/OGDC split coverage
+is `0%`. Its old schema encoded unsupported energy as `0%`; that was not a
+measurement. Readiness is `NO_OVERLAP`. That preflight remains historical. The
+retained official GDELT artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. It verified
+`PASS` at its producing revision, contains `11` payload artifacts and `1,968`
+mapping rows, and retains
+`NO_OVERLAP`; source permission and database provenance pass, while ingestion
+completeness fails with `22` provider errors. Its manifest SHA-256 is
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`
+and its inventory SHA-256 is
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
+Both official artifacts were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`.
+They are immutable historical v2 evidence. The current schema-`1.1` /
+`news-price-coverage-v3` semantic verifier requires recomputation from restored
+source inputs under new IDs and intentionally does not certify the old packs.
+For a current v3 pack, the CLI defaults to full source replay and reports
+`SOURCE_EVIDENCE_BOUND`. The explicit `--pack-only` fallback reports
+`PACK_SEMANTIC`; it checks internal consistency without reopening inputs and is
+not equivalent authority. Strict replay requires any database, permission
+policy, and optional energy-sector contract declared by the sealed references.
+
 The article-level sentiment implementation pins the model and tokenizer to
 `ProsusAI/finbert@0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` and explicitly
 maps `0=positive`, `1=negative`, and `2=neutral` into PAISA's canonical
@@ -143,8 +278,8 @@ The retained real execution is `SENT-20261022-172211-real0002`, sourced from
 `NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
 `7.116756208240986` seconds against a preserved schema-3 database copy, which
 migrated to schema version `5` for that retained execution. Current code
-advances a verified database to schema `6` for sentiment evidence
-certification.
+advances a verified database through schema `6` sentiment certification to
+schema `7` audit-only source-observation provenance.
 It requested and scored all `30` unique canonical articles, with `0` skipped,
 `0` failed, and `any_articles_failed=false`; one scored article was OGDC-linked.
 The label counts were `negative=11`, `neutral=9`, and `positive=10`; `17`
@@ -163,13 +298,14 @@ The short single-publisher snapshot is insufficient for stock-model integration.
 
 At ingestion completion, the accepted manifest and artifact pack recorded
 schema version `3`; those artifacts remain historical and predate the schema-4
-sealing evidence, the schema-5 sentiment tables, and the current schema-6
-certification contract. Before sentiment execution, the
+sealing evidence, the schema-5 sentiment tables, schema-6 certification, and
+the current schema-7 source-observation contract. Before sentiment execution, the
 working `data/news/paisa_news.sqlite3` also used schema version `3`. The
 compatibility migration accepted only that exact known signature, validated
 the affected rows, transactionally restored the later constraints, verified
 integrity, and advanced through schema 4 to schema 5 for the retained run.
-Current code then advances verified storage to schema `6`; validation and DDL
+Current code then advances verified storage through schema `6` certification
+to schema `7` audit-only source-observation provenance; validation and DDL
 remain under one write lock.
 
 The ignored, uncommitted pre-migration copy
@@ -268,6 +404,97 @@ python -m pytest -q \
 
 This test must pass rather than skip. A checksum failure, missing file, or skip
 means the exact demo pair is not ready.
+
+### Restore or regenerate ignored news evidence
+
+Git contains the news code, policies, and documentation, but not
+`artifacts/news_ingestion/`, `artifacts/news_coverage/`, or
+`data/news/paisa_news.sqlite3`. There is no project-managed public download URL
+or predetermined archive checksum. The project lead/artifact custodian is the
+only documented source for the exact retained bytes. The custodian must create
+the checksum sidecar from the archive actually transferred through approved
+shared storage; recipients must not trust a checksum copied from prose.
+
+From the retained checkout, export the complete news evidence set without
+modifying it:
+
+<!-- BEGIN NEWS_ARTIFACT_EXPORT -->
+```bash
+set -euo pipefail
+PAISA_NEWS_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+NEWS_ARCHIVE_NAME="PAISA-news-evidence-20261023.tar.gz"
+NEWS_ARCHIVE="$PAISA_NEWS_TRANSFER_DIR/$NEWS_ARCHIVE_NAME"
+
+test -d "$PAISA_NEWS_TRANSFER_DIR"
+test -d artifacts/news_ingestion
+test -d artifacts/news_coverage
+test -f data/news/paisa_news.sqlite3
+test -f artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2/completion.json
+test -f artifacts/news_coverage/COVERAGE-20261023-120000-real0002/completion.json
+test -f artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/completion.json
+if [ -e "$NEWS_ARCHIVE" ] || [ -L "$NEWS_ARCHIVE" ] || \
+   [ -e "$NEWS_ARCHIVE.sha256" ] || [ -L "$NEWS_ARCHIVE.sha256" ]; then
+  printf 'ERROR: refusing to overwrite news transfer package: %s\n' \
+    "$NEWS_ARCHIVE" >&2
+  exit 1
+fi
+
+tar -czf "$NEWS_ARCHIVE" \
+  artifacts/news_ingestion \
+  artifacts/news_coverage \
+  data/news/paisa_news.sqlite3
+(
+  cd "$PAISA_NEWS_TRANSFER_DIR"
+  shasum -a 256 "$NEWS_ARCHIVE_NAME" > "$NEWS_ARCHIVE_NAME.sha256"
+)
+```
+<!-- END NEWS_ARTIFACT_EXPORT -->
+
+Transfer both archive and sidecar. Restore only into a checkout where the
+generated targets are absent; never merge the archive into another working
+database or artifact root:
+
+<!-- BEGIN NEWS_ARTIFACT_RESTORE -->
+```bash
+set -euo pipefail
+PAISA_NEWS_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+NEWS_ARCHIVE_NAME="PAISA-news-evidence-20261023.tar.gz"
+NEWS_ARCHIVE="$PAISA_NEWS_TRANSFER_DIR/$NEWS_ARCHIVE_NAME"
+
+for target in \
+  artifacts/news_ingestion \
+  artifacts/news_coverage \
+  data/news/paisa_news.sqlite3
+do
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    printf 'ERROR: refusing to overwrite news evidence path: %s\n' \
+      "$target" >&2
+    exit 1
+  fi
+done
+(
+  cd "$PAISA_NEWS_TRANSFER_DIR"
+  shasum -a 256 -c "$NEWS_ARCHIVE_NAME.sha256"
+)
+tar -xzf "$NEWS_ARCHIVE" -C .
+
+test -f artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2/completion.json
+test -f artifacts/news_coverage/COVERAGE-20261023-120000-real0002/completion.json
+test -f artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/completion.json
+test -f data/news/paisa_news.sqlite3
+```
+<!-- END NEWS_ARTIFACT_RESTORE -->
+
+The two retained official coverage packs use schema `1.0` /
+`news-price-coverage-v2`. They verified `PASS` only at their producing revision,
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7`; current schema-`1.1` /
+`news-price-coverage-v3` verification intentionally rejects them. Preserve the
+restored packs for audit. To create current evidence, work on copies of the
+restored inputs, restore the `VSL-...`/`TRN-...` pair above, and run the current
+coverage CLI with a new `COVERAGE-...` ID. A current coverage regeneration from
+an old ingestion pack cannot invent a missing `source_observed_at`. Obtaining
+that first-class field requires a new permitted acquisition/import under a new
+`NEWS-...` ID and, for GDELT, a newly reviewed permission-policy entry.
 
 ### Regenerate a replacement run with new IDs
 
@@ -373,9 +600,11 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
 
 ## Task handoff: Arfa
 
-1. Own the price/news feature join and declare decision cutoffs before adding a
-   column to `src/paisa/experiments/training_features.py`; include an article
-   only when `available_at <= decision_cutoff`.
+1. Keep the price/news feature join blocked while the retained coverage result
+   is `NO_OVERLAP`. After a permitted overlapping corpus passes the configured
+   engineering gate, declare decision cutoffs before adding a column to
+   `src/paisa/experiments/training_features.py`; include an article only when
+   `available_at <= decision_cutoff`.
 2. Keep the current price-only feature set as the control; prepare paired
    price-only and price-plus-sentiment configurations with identical splits.
 3. Train and evaluate the paired Random Forest/XGBoost/LSTM experiments without
@@ -389,8 +618,10 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
 
 ## Task handoff: Waqas
 
-1. Operate and extend the source-attributed news-ingestion foundation with
-   reviewed sources, offline fixtures, and separate provider/network checks.
+1. Operate and extend the source-attributed news-ingestion foundation with the
+   source assessment, metadata-only GDELT boundary, licensed manual imports,
+   offline fixtures, separate provider/network checks, and immutable coverage
+   audits. Do not treat publisher metadata access as permission to store bodies.
 2. Expand the current OGDC aliases into a versioned ticker/company registry and
    reviewable entity-linking output.
 3. Review and operate the pinned FinBERT article-inference foundation; inspect
@@ -418,6 +649,65 @@ python scripts/run_news_pipeline.py \
   --config configs/news/ogdc_sources.example.json \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
+
+# Historical metadata only. Re-check the source assessment and current GDELT
+# terms first. This adapter does not fetch publisher bodies or bypass limits.
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+
+# A manual historical CSV is permitted only with documented provenance and
+# field-level licence/storage rights. It remains an import, never a live fetch.
+python scripts/run_news_pipeline.py \
+  --provider manual-csv \
+  --input /absolute/path/to/licensed_historical_news.csv \
+  --source-name reviewed-dataset-name \
+  --licensing-usage-note "Licence, permitted fields, academic use, retention, and attribution reviewed on YYYY-MM-DD" \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+
+# The retained coverage-v2 packs verified only at their producing revision.
+# Current code requires regenerated schema-1.1 / coverage-v3 evidence under a
+# fresh, unique COVERAGE-... value; never reuse an old immutable run ID. Replace
+# these syntactically valid example IDs with the exact restored input IDs.
+PAISA_COVERAGE_RUN_ID="COVERAGE-20261023-190000-handoff-v3"
+PAISA_COVERAGE_RUN_DIR="artifacts/news_coverage/$PAISA_COVERAGE_RUN_ID"
+PAISA_NEWS_RUN_DIR="artifacts/news_ingestion/NEWS-20261023-180000-handoff-source"
+PAISA_VERTICAL_RUN_DIR="artifacts/vertical_slice/VSL-20261020-OGDC-main-02"
+PAISA_TRAINING_RUN_DIR="artifacts/model_training/TRN-20261020-191815-624662-nogit"
+
+# Generate the new immutable v3 pack first. This example includes the explicit
+# compatibility flag required for a checksum-verified, pre-seal RSS news pack;
+# omit that flag when every selected news run has a current completion seal.
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --allow-legacy-unsealed \
+  --output-dir artifacts/news_coverage \
+  --run-id "$PAISA_COVERAGE_RUN_ID"
+
+# Then perform the strict source-bound replay against the exact same inputs.
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --allow-legacy-unsealed
+
+# Only when source evidence is unavailable: this is a weaker internal semantic
+# check and its PASS must not be reported as source-evidence-bound.
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --pack-only
 
 # Pinned article-level FinBERT inference. Review the license and CLI first,
 # use a copy of legacy retained storage during migration testing, and never
@@ -470,8 +760,22 @@ npm run test
 npm run lint
 npm run build
 cd ..
-git diff --check
+git diff --check origin/main...HEAD
 ```
+
+Independent validation of reviewed PR head `4d7084b` produced two historical
+pre-fix matrices:
+
+- artifact-present checkout: Python `609 passed, 1 skipped`; the only skip was
+  optional TensorFlow/LSTM, and the local retained-artifact integration test
+  passed;
+- clean Git clone: Python `608 passed, 2 skipped`; optional TensorFlow/LSTM and
+  the absent local-real-run artifact integration test skipped.
+
+That review also reported frontend `57 passed`, passing lint/build,
+`pip check`, `compileall`, and `git diff --check origin/main...HEAD`. Do not
+present those counts as validation of later changes; report the exact results
+from the checkout actually tested.
 
 Report the exact pass/fail/skip counts and warnings, branch and commit, generated
 artifact IDs, assumptions, known limitations, and any contract changes. Keep

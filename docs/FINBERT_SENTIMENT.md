@@ -218,18 +218,19 @@ OGDC-linked article, from one short Dawn Business RSS snapshot. All 30 retained
 canonical inputs carry `en-us` language evidence. The accepted ingestion
 manifest and artifact pack record the schema version at ingestion completion:
 version `3`. Those historical artifacts are unchanged and still predate the
-schema-4 sealing evidence, the schema-5 sentiment tables, and the current
-schema-6 certification contract.
+schema-4 sealing evidence, the schema-5 sentiment tables, schema-6
+certification, and the current schema-7 source-observation contract.
 
 Before sentiment execution, the working `data/news/paisa_news.sqlite3` also
 used schema version `3`. The migration recognized only that exact legacy
 signature, verified that every retained row met the later constraints,
 transactionally rebuilt the three affected base tables, and advanced through
 schema 4 to schema 5. The retained reference run below was produced at schema
-version `5`. Current code advances a verified database to schema version `6`
-for model-file identity, truncation evidence, run associations, and certified
-finalization; migration preconditions are evaluated while holding the write
-lock. Any other drift or invalid row is rejected. An ignored, uncommitted
+version `5`. Current code advances a verified database through schema version
+`6` for model-file identity, truncation evidence, run associations, and
+certified finalization, then schema `7` for nullable audit-only
+`source_observed_at`; migration preconditions are evaluated while holding the
+write lock. Any other drift or invalid row is rejected. An ignored, uncommitted
 pre-migration copy remains at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`; it was verified
 at schema version `3` with `31` canonical articles, `150` article occurrences,
@@ -259,7 +260,7 @@ Git and are not committed.
 | Model and tokenizer revision | `0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` |
 | Device / duration | `cpu / 7.116756208240986 seconds` |
 | Runtime | Python `3.13.7`; PyTorch `2.10.0`; Transformers `5.20.2`; Tokenizers `0.23.3`; Hugging Face Hub `1.32.0`; Safetensors `0.8.0` |
-| Database schema for the retained reference run | `5` (current code target: `6`) |
+| Database schema for the retained reference run | `5` (current code target: `7`) |
 | Artifact directory | `artifacts/sentiment_inference/SENT-20261022-172211-real0002` |
 
 Sentiment outputs were generated, but classification accuracy was not evaluated in this run.

@@ -95,21 +95,23 @@ the retained price-only feature set, one chronological split, the fixed policy,
 
 ## Test evidence
 
-The complete branch was verified on 22 October 2026 after the documentation
-pack was prepared:
+Independent verification of reviewed PR head `4d7084b` reported the following
+two matrices. They are historical pre-fix results, not a claim that later
+working-tree changes have already passed:
 
 | Command | Result |
 |---|---|
-| `python -m pytest` | `276 passed, 1 skipped`; one `StarletteDeprecationWarning` |
+| `python -m pytest` (artifact-present checkout) | `609 passed, 1 skipped`; only optional TensorFlow/LSTM skipped, while the local retained-artifact integration test ran and passed |
+| `python -m pytest` (clean Git clone) | `608 passed, 2 skipped`; optional TensorFlow/LSTM and the absent local-real-run artifact integration test skipped |
 | `python -m pip check` | No broken requirements found |
 | `cd frontend && npm run test` | 8 files and 57 tests passed |
 | `cd frontend && npm run lint` | Passed with zero allowed warnings |
 | `cd frontend && npm run build` | Passed; main bundle 1,441.02 kB (462.91 kB gzip) with a non-failing `>500 kB` chunk warning |
-| `git diff --check` | Passed |
+| `git diff --check origin/main...HEAD` | Passed |
 
-The skipped test is the optional real TensorFlow LSTM round-trip when TensorFlow
-is not installed. The default RF/XGBoost vertical slice does not require
-TensorFlow.
+The default RF/XGBoost vertical slice does not require TensorFlow. The second
+clean-clone skip reflects deliberately untracked real-run artifacts, not a
+second optional dependency.
 
 ## Screenshots to capture
 

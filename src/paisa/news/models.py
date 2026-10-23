@@ -6,7 +6,9 @@ from pathlib import PurePosixPath
 from typing import Any, Literal, Mapping
 
 
-NEWS_SCHEMA_VERSION = "1.0"
+NEWS_SCHEMA_VERSION = "1.1"
+SUPPORTED_NEWS_SCHEMA_VERSIONS = frozenset({"1.0", NEWS_SCHEMA_VERSION})
+NEWS_AVAILABILITY_POLICY_VERSION = "news-availability-v1"
 DataClass = Literal["real", "imported", "fixture"]
 RunStatus = Literal["PASS", "PARTIAL", "FAIL"]
 QualityStatus = Literal["PASS", "WARN", "FAIL"]
@@ -40,9 +42,12 @@ class ProviderError:
     message: str
     occurred_at: datetime
     http_status: int | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         utc_iso(self.occurred_at)
+        if not isinstance(self.details, Mapping):
+            raise TypeError("Provider error details must be a mapping.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +57,7 @@ class ProviderError:
             "message": self.message,
             "occurred_at": utc_iso(self.occurred_at),
             "http_status": self.http_status,
+            "details": dict(self.details),
         }
 
 
@@ -121,6 +127,9 @@ class RawNewsRecord:
     response_sha256: str | None = None
     raw_payload: Mapping[str, Any] = field(default_factory=dict, repr=False)
     provider_warnings: tuple[str, ...] = ()
+    # Append new optional fields so callers using the original positional
+    # constructor retain the v0 argument order.
+    source_observed_at_raw: str | None = None
 
     def __post_init__(self) -> None:
         utc_iso(self.fetched_at)
@@ -179,11 +188,17 @@ class NormalizedNewsArticle:
     raw_artifact_reference: str
     normalization_warnings: tuple[str, ...]
     data_class: DataClass
+    source_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != NEWS_SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_NEWS_SCHEMA_VERSIONS:
             raise ValueError(f"Unsupported news schema: {self.schema_version}")
+        if self.schema_version == "1.0" and self.source_observed_at is not None:
+            raise ValueError(
+                "source_observed_at requires news record schema 1.1"
+            )
         utc_iso(self.published_at)
+        utc_iso(self.source_observed_at)
         utc_iso(self.available_at)
         utc_iso(self.fetched_at)
         if self.available_at < self.fetched_at:
@@ -193,7 +208,7 @@ class NormalizedNewsArticle:
         _safe_relative_reference(self.raw_artifact_reference)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "article_id": self.article_id,
             "raw_record_id": self.raw_record_id,
@@ -220,6 +235,9 @@ class NormalizedNewsArticle:
             "normalization_warnings": list(self.normalization_warnings),
             "data_class": self.data_class,
         }
+        if self.schema_version != "1.0":
+            payload["source_observed_at"] = utc_iso(self.source_observed_at)
+        return payload
 
 
 @dataclass(frozen=True)

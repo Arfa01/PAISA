@@ -190,12 +190,12 @@ def _finalize_run(storage: NewsStorage, run_id: str, *, status: str) -> None:
     )
 
 
-def test_v6_schema_and_bounded_completed_run_input_iteration(
+def test_v7_schema_and_bounded_completed_run_input_iteration(
     completed_news_storage: NewsStorage,
 ):
     storage = completed_news_storage
     with storage.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         tables = {
             row[0]
             for row in connection.execute(
@@ -1012,12 +1012,13 @@ def _rewrite_as_recognized_legacy_v3(path) -> None:
         connection.commit()
 
 
-def test_exact_retained_legacy_v3_signature_repairs_then_migrates_to_v6(tmp_path):
+def test_exact_retained_legacy_v3_signature_repairs_then_migrates_to_v7(tmp_path):
     database = tmp_path / "legacy-v3.sqlite3"
     _create_versioned_database(database, 3)
     legacy = NewsStorage(database)
     legacy.begin_run(
         run_id="NEWS-20261022-100000-legacy",
+        schema_version="1.0",
         provider_id="fixture",
         provider_mode="fixture",
         configured_source="fixture://legacy",
@@ -1055,7 +1056,7 @@ def test_exact_retained_legacy_v3_signature_repairs_then_migrates_to_v6(tmp_path
     migrated = NewsStorage(database).initialize()
 
     with migrated.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute(
             "SELECT count(*) FROM normalized_articles"
         ).fetchone()[0] == 1
@@ -1066,7 +1067,10 @@ def test_exact_retained_legacy_v3_signature_repairs_then_migrates_to_v6(tmp_path
         latest = connection.execute(
             "SELECT version, name FROM schema_migrations ORDER BY version DESC"
         ).fetchone()
-    assert tuple(latest) == (DATABASE_SCHEMA_VERSION, "sentiment_run_certification")
+    assert tuple(latest) == (
+        DATABASE_SCHEMA_VERSION,
+        "source_observation_provenance",
+    )
 
 
 def test_unrecognized_v3_drift_is_not_repaired(tmp_path):

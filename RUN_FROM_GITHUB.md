@@ -3,6 +3,15 @@
 These are the exact steps to run the current PAISA backend and read-only results
 dashboard from a fresh clone.
 
+Source installation, offline tests, and newly generated runs work from a fresh
+clone. Git intentionally excludes retained model, news, database, sentiment,
+and coverage artifacts. Commands below that name a `NEWS-...`, `COVERAGE-...`,
+`SENT-...`, `TRN-...`, or `VSL-...` identity are therefore marked
+**artifact-present**: obtain a checksum-verified custodian export as documented
+in [`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs.
+The repository does not publish a download URL or a fixed checksum for those
+local archives.
+
 ## 1. Clone the repo
 
 ```bash
@@ -89,9 +98,51 @@ Or import a permitted local dataset, which will be labelled `imported`:
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /absolute/path/to/news.csv \
+  --licensing-usage-note "Dataset licence and permitted stored fields reviewed on YYYY-MM-DD" \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 ```
+
+For bounded historical discovery, PAISA also provides a metadata-only GDELT
+DOC 2.0 adapter. The example intentionally queries only OGDC. Before a future
+acquisition, review and update the dated source assessment and companion policy,
+including the assessment checksum and exact run allowlist, and then review the
+example's query windows:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+The adapter uses the fixed official endpoint, rejects redirects, applies
+bounded responses and rate-limit backoff, and never fetches publisher pages.
+It stores metadata only. New schema-`1.1` runs retain GDELT observation time as
+audit-only `source_observed_at`, not publisher publication or cutoff-eligibility
+evidence under `news-availability-v1`. Normalized `available_at` is controlled
+by the PAISA fetch time for these records.
+
+In the artifact-present retained checkout, the completed live run
+`NEWS-20261023-060000-gdelt-ogdc2` is sealed `PARTIAL/WARN`; its ingestion
+evidence verifies `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It contains
+`656` raw rows and `656` normalized canonical rows unique under the current
+exact URL/content/title-source-time rules, `42` exact OGDC-linked rows, `93`
+returned source domains, zero exact-rule duplicate relationships, and zero
+rejected records. This does not establish article-level uniqueness: a
+conservative reviewed-publisher document-ID diagnostic flags `17` candidate
+groups (`36` rows, `19` beyond one per group) for later adjudication. All `656`
+records have missing `published_at`. Raw source `seendate`
+evidence spans `2023-06-18T12:15:00Z`--`2024-06-14T15:00:00Z`, but conservative
+`available_at` is the later acquisition-time range
+`2026-10-23T06:26:32.440746Z`--`2026-10-23T06:29:25.858147Z`. Its `PARTIAL`
+status preserves `22` provider errors: `15` `ReadTimeout` failures, `4` quarantined
+out-of-window responses, and `3` exhausted HTTP 429 responses.
+The source-permission policy allowlists this exact run under its reviewed,
+permission-relevant metadata-only controls. A future GDELT acquisition requires
+a new review and explicit allowlist update; the existing decision is not a
+provider-wide permission grant.
 
 After valid argument parsing, one structured result prints the immutable run ID
 and locations. `FAIL` exits non-zero. Existing run IDs are never overwritten,
@@ -99,7 +150,128 @@ provider failures never fall back to fixtures, and generated
 databases/artifacts remain outside Git. See
 [`docs/NEWS_INGESTION.md`](docs/NEWS_INGESTION.md) before configuring a source.
 
-## 4b. Run article-level FinBERT sentiment inference
+## 4b. Audit historical news versus the immutable OGDC price period
+
+The audit validates selected immutable news packs and the retained stock/model
+manifests, reads exact split membership from `split_manifest.json`, and maps
+canonical article availability to the configurable daily decision cutoff. It
+does not aggregate sentiment or change any price/model/portfolio result:
+
+**Artifact-present only:** the following example needs all five ignored news
+ingestion packs, the SQLite database, and both retained `VSL-...`/`TRN-...`
+roots. It cannot run in an artifact-free clone. Restoring the historical
+schema-`1.0` coverage output itself is optional because current code must write
+a new schema-`1.1` / `news-price-coverage-v3` run under a fresh ID.
+
+```bash
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120012-31d811b1 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120133-43a51981 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-130023-470cb7a7 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-131242-5ddffd2d \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --readiness-config configs/news_coverage/default_readiness.json \
+  --market-timezone Asia/Karachi \
+  --decision-cutoff 15:30:00 \
+  --real-mode \
+  --allow-legacy-unsealed \
+  --output-dir artifacts/news_coverage
+```
+
+Real mode is the default and rejects fixture, mock, generated, synthetic, or
+test inputs.
+The explicit legacy flag is needed only for these five pre-completion-seal RSS
+packs; it checks their complete manifest inventories without upgrading their
+contract status or resolving source permission.
+Use a unique `--run-id` when a reproducible external identity is needed; an
+existing directory is never overwritten. The existing RSS preflight
+`COVERAGE-20261023-100000-preflight003` reports `NO_OVERLAP` because the retained
+October 2026 snapshot is later than prices ending on 2026-09-15. The sealed
+historical official RSS artifact is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it verified `PASS`
+at its producing revision and retained the same `NO_OVERLAP` readiness result.
+This is an engineering/data-
+coverage determination, not a statistical or financial claim.
+The default `--news-database` is fingerprinted, but authority additionally
+requires every selected pack's current completion/database seal. Passing an
+empty value creates artifact-only replay, and the five legacy unsealed packs
+remain non-authoritative even with the database present; either condition
+hard-blocks an otherwise-ready result from `READY_FOR_AGGREGATION`. When a
+database is supplied, one consistent SQLite online-backup image is used for
+every seal check and for the published fingerprint. The resulting
+`article_session_mappings.csv` exhaustively maps every selected occurrence and
+population-specific canonical representative for later aggregation.
+See [`docs/HISTORICAL_NEWS_COVERAGE.md`](docs/HISTORICAL_NEWS_COVERAGE.md),
+[`docs/NEWS_PRICE_OVERLAP_CONTRACT.md`](docs/NEWS_PRICE_OVERLAP_CONTRACT.md),
+and the
+[`source assessment`](docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md).
+
+The completed GDELT acquisition has a separate historical schema-`1.0` /
+`news-price-coverage-v2`
+preflight, `COVERAGE-20261023-110000-gdeltpre1`. It passes source permission and
+database provenance, fails ingestion completeness
+because the pack is `PARTIAL` with `22` provider errors, has `null` publication
+and availability calendar-overlap ranges, and reports `0%` coverage for the
+supported all-news and OGDC populations. Its old schema encoded unsupported
+energy as `0%`; that value was not a measurement. Its readiness is
+`NO_OVERLAP`. That preflight remains historical. The official RSS and GDELT
+audits are immutable historical schema-`1.0` / v2 packs; never reuse either run
+ID.
+
+At their producing revision, both verifiers returned `PASS`; both artifacts
+were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false` and contain
+`11` payload artifacts. The RSS result has `450` mapping rows, manifest SHA-256
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`,
+and inventory SHA-256
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`;
+source permission and legacy database provenance fail, while ingestion
+completeness passes. The GDELT result has `1,968` mapping rows, manifest SHA-256
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`,
+and inventory SHA-256
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`;
+source permission and database provenance pass, while ingestion completeness
+fails with `22` provider errors. Both readiness results are `NO_OVERLAP`, so
+aggregation remains blocked. Any independent reproduction must use a fresh
+`--run-id`; retained IDs are never overwritten. Current schema-`1.1` /
+`news-price-coverage-v3` verification intentionally rejects the old v2 packs.
+Regenerate from the restored ingestion, stock, and split inputs to produce a
+new pack that the current semantic verifier can certify.
+
+For a newly generated v3 pack, the verifier is source-bound by default. Supply
+every exact source input (repeat `--news-run-dir` as needed). Set these example
+variables to the real immutable IDs produced or restored in your checkout; the
+values shown here are syntactically valid examples, not bundled artifacts:
+
+```bash
+PAISA_COVERAGE_RUN_DIR="artifacts/news_coverage/COVERAGE-20261023-190000-example-v3"
+PAISA_NEWS_RUN_DIR="artifacts/news_ingestion/NEWS-20261023-180000-example-source"
+PAISA_VERTICAL_RUN_DIR="artifacts/vertical_slice/VSL-20261020-OGDC-main-02"
+PAISA_TRAINING_RUN_DIR="artifacts/model_training/TRN-20261020-191815-624662-nogit"
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json
+```
+
+A successful strict replay reports
+`verification_basis=SOURCE_EVIDENCE_BOUND`. If those inputs are unavailable,
+`--pack-only` requests a deliberately weaker internal semantic check and
+reports `verification_basis=PACK_SEMANTIC`; do not present that PASS as
+source-evidence-bound. Strict mode fails closed when the pack references a
+database or permission policy that was not supplied. For a pack that supports
+energy coverage, also provide its exact external contract with
+`--energy-sector-link-contract`; omit that option for unsupported energy.
+
+## 4c. Run article-level FinBERT sentiment inference
 
 This stage reads canonical normalized articles from one completed news run. It
 does not fetch publishers, aggregate daily sentiment, join stock prices,
@@ -140,10 +312,12 @@ private paths or credentials. A failed model download/load exits non-zero and
 never silently selects another classifier.
 
 The reviewed config, safetensors, tokenizer config, vocabulary, and
-special-token files are SHA-256 verified before and after load. Current SQLite
-schema `6` records their identity, each ordered input's terminal
+special-token files are SHA-256 verified before and after load. SQLite schema
+`6` records their identity, each ordered input's terminal
 generated/reused/error association, post-truncation token evidence, and both
-recovery seals before it permits `PASS`.
+recovery seals before it permits `PASS`; current schema `7` adds nullable
+audit-only source-observation provenance without changing those sentiment
+rules.
 
 If an earlier process was interrupted and the exact ID remains `RUNNING`, first
 confirm no process still owns it, then retry that same ID with
@@ -157,8 +331,9 @@ retained sentiment execution, the working `data/news/paisa_news.sqlite3` also
 used schema version `3`. The migration repaired only the exact recognized
 legacy signature after validating every affected row, then applied schemas 4
 and 5; all other drift fails closed. The retained reference database records
-schema version `5`; current code advances a verified working copy to schema
-version `6` before new sentiment inference. Its ignored, uncommitted
+schema version `5`; current code advances a verified working copy through
+schema version `6` sentiment certification to schema version `7` before new
+sentiment inference. Its ignored, uncommitted
 pre-migration copy is
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified at
 schema version `3` with `31` canonical articles, `150` article occurrences,
@@ -170,8 +345,8 @@ The retained final-code reference execution is
 `NEWS-20261022-131242-5ddffd2d`. It completed with `PASS` on CPU in
 `7.116756208240986` seconds against a preserved schema-3 database copy, which
 migrated to schema version `5`. That is the retained reference-run schema;
-current code advances a verified database to schema `6` for sentiment run
-certification.
+current code advances a verified database through schema `6` sentiment run
+certification to schema `7` audit-only source-observation provenance.
 It requested and scored `30` unique canonical articles, skipped `0`, failed
 `0`, and recorded `any_articles_failed=false`. One scored article was linked
 to OGDC. The label counts were `negative=11`, `neutral=9`, and `positive=10`;
@@ -203,7 +378,20 @@ This short snapshot is insufficient for stock-model integration. See
 python -m pytest
 ```
 
-Expected: all collected tests pass. The count will grow as components are added.
+Independent verification of reviewed PR head `4d7084b` produced two distinct
+matrices; these are historical pre-fix results, not a claim about untested
+working-tree changes:
+
+- artifact-present checkout: `609 passed, 1 skipped`; the only skip was the
+  optional TensorFlow/LSTM test, and the local retained-artifact integration
+  test passed;
+- clean Git clone: `608 passed, 2 skipped`; the skips were optional TensorFlow
+  and the intentionally absent local-real-run artifact integration test.
+
+That review also reported `57` passing frontend tests plus passing lint and
+production build, `pip check`, `compileall`, and
+`git diff --check origin/main...HEAD`. Always report the counts from the
+checkout actually tested rather than copying these historical numbers.
 
 ## 6. Start the API
 
@@ -365,7 +553,11 @@ the committed example configuration:
 ```bash
 cd frontend
 npm ci
-cp .env.example .env.local
+if [ ! -e .env.local ] && [ ! -L .env.local ]; then
+  cp .env.example .env.local
+else
+  printf 'Keeping existing frontend/.env.local\n'
+fi
 ```
 
 `frontend/.env.example` contains:

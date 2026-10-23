@@ -19,6 +19,9 @@ from paisa.news.models import (
 from paisa.news.providers.base import NewsProvider, sha256_bytes, utc_datetime
 
 
+LICENSING_REVIEW_REQUIRED = "LICENSING_REVIEW_REQUIRED"
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -32,6 +35,17 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _required_single_line(value: Any, *, field: str, maximum: int = 2_000) -> str:
+    text = _optional_text(value)
+    if text is None:
+        raise ValueError(f"{field} cannot be blank")
+    if "\r" in text or "\n" in text:
+        raise ValueError(f"{field} must be a single-line value")
+    if len(text) > maximum:
+        raise ValueError(f"{field} exceeds its maximum length")
+    return text
 
 
 _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
@@ -78,12 +92,17 @@ class ManualCsvNewsProvider(NewsProvider):
         self,
         csv_path: str | Path,
         *,
+        licensing_usage_note: str = LICENSING_REVIEW_REQUIRED,
         source_name: str | None = None,
         default_language: str | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.source_name = source_name or self.csv_path.stem
+        self.licensing_usage_note = _required_single_line(
+            licensing_usage_note,
+            field="licensing_usage_note",
+        )
         self.default_language = _optional_text(default_language)
         self.configured_source = f"manual-csv:{self.csv_path.name}"
         self.clock = clock
@@ -91,11 +110,15 @@ class ManualCsvNewsProvider(NewsProvider):
             {
                 "configured_source": self.configured_source,
                 "source_name": self.source_name,
+                "provider_mode": "manual_import",
+                "licensing_usage_note": self.licensing_usage_note,
             },
         )
         self.effective_config = {
             "source_name": self.source_name,
             "default_language": self.default_language,
+            "provider_mode": "manual_import",
+            "licensing_usage_note": self.licensing_usage_note,
         }
 
     def fetch(self, *, fetched_at: datetime | None = None) -> ProviderFetchResult:
@@ -157,6 +180,9 @@ class ManualCsvNewsProvider(NewsProvider):
                     warnings.append("missing_source_url")
                 if published is None:
                     warnings.append("missing_publication_time")
+                raw_payload = dict(row)
+                raw_payload["provider_mode"] = "manual_import"
+                raw_payload["licensing_usage_note"] = self.licensing_usage_note
                 records.append(
                     RawNewsRecord(
                         raw_record_id=f"{capture_id}-{row_index:06d}",
@@ -179,7 +205,7 @@ class ManualCsvNewsProvider(NewsProvider):
                         http_status=None,
                         response_content_type="text/csv",
                         response_sha256=checksum,
-                        raw_payload=dict(row),
+                        raw_payload=raw_payload,
                         provider_warnings=tuple(warnings),
                     )
                 )
@@ -220,4 +246,4 @@ class ManualCsvNewsProvider(NewsProvider):
         )
 
 
-__all__ = ["ManualCsvNewsProvider"]
+__all__ = ["LICENSING_REVIEW_REQUIRED", "ManualCsvNewsProvider"]

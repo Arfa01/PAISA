@@ -25,10 +25,12 @@ from urllib.parse import quote
 from paisa.news.deduplication import title_source_time_key
 from paisa.news.entity_linking import link_ogdc_articles
 from paisa.news.models import (
+    NEWS_AVAILABILITY_POLICY_VERSION,
     DuplicateRelationship,
     NormalizedNewsArticle,
     ProviderError,
     RawNewsRecord,
+    SUPPORTED_NEWS_SCHEMA_VERSIONS,
 )
 from paisa.news.normalization import NormalizationError, normalize_record
 from paisa.news.quality import calculate_quality_report
@@ -62,6 +64,7 @@ _NORMALIZED_FIELDS = (
     "body",
     "published_at",
     "published_timezone",
+    "source_observed_at",
     "available_at",
     "fetched_at",
     "language",
@@ -470,6 +473,14 @@ def _validate_context(root: Path, manifest: Mapping[str, Any]) -> Mapping[str, A
         raise NewsRunVerificationError("Deduplication context digest differs")
     if recorded_context_hash != reference.get("context_sha256"):
         raise NewsRunVerificationError("Manifest context digest differs")
+    if context.get("schema_version") != "1.0":
+        raise NewsRunVerificationError(
+            "Deduplication context schema is unsupported"
+        )
+    if context.get("news_record_schema_version") != manifest.get("schema_version"):
+        raise NewsRunVerificationError(
+            "Deduplication context news record schema differs from the manifest"
+        )
     code_identity = context.get("code_identity")
     if not isinstance(code_identity, Mapping) or not isinstance(
         code_identity.get("news_source_sha256"), str
@@ -647,6 +658,32 @@ def verify_news_run(
     ):
         raise NewsRunVerificationError("Completion evidence is not committed")
 
+    artifact_news_schema = manifest.get("schema_version")
+    if artifact_news_schema not in SUPPORTED_NEWS_SCHEMA_VERSIONS:
+        raise NewsRunVerificationError("News run uses an unsupported record schema")
+    if (
+        completion.get("schema_version") != "1.0"
+        or completion.get("news_record_schema_version") != artifact_news_schema
+        or summary.get("schema_version") != artifact_news_schema
+    ):
+        raise NewsRunVerificationError(
+            "Completion, manifest, and summary news record schemas differ"
+        )
+    expected_availability_policy = (
+        NEWS_AVAILABILITY_POLICY_VERSION
+        if artifact_news_schema != "1.0"
+        else None
+    )
+    if (
+        manifest.get("availability_policy_version")
+        != expected_availability_policy
+        or completion.get("availability_policy_version")
+        != expected_availability_policy
+    ):
+        raise NewsRunVerificationError(
+            "News availability policy version is missing or inconsistent"
+        )
+
     expected_inventory = _normalize_inventory(manifest.get("artifact_inventory"))
     inventory_digest = _json_digest(expected_inventory)
     if inventory_digest != manifest.get("artifact_inventory_sha256"):
@@ -661,6 +698,18 @@ def verify_news_run(
 
     context = _validate_context(root, manifest)
     raw_index = _read_json(root, "raw/index.json", label="raw index")
+    provider_config = _read_json(
+        root, "provider_config.json", label="provider configuration"
+    )
+    if (
+        raw_index.get("schema_version") != artifact_news_schema
+        or provider_config.get("schema_version") != artifact_news_schema
+        or provider_config.get("availability_policy_version")
+        != expected_availability_policy
+    ):
+        raise NewsRunVerificationError(
+            "Raw index or provider configuration news record schema differs"
+        )
     captures = raw_index.get("captures")
     records = raw_index.get("records")
     if not isinstance(captures, list) or not isinstance(records, list):
@@ -697,6 +746,13 @@ def verify_news_run(
         ):
             raise NewsRunVerificationError("Raw record index identity is invalid")
         payload = _read_json(root, reference, label="raw record")
+        if (
+            artifact_news_schema == "1.0"
+            and "source_observed_at_raw" in payload
+        ):
+            raise NewsRunVerificationError(
+                "Schema 1.0 raw records cannot declare source_observed_at_raw"
+            )
         record = _raw_record(payload, indexed_id=indexed_id)
         if record_entry.get("provider_record_id") != record.provider_record_id:
             raise NewsRunVerificationError("Raw index provider identity differs")
@@ -719,6 +775,7 @@ def verify_news_run(
                     record,
                     ingestion_run_id=run_id,
                     raw_artifact_reference=reference,
+                    schema_version=artifact_news_schema,
                 )
             )
         except NormalizationError as exc:
@@ -729,11 +786,16 @@ def verify_news_run(
         normalized, frozen_candidates  # type: ignore[arg-type]
     )
     linked_articles, entity_links = link_ogdc_articles(deduplicated)
+    normalized_fields = (
+        tuple(field for field in _NORMALIZED_FIELDS if field != "source_observed_at")
+        if artifact_news_schema == "1.0"
+        else _NORMALIZED_FIELDS
+    )
     expected_normalized = _expected_csv_rows(
-        (article.to_dict() for article in linked_articles), _NORMALIZED_FIELDS
+        (article.to_dict() for article in linked_articles), normalized_fields
     )
     observed_normalized = _read_csv(
-        root, "normalized_articles.csv", _NORMALIZED_FIELDS
+        root, "normalized_articles.csv", normalized_fields
     )
     if observed_normalized != expected_normalized:
         raise NewsRunVerificationError("Normalized CSV does not match raw-record replay")
@@ -756,15 +818,25 @@ def verify_news_run(
         rejected, key=lambda item: (item["raw_record_id"], item["reason"])
     ):
         raise NewsRunVerificationError("Quality rejection evidence differs from replay")
-    errors_payload = _read_json(
+    provider_error_evidence = _read_json(
         root, "provider_errors.json", label="provider errors"
-    ).get("errors")
+    )
+    if provider_error_evidence.get("schema_version") != artifact_news_schema:
+        raise NewsRunVerificationError(
+            "Provider error news record schema differs from the manifest"
+        )
+    errors_payload = provider_error_evidence.get("errors")
     if not isinstance(errors_payload, list):
         raise NewsRunVerificationError("Provider error evidence must be a list")
     provider_errors: list[ProviderError] = []
     for error in errors_payload:
         if not isinstance(error, Mapping):
             raise NewsRunVerificationError("Provider error entries must be objects")
+        details = error.get("details", {})
+        if not isinstance(details, Mapping):
+            raise NewsRunVerificationError(
+                "Provider error request details must be an object"
+            )
         try:
             provider_errors.append(
                 ProviderError(
@@ -780,6 +852,7 @@ def verify_news_run(
                         if error.get("http_status") is None
                         else int(error["http_status"])
                     ),
+                    details=details,
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -791,6 +864,7 @@ def verify_news_run(
         entity_links=entity_links,
         rejected_records=rejected,
         provider_errors=provider_errors,
+        news_record_schema_version=artifact_news_schema,
     )
     if quality != replayed_quality:
         raise NewsRunVerificationError("Quality report does not match replay")

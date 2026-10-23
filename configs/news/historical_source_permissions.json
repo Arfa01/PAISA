@@ -1,0 +1,41 @@
+{
+  "assessment_document": "docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md",
+  "assessment_sha256": "a68592c0e9d7e627db9311cb6711587d96f56f27ee3ba295435ff28ac8857f88",
+  "decisions": [
+    {
+      "allowed_run_ids": [
+        "NEWS-20261023-060000-gdelt-ogdc2"
+      ],
+      "decision_id": "gdelt-doc-metadata-academic-v1",
+      "licensing_usage_note_sha256": "36139725658de9e8072839f62673c96e115e7140ceda29c99cd90c111fe0bd7e",
+      "provider": "gdelt-doc",
+      "provider_mode": "real",
+      "required_provider_options": {
+        "article_page_fetching": "disabled",
+        "attribution_text": "Data source: GDELT Project (https://www.gdeltproject.org/).",
+        "endpoint": "https://api.gdeltproject.org/api/v2/doc/doc",
+        "environment_authentication": "disabled",
+        "provider_mode": "historical_api"
+      },
+      "scope": "GDELT-returned metadata only; cite GDELT; do not fetch or store linked publisher bodies or images.",
+      "status": "PERMITTED"
+    },
+    {
+      "decision_id": "rss-existing-evidence-review-v1",
+      "provider": "rss",
+      "provider_mode": "real",
+      "required_provider_options": {},
+      "scope": "Existing private descriptive audit evidence only; no new collection, export, or training-corpus use without written permission.",
+      "status": "REVIEW_REQUIRED"
+    },
+    {
+      "decision_id": "manual-csv-dataset-specific-review-v1",
+      "provider": "manual-csv",
+      "provider_mode": "imported",
+      "required_provider_options": {},
+      "scope": "Each supplied dataset requires its own reviewed licence, permitted-field, retention, attribution, and redistribution evidence.",
+      "status": "REVIEW_REQUIRED"
+    }
+  ],
+  "schema_version": "1.0"
+}

@@ -13,6 +13,10 @@ from paisa.news.models import PipelineSummary
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "run_news_pipeline.py"
+MANUAL_LICENSE_ARGS = [
+    "--licensing-usage-note",
+    "Licensed academic import; supplied fields may be stored for this project.",
+]
 
 
 def _load_cli_module():
@@ -47,7 +51,12 @@ def _summary(*, status: str = "PASS") -> PipelineSummary:
     "argv,expected_message",
     [
         (["--provider", "rss"], "requires --config"),
+        (["--provider", "gdelt-doc"], "requires --config"),
         (["--provider", "manual-csv"], "requires --input"),
+        (
+            ["--provider", "manual-csv", "--input", "news.csv"],
+            "requires --licensing-usage-note",
+        ),
         (
             ["--provider", "rss", "--config", "feeds.json", "--input", "news.csv"],
             "--input is only valid",
@@ -79,7 +88,9 @@ def test_cli_prints_exactly_one_body_free_summary_and_rejects_partial_by_default
         lambda *args, **kwargs: _summary(status="PARTIAL"),
     )
 
-    exit_code = module.main(["--provider", "manual-csv", "--input", "news.csv"])
+    exit_code = module.main(
+        ["--provider", "manual-csv", "--input", "news.csv", *MANUAL_LICENSE_ARGS]
+    )
 
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -106,6 +117,7 @@ def test_cli_allows_partial_only_with_explicit_opt_in(monkeypatch, capsys):
             "manual-csv",
             "--input",
             "news.csv",
+            *MANUAL_LICENSE_ARGS,
             "--allow-partial",
         ]
     )
@@ -123,7 +135,9 @@ def test_cli_returns_nonzero_for_failed_summary(monkeypatch, capsys):
         lambda *args, **kwargs: _summary(status="FAIL"),
     )
 
-    exit_code = module.main(["--provider", "manual-csv", "--input", "news.csv"])
+    exit_code = module.main(
+        ["--provider", "manual-csv", "--input", "news.csv", *MANUAL_LICENSE_ARGS]
+    )
 
     assert exit_code == 1
     assert json.loads(capsys.readouterr().out)["run_status"] == "FAIL"
@@ -138,7 +152,9 @@ def test_cli_exception_output_does_not_echo_credentials(monkeypatch, capsys):
 
     monkeypatch.setattr(module, "run_news_pipeline", fail)
 
-    exit_code = module.main(["--provider", "manual-csv", "--input", "news.csv"])
+    exit_code = module.main(
+        ["--provider", "manual-csv", "--input", "news.csv", *MANUAL_LICENSE_ARGS]
+    )
 
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -171,6 +187,7 @@ def test_manual_csv_cli_end_to_end_emits_summary_and_artifact_locations(tmp_path
             "manual-csv",
             "--input",
             str(imported),
+            *MANUAL_LICENSE_ARGS,
             "--output-dir",
             str(output_root),
             "--database",
@@ -200,3 +217,9 @@ def test_manual_csv_cli_end_to_end_emits_summary_and_artifact_locations(tmp_path
     assert completed.stderr == ""
     assert (output_root / run_id / "run_manifest.json").is_file()
     assert (output_root / run_id / "final_summary.json").is_file()
+    provider_config = json.loads(
+        (output_root / run_id / "provider_config.json").read_text(encoding="utf-8")
+    )
+    assert provider_config["provider_options"]["licensing_usage_note"] == (
+        MANUAL_LICENSE_ARGS[1]
+    )

@@ -200,12 +200,17 @@ resealing cannot legitimize a false nested checksum claim.
 
 ## Certified real run
 
-The retained local run `LSTM-20261024-OGDC-price-only-01` completed with status
+The retained local run `LSTM-20261024-OGDC-price-only-02` completed with status
 `PASS`. It was produced from clean source commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140` on CPU with Python `3.13.7`,
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f` on CPU with Python `3.13.7`,
 TensorFlow `2.21.0`, NumPy `2.3.5`, and seed `42`. Generated run artifacts and
 the ZIP are intentionally ignored by Git; the checksum-sealed local directory
 and its `final_summary.json` are the result source of record.
+
+The earlier immutable `LSTM-20261024-OGDC-price-only-01` run is retained as
+historical pre-hardening evidence. Its schema `1.0` summary does not demonstrate
+the portable-path, publication-order, or revised shared-holdout contracts; it
+was not overwritten or relabeled as the certified result.
 
 The frozen input contains 1,239 OGDC daily sessions from 2021-09-16 through
 2026-09-15 and produces 1,219 labeled technical-feature rows with 19 ordered
@@ -219,12 +224,12 @@ Both one-layer models have 64 recurrent units, a sigmoid output, 21,569
 parameters, Adam at `0.001`, batch size 32, and 50 requested epochs. `M-005`
 uses dropout `0.20`; `M-006` uses dropout `0.40`, recurrent dropout `0.10`, and
 kernel/recurrent L2 `0.0001`. Early stopping completed both fits after 7 epochs,
-with epoch 1 as the best validation checkpoint. Training durations were 2.298
-seconds for M-005 and 3.957 seconds for M-006 on this host. The registered IDs
+with epoch 1 as the best validation checkpoint. Training durations were 2.503
+seconds for M-005 and 4.036 seconds for M-006 on this host. The registered IDs
 are:
 
-- `M-005-1fee47047b61cc43-7a681372-6a908832-a39f-4087-abd8-d70b4d0ebe50`
-- `M-006-67bcc0f398cc963a-7a681372-6a908832-a39f-4087-abd8-d70b4d0ebe50`
+- `M-005-1fee47047b61cc43-81548726-c0c4e1fd-50f7-4fa4-9963-01b6b3f85a46`
+- `M-006-67bcc0f398cc963a-81548726-c0c4e1fd-50f7-4fa4-9963-01b6b3f85a46`
 
 ### Validation-only selection metrics
 
@@ -268,13 +273,19 @@ Neither LSTM beats buy-and-hold or the best model portfolio. On the same dates
 and rules, M-002 is the best model portfolio at PKR 105,987.04 and 5.98704%,
 still below buy-and-hold by 0.26085 percentage points.
 
-The run-level validator accepted 147 checksum-inventoried payload files. Both
+The run-level validator accepted 147 checksum-inventoried payload files. The
+persisted summary uses schema `1.1`, repository-independent relative paths, and
+the post-freeze/shared-holdout field names; neither the run directory nor its
+ZIP contains the originating absolute workspace path. The comparison
+leaderboard has one canonical `registered_model_id` column. Both
 184-row prediction files use the exact nine-column backtester schema, contain
 finite complementary probabilities, and cover 2025-12-16 through 2026-09-15.
 Reloading each saved bundle reproduced all 182 validation probabilities exactly
 without a second test inference. The complete ZIP passed integrity testing and
 has SHA-256
-`1ad1f9f536c5c40d5c1ef4ca9643644edde4fe8a127fa4152e44c4652e218968`.
+`f9d3ef10bb80528388a9137e7f169a7d870e7429f779f46e074a6254a26d8821`.
+The published `run_manifest.json` has SHA-256
+`e475e077f375071c79ce8743425831d8cd9cf5ceb37f42eca0acfa65a100f3d0`.
 
 One stock, one period, and one trading policy cannot establish general market
 superiority or future performance. Unknown corporate-action adjustment,
@@ -300,5 +311,6 @@ npm run build
 
 The default test suite must remain offline. TensorFlow smoke training is bounded
 to a tiny fixture and skips only when the optional dependency is absent. For
-the certified run above, the TensorFlow-enabled full suite completed with 1,014
-passing backend tests; the frontend completed 57 tests plus lint and build.
+the certified run above, the TensorFlow-enabled full suite completed with 1,036
+passing backend tests and one Windows-only junction test skipped on macOS; the
+frontend completed 57 tests plus lint and build.

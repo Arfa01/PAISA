@@ -40,7 +40,7 @@ The provisional champion is selected from validation metrics only, and only
 when both actual classes occur in that split. For a one-class split, balanced
 accuracy, Matthews correlation coefficient, and ROC-AUC are undefined, the
 metrics carry `single_class_actuals`, and selection fails closed. The test split
-remains untouched until configurations and the champion-selection rule have
+is not consulted until configurations and the champion-selection rule have
 been frozen; test results never select or tune a model.
 
 ## Target and timing contract
@@ -236,8 +236,8 @@ leaderboards, comparison outputs, checksummed manifest, and
 remain direct backtesting inputs, with independent portfolio state per model.
 
 The certified local execution is
-`LSTM-20261024-OGDC-price-only-01`, produced on CPU from clean commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140`. Both variants stopped after 7
+`LSTM-20261024-OGDC-price-only-02`, produced on CPU from clean commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f`. Both variants stopped after 7
 epochs; validation selected M-005. On all 184 common post-freeze LSTM test dates,
 M-005/M-006 balanced accuracy is `0.520087`/`0.544251`. Their fixed-policy
 portfolio returns are `-3.64071%`/`-3.88909%`, versus `+6.24789%` for

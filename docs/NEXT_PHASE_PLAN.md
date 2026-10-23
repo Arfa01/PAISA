@@ -224,8 +224,8 @@ reported without promotion language.
 
 ### 6. Preserve and interpret the certified price-only LSTM comparison
 
-**Completed and certified.** Run `LSTM-20261024-OGDC-price-only-01` executed on
-CPU from clean source commit `eb28ea53ffd69032f4b1109be127e23f1ddcc140`
+**Completed and certified.** Run `LSTM-20261024-OGDC-price-only-02` executed on
+CPU from clean source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f`
 with Python 3.13 and TensorFlow 2.21. It reproduced the canonical 834/182/184
 train/validation/test sequence counts. Both variants trained for 7 epochs and
 recorded best validation epoch 1.
@@ -240,9 +240,10 @@ variant or to tune another configuration.
 The model portfolios ended at PKR 96,359.29 (-3.64071%) for `M-005` and PKR
 96,110.91 (-3.88909%) for `M-006`. Neither beat buy-and-hold at PKR 106,247.89
 (+6.24789%) or the best baseline model portfolio, `M-002`, at PKR 105,987.04
-(+5.98704%). The acceptance checks passed, including 1,014 backend tests, 57
-frontend tests, frontend lint/build, dependency, bytecode-compilation, and diff
-checks. The checksum-inventoried artifacts remain local and ignored by Git;
+(+5.98704%). The acceptance checks passed, including 1,036 backend tests with
+one platform-specific skip, 57 frontend tests, frontend lint/build, dependency,
+bytecode-compilation, and diff checks. The checksum-inventoried artifacts
+remain local and ignored by Git;
 their generated `final_summary.json` is authoritative. These results are an
 academic simulation, not financial advice. Follow
 [`LSTM_SEQUENCE_CONTRACT.md`](LSTM_SEQUENCE_CONTRACT.md) and

@@ -492,11 +492,11 @@ production build, `pip check`, `compileall`, and
 `git diff --check origin/main...HEAD`. Always report the counts from the
 checkout actually tested rather than copying these historical numbers.
 
-The later certified LSTM run used clean source commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140`. Its completed checkout validation
-reported `1014 passed` for the backend and `57 passed` for the frontend, with
-frontend lint/build, `pip check`, bytecode compilation, and diff checks also
-passing.
+The hardened certified LSTM run used clean source commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f`. Its completed checkout validation
+reported `1036 passed, 1 skipped` for the backend and `57 passed` for the
+frontend, with frontend lint/build, `pip check`, bytecode compilation, and diff
+checks also passing. The skip is the Windows-only junction test on macOS.
 
 ## 6. Start the API
 
@@ -828,8 +828,8 @@ evaluated only after that choice is frozen.
 
 The workflow supports CPU and Colab GPU. Apple Metal is optional, and no
 bit-identical cross-device result is promised. The certified CPU execution is
-`LSTM-20261024-OGDC-price-only-01`, run from clean commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140` with Python 3.13 and TensorFlow
+`LSTM-20261024-OGDC-price-only-02`, run from clean commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f` with Python 3.13 and TensorFlow
 2.21. It produced 834/182/184 train/validation/test sequences; both variants
 ran for 7 epochs and recorded best validation epoch 1. Validation preferred
 `M-005` at `0.479280` balanced accuracy over `M-006` at `0.474931`.

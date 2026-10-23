@@ -131,9 +131,9 @@ experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
 
-The accepted local LSTM run is `LSTM-20261024-OGDC-price-only-01`. It was
+The accepted local LSTM run is `LSTM-20261024-OGDC-price-only-02`. It was
 executed on CPU from clean source commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140` with Python 3.13 and TensorFlow
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f` with Python 3.13 and TensorFlow
 2.21 and produced 834/182/184 train/validation/test sequences. Both variants
 trained for 7 epochs and recorded best validation epoch 1. Validation preferred
 `M-005` at `0.479280` balanced accuracy over `M-006` at `0.474931`. On the
@@ -982,7 +982,7 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    `available_at <= decision_cutoff`.
 2. Keep the current price-only feature set as the control; prepare paired
    price-only and price-plus-sentiment configurations with identical splits.
-3. Preserve the certified `LSTM-20261024-OGDC-price-only-01` evidence and its
+3. Preserve the certified `LSTM-20261024-OGDC-price-only-02` evidence and its
    validation-only selection decision. Do not promote `M-006` from its stronger
    post-freeze test balanced accuracy. After the sentiment coverage gate passes,
    train paired price-only and price-plus-sentiment experiments without using
@@ -1112,7 +1112,7 @@ python scripts/train_ogdc_models.py \
   --run-id "$PAISA_NEW_TRAINING_RUN_ID"
 
 # Optional TensorFlow price-only comparison. The accepted run is
-# LSTM-20261024-OGDC-price-only-01; the command below is for a new run ID only.
+# LSTM-20261024-OGDC-price-only-02; the command below is for a new run ID only.
 # M-005 and M-006 both use the frozen OGDC evidence; validation selects/reports
 # and test is post-freeze.
 # CPU and Colab GPU are supported, Apple Metal is optional, and results are not
@@ -1174,12 +1174,12 @@ That review also reported frontend `57 passed`, passing lint/build,
 present those counts as validation of later changes; report the exact results
 from the checkout actually tested.
 
-The later certified LSTM source commit
-`eb28ea53ffd69032f4b1109be127e23f1ddcc140` completed with `1014 passed` in
-the backend, `57 passed` in the frontend, and passing frontend lint/build,
-`pip check`, bytecode compilation, and diff checks. Those are the accepted
-counts for that clean source commit; future changes require their own exact
-verification.
+The hardened certified LSTM source commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f` completed with `1036 passed, 1
+skipped` in the backend, `57 passed` in the frontend, and passing frontend
+lint/build, `pip check`, bytecode compilation, and diff checks. The skip is the
+Windows-only junction test on macOS. Those are the accepted counts for that
+clean source commit; future changes require their own exact verification.
 
 Report the exact pass/fail/skip counts and warnings, branch and commit, generated
 artifact IDs, assumptions, known limitations, and any contract changes. Keep

@@ -20,6 +20,14 @@ DEMO_PACK_DOCUMENTS = (
     "docs/SUPERVISOR_DEMO_SCRIPT.md",
     "docs/TEAM_HANDOFF.md",
 )
+CONTINUATION_DOCUMENTS = (
+    "docs/PROJECT_STATE_2026-10-24.md",
+    "docs/REMAINING_ROADMAP.md",
+    "docs/ISSUE_BACKLOG.md",
+    "docs/REPRODUCTION_COMMANDS.md",
+    "docs/FREE_PLAN_WORKFLOW.md",
+    "docs/CODEX_PROMPT_LIBRARY.md",
+)
 
 
 def _read(relative_path: str) -> str:
@@ -603,3 +611,150 @@ def test_operator_commands_do_not_overwrite_frontend_environment() -> None:
             or "[ -e .env.local ] || cp .env.example .env.local" in document
         )
         assert "\ncp .env.example .env.local\n" not in document
+
+
+def test_continuation_documents_are_discoverable_and_cover_the_handoff() -> None:
+    readme = _read("README.md")
+    for relative_path in CONTINUATION_DOCUMENTS:
+        assert (REPOSITORY_ROOT / relative_path).is_file()
+        assert f"]({relative_path})" in readme
+
+    state = _normalized(_read("docs/PROJECT_STATE_2026-10-24.md"))
+    assert "d7015cb" in state
+    assert "pr #16" in state
+    assert "lstm-20261024-ogdc-price-only-02" in state
+    assert "vsl-20261020-ogdc-main-02" in state
+    assert "exact next safe task" in state
+    assert "not financial advice" in state
+
+    roadmap_and_backlog = _normalized(
+        _read("docs/REMAINING_ROADMAP.md") + _read("docs/ISSUE_BACKLOG.md")
+    )
+    for topic in (
+        "lstm integration",
+        "unified model comparison",
+        "shap",
+        "multi-stock",
+        "event graph",
+        "historical-news overlap",
+        "daily sentiment aggregation",
+        "price-plus-sentiment",
+        "final report",
+        "final demo",
+    ):
+        assert topic in roadmap_and_backlog
+    for priority in ("must", "should", "stretch"):
+        assert priority in roadmap_and_backlog
+    assert "dependencies" in roadmap_and_backlog
+    assert "exit criteria" in roadmap_and_backlog
+
+    backlog = _read("docs/ISSUE_BACKLOG.md")
+    permission_run = backlog.split("## PAISA-RM-007", 1)[1].split(
+        "## PAISA-RM-008", 1
+    )[0]
+    registry = backlog.split("## PAISA-RM-018", 1)[1].split(
+        "## PAISA-RM-019", 1
+    )[0]
+    final_report = backlog.split("## PAISA-RM-021", 1)[1].split(
+        "## PAISA-RM-022", 1
+    )[0]
+    assert "**Depends on:** `PAISA-RM-006`" in permission_run
+    assert "None for the fixture-backed registry contract" in registry
+    assert "`PAISA-RM-013` only when `G3-NEWS-OVERLAP` opens" in final_report
+
+
+def test_prompt_library_and_limited_usage_workflow_cover_every_stage() -> None:
+    prompts = _normalized(_read("docs/CODEX_PROMPT_LIBRARY.md"))
+    for heading in (
+        "implementation",
+        "read-only review",
+        "fix review findings",
+        "post-merge acceptance",
+        "error triage",
+        "release and tagging",
+        "report generation",
+    ):
+        assert heading in prompts
+
+    workflow = _normalized(_read("docs/FREE_PLAN_WORKFLOW.md"))
+    for concept in (
+        "small number",
+        "one issue, one branch",
+        "local validation",
+        "github actions",
+        "colab",
+        "artifact custodian",
+        "github issues",
+    ):
+        assert concept in workflow
+
+
+def test_reproduction_runbook_covers_required_commands_and_parses_as_shell() -> None:
+    document = _read("docs/REPRODUCTION_COMMANDS.md")
+    normalized = _normalized(document)
+    for command in (
+        "python scripts/doctor.py",
+        "python -m pytest",
+        "python -m pip check",
+        "python -m compileall",
+        "npm ci",
+        "npm run test",
+        "npm run lint",
+        "npm run build",
+        "uvicorn paisa.api.main:app",
+        "npm run dev",
+        "run_ogdc_vertical_slice.py",
+        "run_news_pipeline.py",
+        "run_sentiment_inference.py",
+        "audit_news_price_overlap.py",
+        "verify_news_coverage.py",
+        "run_lstm_price_only_experiments.py",
+    ):
+        assert command in normalized
+    assert "new immutable" in normalized
+    assert "not financial advice" in normalized
+
+    blocks = _bash_blocks("docs/REPRODUCTION_COMMANDS.md")
+    assert blocks
+    for block in blocks:
+        parsed = subprocess.run(
+            ["bash", "-n"],
+            input=block,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert parsed.returncode == 0, parsed.stderr
+
+
+def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
+    workflow = _read(".github/workflows/ci.yml")
+    action_references = re.findall(r"uses:\s+([^\s#]+)", workflow)
+
+    assert action_references
+    assert all(re.search(r"@[0-9a-f]{40}$", value) for value in action_references)
+    assert "cache: pip" in workflow
+    assert "cache: npm" in workflow
+    assert "python -m pip check" in workflow
+    assert "python -m compileall -q src scripts tests" in workflow
+    assert "python -m pytest --ignore=tests/test_documentation_contracts.py" in workflow
+    assert "python -m pytest tests/test_documentation_contracts.py" in workflow
+    assert "npm ci" in workflow
+    assert "npm run test" in workflow
+    assert "npm run lint" in workflow
+    assert "npm run build" in workflow
+    assert 'HF_HUB_OFFLINE: "1"' in workflow
+    assert 'TRANSFORMERS_OFFLINE: "1"' in workflow
+    assert "git diff --check" in workflow
+    assert "git diff --exit-code" in workflow
+
+    for forbidden in (
+        "requirements-lstm.txt",
+        "requirements-sentiment.txt",
+        "requirements-provider-pypsx.txt",
+        "run_news_pipeline.py",
+        "run_sentiment_inference.py",
+        "run_ogdc_vertical_slice.py",
+        "run_lstm_price_only_experiments.py",
+    ):
+        assert forbidden not in workflow

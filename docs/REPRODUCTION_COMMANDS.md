@@ -1,0 +1,476 @@
+# PAISA reproduction commands
+
+This runbook collects the supported commands for continuing PAISA from a clean
+checkout. Run them from the repository root unless a block explicitly changes
+directory. Predictions, signals, trades, portfolios, and returns produced by
+these commands are academic simulations and are not financial advice.
+
+## Execution profiles and safety boundaries
+
+There are two distinct profiles:
+
+- **Offline validation** installs only `requirements.txt`, uses deterministic
+  fixtures and mocks, does not call a live provider, does not download model
+  weights, and does not require any private generated artifact.
+- **Local research reproduction** may use network providers, ignored SQLite
+  data, ignored immutable artifacts, and optional model runtimes. Review source
+  permission and licensing before acquisition, and never commit generated data,
+  model binaries, caches, databases, credentials, or artifact directories.
+
+The Python package supports Python 3.10 or newer. The certified LSTM run used
+Python 3.13.7, and TensorFlow 2.21 is supported here only on CPython 3.10 through
+3.13. The frontend supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
+22.20.0 is the version recorded in the current dashboard runbook.
+
+All generated run destinations are immutable. Every producer below requires a
+new immutable ID. Replace every
+`REPLACE-WITH-A-NEW-UNUSED-ID` value before running a producer. A collision must
+fail; do not delete, overwrite, reseal, or relabel an earlier run.
+
+## Default Python setup
+
+The default environment contains the backend, baseline/boosted model stack,
+backtesting, and test dependencies. It intentionally excludes TensorFlow,
+FinBERT, and the optional `pypsx-toolkit` provider.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+```
+
+Run the read-only environment diagnostic after setup. It reports required
+commands and dependencies, optional local evidence, and exact next commands; it
+does not install, download, create, or change data or artifacts.
+
+```bash
+python scripts/doctor.py
+```
+
+The optional dependency sets are deliberately separate:
+
+```bash
+# Only for article-level FinBERT inference; downloads are not part of CI.
+python -m pip install -r requirements-sentiment.txt
+
+# Only in a CPython 3.10--3.13 LSTM environment or Colab runtime.
+python -m pip install -r requirements-lstm.txt
+
+# Optional full-OHLCV provider; not required for the official psx-dps path.
+python -m pip install -r requirements-provider-pypsx.txt
+python -c "import pypsx_toolkit"
+```
+
+For the cleanest separation, create `.venv-lstm` or a Colab runtime instead of
+adding TensorFlow to the default development environment.
+
+## Offline validation and CI-equivalent checks
+
+These commands do not invoke the OGDC runner, news providers, sentiment
+inference, or LSTM training. The default tests inject fixtures or fake provider
+sessions. In a fresh clone, the optional TensorFlow smoke test and retained-real
+artifact integration test may skip; report the counts actually observed.
+
+```bash
+source .venv/bin/activate
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python -m pip check
+python -m compileall -q src scripts tests
+python -m pytest
+git diff --check
+git diff --check origin/main...HEAD
+```
+
+Frontend dependencies are restored from the committed lockfile. The production
+build is generated under ignored `frontend/dist/`.
+
+```bash
+cd frontend
+npm ci
+npm run test
+npm run lint
+npm run build
+cd ..
+git diff --check
+git diff --check origin/main...HEAD
+git status --short
+```
+
+CI must use only the default Python dependency set and the npm lockfile. It must
+not install `requirements-lstm.txt` or `requirements-sentiment.txt`, invoke live
+providers, restore private artifacts, or fetch real model weights.
+
+## Start the API and dashboard
+
+The v1 results API requires a complete, checksum-valid vertical-slice run and
+its referenced model-training run. These generated roots are private,
+Git-ignored local artifacts; restore both together from the project artifact
+custodian or create a new pair before starting the demo.
+
+Terminal 1, from the repository root:
+
+```bash
+source .venv/bin/activate
+export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
+export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
+export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+The retained ID above works only when the ignored
+`artifacts/vertical_slice/VSL-20261020-OGDC-main-02/` and referenced
+`artifacts/model_training/TRN-20261020-191815-624662-nogit/` directories are
+present. An explicit `/api/v1/vertical-slices/{run_id}/...` request does not
+require the default-run variable.
+
+Terminal 2:
+
+```bash
+cd frontend
+npm ci
+if [ ! -e .env.local ] && [ ! -L .env.local ]; then
+  cp .env.example .env.local
+else
+  printf 'Keeping existing frontend/.env.local\n'
+fi
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. The dashboard reads API results and never trains a
+model, reads an artifact directly, or substitutes fixture prices after an API
+failure.
+
+## Read-only artifact verification
+
+### Price, training, and LSTM artifact inventories
+
+The following validators check checksums and schemas without deserializing a
+fitted model. They require the ignored artifact directories to be present.
+
+```bash
+source .venv/bin/activate
+python - <<'PY'
+from pathlib import Path
+
+from paisa.experiments.artifacts import validate_training_run_artifacts
+from paisa.experiments.lstm_runner import validate_vertical_slice_artifacts
+
+vertical = Path("artifacts/vertical_slice/VSL-20261020-OGDC-main-02")
+training = Path("artifacts/model_training/TRN-20261020-191815-624662-nogit")
+lstm = Path("artifacts/lstm_experiments/LSTM-20261024-OGDC-price-only-02")
+
+vertical_result = validate_vertical_slice_artifacts(vertical)
+training_result = validate_training_run_artifacts(training)
+lstm_result = validate_training_run_artifacts(lstm)
+
+print(f"PASS vertical slice: {vertical_result.directory.name}")
+print(f"PASS model training: {training_result.run_id}")
+print(f"PASS LSTM experiment: {lstm_result.run_id}")
+PY
+```
+
+### News, contemporaneous evidence, and coverage artifacts
+
+Database-bound news verification is authoritative only when the exact SQLite
+evidence for that run is present. Omitting `--database` performs the weaker
+artifact-only replay.
+
+```bash
+PAISA_NEWS_RUN_ID="NEWS-20261023-060000-gdelt-ogdc2"
+python scripts/verify_news_run.py \
+  --run-dir "artifacts/news_ingestion/$PAISA_NEWS_RUN_ID" \
+  --database data/news/paisa_news.sqlite3
+
+python scripts/verify_evidence_run.py \
+  --run-dir artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685
+
+python scripts/verify_evidence_coverage.py \
+  --run-dir artifacts/evidence_coverage/ECOV-20261023-175904-be50a499
+```
+
+These verifiers are offline and read-only. The contemporaneous coverage
+verifier reconciles its sealed records and stock calendar but is not a replay
+of the original remote GDELT archive.
+
+## Official OGDC vertical slice
+
+The official vertical slice is daily OGDC data through the real `psx-dps`
+provider. It trains M-001 through M-004, creates independent portfolios, and
+publishes an immutable comparison. It never silently substitutes sample or
+synthetic data.
+
+Review the CLI, select a fresh ID, then run:
+
+```bash
+source .venv/bin/activate
+python scripts/run_ogdc_vertical_slice.py --help
+
+PAISA_NEW_VERTICAL_RUN_ID="VSL-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_ogdc_vertical_slice.py \
+  --start 2021-01-01 \
+  --output-dir artifacts/vertical_slice \
+  --model-output-dir artifacts/model_training \
+  --run-id "$PAISA_NEW_VERTICAL_RUN_ID"
+```
+
+When live PSX-DPS is unavailable, only a checksum-bound, real-provider cache
+with its required sibling provenance is acceptable. The retained vertical
+slice contains such a frozen input snapshot; fixtures and bare CSV files are
+rejected.
+
+```bash
+PAISA_NEW_VERTICAL_RUN_ID="VSL-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_ogdc_vertical_slice.py \
+  --cached-prices artifacts/vertical_slice/VSL-20261020-OGDC-main-02/input_snapshot/psx_prices.csv \
+  --output-dir artifacts/vertical_slice \
+  --model-output-dir artifacts/model_training \
+  --run-id "$PAISA_NEW_VERTICAL_RUN_ID"
+```
+
+The second command still attempts the live provider first. If it falls back,
+the provider error and verified-cache acquisition mode remain explicit in the
+new evidence.
+
+## News ingestion
+
+News ingestion is separate from sentiment, stock models, signals, portfolios,
+the API, and the dashboard. Existing destinations are never overwritten, and a
+provider failure never falls back to fixtures. Review
+`docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md`, the source terms, allowed stored
+fields, attribution, and retention before any network or manual acquisition.
+
+### Configured RSS or Atom feeds
+
+The RSS adapter fetches only configured feeds and never follows article links.
+
+```bash
+PAISA_NEW_NEWS_RUN_ID="NEWS-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_news_pipeline.py \
+  --provider rss \
+  --config configs/news/ogdc_sources.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3 \
+  --run-id "$PAISA_NEW_NEWS_RUN_ID"
+```
+
+### Licensed manual CSV import
+
+Use only a dataset whose licence and field-level storage rights have been
+reviewed. Record a concrete permission note; an absolute path is recommended.
+
+```bash
+PAISA_NEW_NEWS_RUN_ID="NEWS-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_news_pipeline.py \
+  --provider manual-csv \
+  --input /absolute/path/to/licensed_historical_news.csv \
+  --source-name reviewed-dataset-name \
+  --licensing-usage-note "Licence, permitted fields, academic use, retention, and attribution reviewed on YYYY-MM-DD" \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3 \
+  --run-id "$PAISA_NEW_NEWS_RUN_ID"
+```
+
+### Bounded GDELT DOC metadata discovery
+
+The example is metadata-only and OGDC-bounded. It does not fetch publisher
+pages. Before a new acquisition, review the dated assessment, query windows,
+and permission policy. The existing policy allowlist is tied to an exact prior
+run and is not a provider-wide permission grant; a new run needs a new reviewed
+decision before it can support a coverage-readiness claim.
+
+```bash
+PAISA_NEW_NEWS_RUN_ID="NEWS-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3 \
+  --run-id "$PAISA_NEW_NEWS_RUN_ID"
+```
+
+After any completed ingestion, verify the exact new run against its SQLite
+commit:
+
+```bash
+PAISA_NEW_NEWS_RUN_ID="NEWS-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/verify_news_run.py \
+  --run-dir "artifacts/news_ingestion/$PAISA_NEW_NEWS_RUN_ID" \
+  --database data/news/paisa_news.sqlite3
+```
+
+## Article-level FinBERT sentiment
+
+This optional stage needs `requirements-sentiment.txt` and the exact reviewed
+FinBERT snapshot. It may download large model files during an authorized local
+setup; CI must not run it. The model licence is CC BY-NC-SA 4.0 and its use here
+is limited to non-commercial academic work. The stage emits article-level
+probabilities only: it does not aggregate by day, join prices, retrain a stock
+model, produce a signal, or update a portfolio or dashboard.
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-sentiment.txt
+python scripts/run_sentiment_inference.py --help
+
+PAISA_NEW_SENTIMENT_RUN_ID="SENT-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_sentiment_inference.py \
+  --source-run-id NEWS-20261022-131242-5ddffd2d \
+  --database data/news/paisa_news.sqlite3 \
+  --output-dir artifacts/sentiment_inference \
+  --model-cache data/sentiment_model_cache \
+  --device cpu \
+  --batch-size 8 \
+  --max-input-characters 4000 \
+  --max-token-length 512 \
+  --max-articles 500 \
+  --run-id "$PAISA_NEW_SENTIMENT_RUN_ID"
+```
+
+The source news pack, matching SQLite evidence, and reviewed cached model bytes
+must exist. A download or integrity failure is fatal and never selects another
+classifier. Reusing an existing finalized `SENT-...` ID is forbidden.
+
+## Current news-price coverage v3
+
+The retained `COVERAGE-20261023-120000-real0002` and
+`COVERAGE-20261023-130000-gdelt0001` packs are historical schema-`1.0`,
+`news-price-coverage-v2` evidence. They verified at their producing revisions,
+but the current schema-`1.1`, `news-price-coverage-v3` verifier intentionally
+rejects them. Never edit or reseal a v2 pack to make it pass.
+
+The current authoritative workflow restores the exact source evidence,
+publishes a new v3 run under a fresh ID, and performs source-bound replay. The
+example below uses the permission-allowlisted retained GDELT ingestion pack; it
+still has no contemporaneous overlap with the retained price period and does
+not unblock daily sentiment aggregation.
+
+```bash
+PAISA_COVERAGE_RUN_ID="COVERAGE-REPLACE-WITH-A-NEW-UNUSED-V3-ID"
+PAISA_COVERAGE_RUN_DIR="artifacts/news_coverage/$PAISA_COVERAGE_RUN_ID"
+PAISA_NEWS_RUN_DIR="artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2"
+PAISA_VERTICAL_RUN_DIR="artifacts/vertical_slice/VSL-20261020-OGDC-main-02"
+PAISA_TRAINING_RUN_DIR="artifacts/model_training/TRN-20261020-191815-624662-nogit"
+
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --readiness-config configs/news_coverage/default_readiness.json \
+  --market-timezone Asia/Karachi \
+  --decision-cutoff 15:30:00 \
+  --real-mode \
+  --output-dir artifacts/news_coverage \
+  --run-id "$PAISA_COVERAGE_RUN_ID"
+
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json
+```
+
+A successful strict replay reports `verification_basis=SOURCE_EVIDENCE_BOUND`
+and `source_evidence_bound=true`. If a selected old news pack predates the
+completion seal, both commands require the explicit `--allow-legacy-unsealed`
+flag; that compatibility boundary does not upgrade the source pack. Do not use
+`--allow-fixture` for a real readiness claim.
+
+When source evidence is genuinely unavailable, this explicit fallback performs
+only weaker sealed-pack semantic verification:
+
+```bash
+PAISA_COVERAGE_RUN_DIR="artifacts/news_coverage/COVERAGE-REPLACE-WITH-AN-EXISTING-V3-ID"
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --pack-only
+```
+
+A `PACK_SEMANTIC` pass is not source-bound authority and must not be reported as
+such. Coverage thresholds are engineering/data gates, not evidence that
+sentiment predicts prices or returns.
+
+## Price-only LSTM M-005 and M-006
+
+LSTM is an optional, offline training workflow. It requires TensorFlow but does
+not download data or weights. Use CPython 3.10 through 3.13, preferably a
+separate environment or the maintained Colab notebook. The input training and
+vertical-slice artifacts are private and ignored by Git.
+
+```bash
+python3.13 -m venv .venv-lstm
+source .venv-lstm/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-lstm.txt
+python -m pip install --no-deps -e .
+python scripts/run_lstm_price_only_experiments.py --help
+
+export PAISA_NEW_LSTM_RUN_ID="LSTM-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/TRN-20261020-191815-624662-nogit/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id "$PAISA_NEW_LSTM_RUN_ID" \
+  --baseline-training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --baseline-vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --device cpu
+```
+
+The reusable Colab entry point is
+`notebooks/PAISA_OGDC_LSTM_Experiments.ipynb`. It calls the repository runner
+and displays saved evidence rather than reimplementing the split, sequence,
+evaluation, or portfolio logic. Preserve the certified
+`LSTM-20261024-OGDC-price-only-02` run unchanged; every reproduction uses a new
+ID.
+
+Verify the newly generated LSTM pack without loading its Keras model:
+
+```bash
+python - <<'PY'
+import os
+from pathlib import Path
+
+from paisa.experiments.artifacts import validate_training_run_artifacts
+
+run_id = os.environ["PAISA_NEW_LSTM_RUN_ID"]
+result = validate_training_run_artifacts(Path("artifacts/lstm_experiments") / run_id)
+print(f"PASS LSTM experiment: {result.run_id}")
+PY
+```
+
+## Final handoff checks
+
+Run the complete validation matrix, report the observed results, and confirm
+that only intended source/documentation changes remain:
+
+```bash
+source .venv/bin/activate
+python scripts/doctor.py
+python -m pip check
+python -m compileall -q src scripts tests
+python -m pytest
+
+cd frontend
+npm ci
+npm run test
+npm run lint
+npm run build
+cd ..
+
+git diff --check
+git diff --check origin/main...HEAD
+git status --short
+```
+
+Do not copy historical test counts into a handoff. Record the counts and skips
+from the checkout that was actually tested, along with the exact source commit,
+configuration, artifact IDs, date ranges, feature order, target definition,
+prediction horizon, random seeds, and metrics.

@@ -420,7 +420,9 @@ deterministic replay from captured evidence.
 The retained October 2026 real news evidence is later than the stock artifact
 ending September 15, 2026, and the existing
 `COVERAGE-20261023-100000-preflight003` evidence therefore reports
-`NO_OVERLAP`. That preflight predates the current coverage completion seal; the
-official final remains planned as `COVERAGE-20261023-120000-real0002`. Fixture
-results may test other statuses but must never replace or be presented as the
-real evidence.
+`NO_OVERLAP`. That preflight predates the current coverage completion seal. The
+sealed official `COVERAGE-20261023-120000-real0002` artifact verifies `PASS` and
+retains `NO_OVERLAP`; the separate sealed GDELT result
+`COVERAGE-20261023-130000-gdelt0001` also verifies `PASS` and retains
+`NO_OVERLAP`. Fixture results may test other statuses but must never replace or
+be presented as the real evidence.

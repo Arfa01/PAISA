@@ -169,11 +169,11 @@ contract status or resolving source permission.
 Use a unique `--run-id` when a reproducible external identity is needed; an
 existing directory is never overwritten. The existing RSS preflight
 `COVERAGE-20261023-100000-preflight003` reports `NO_OVERLAP` because the retained
-October 2026 snapshot is later than prices ending on 2026-09-15. The planned
+October 2026 snapshot is later than prices ending on 2026-09-15. The sealed
 official RSS artifact is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it has not yet been
-published. This is an engineering/data-coverage determination, not a
-statistical or financial claim.
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it verifies `PASS`
+and retains the same `NO_OVERLAP` readiness result. This is an engineering/data-
+coverage determination, not a statistical or financial claim.
 The default `--news-database` is fingerprinted, but authority additionally
 requires every selected pack's current completion/database seal. Passing an
 empty value creates artifact-only replay, and the five legacy unsealed packs
@@ -193,31 +193,32 @@ preflight, `COVERAGE-20261023-110000-gdeltpre1`. It passes source permission and
 database provenance, fails ingestion completeness
 because the pack is `PARTIAL` with `22` provider errors, has `null` publication
 and availability calendar-overlap ranges, and reports `0%` coverage for every
-split and population. Its readiness is `NO_OVERLAP`. That preflight is not the
-planned final audit. If the target directory does not already exist, publish
-the final immutable GDELT audit with:
+split and population. Its readiness is `NO_OVERLAP`. That preflight remains
+historical. The official RSS and GDELT audits are now sealed; verify the retained
+packs instead of reusing either immutable run ID:
 
 ```bash
-python scripts/audit_news_price_overlap.py \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
-  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
-  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
-  --source-permission-policy configs/news/historical_source_permissions.json \
-  --readiness-config configs/news_coverage/default_readiness.json \
-  --market-timezone Asia/Karachi \
-  --decision-cutoff 15:30:00 \
-  --real-mode \
-  --output-dir artifacts/news_coverage \
-  --run-id COVERAGE-20261023-130000-gdelt0001
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-120000-real0002
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001
 ```
 
-The intended artifact is
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; the distinct
-planned RSS final is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Neither planned
-artifact exists yet. Aggregation remains blocked unless a later immutable audit
-satisfies every permission, completeness, provenance, and overlap prerequisite.
+Both verifiers return `PASS`; both artifacts were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false` and contain
+`11` payload artifacts. The RSS result has `450` mapping rows, manifest SHA-256
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`,
+and inventory SHA-256
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`;
+source permission and legacy database provenance fail, while ingestion
+completeness passes. The GDELT result has `1,968` mapping rows, manifest SHA-256
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`,
+and inventory SHA-256
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`;
+source permission and database provenance pass, while ingestion completeness
+fails with `22` provider errors. Both readiness results are `NO_OVERLAP`, so
+aggregation remains blocked. Any independent reproduction must use a fresh
+`--run-id`; retained IDs are never overwritten.
 
 ## 4c. Run article-level FinBERT sentiment inference
 
@@ -323,7 +324,7 @@ This short snapshot is insufficient for stock-model integration. See
 python -m pytest
 ```
 
-Current validated result: `606 passed, 1 skipped`. The skip is the documented
+Current validated result: `609 passed, 1 skipped`. The skip is the documented
 retained-artifact integration check that a clean checkout cannot run. The
 frontend separately has `57` passing tests plus passing lint and production
 build; `pip check`, `compileall`, and `git diff --check` also pass.

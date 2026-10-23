@@ -44,9 +44,11 @@ evidence contains `1,239` observed sessions from 2021-09-16 through 2026-09-15,
 with exact split counts of `853` train, `182` validation, and `184` test
 sessions. Publication overlap and cutoff-eligible availability overlap are both
 zero, and the readiness status is `NO_OVERLAP`. This preflight predates the
-current coverage completion seal. The planned official RSS artifact is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/` and has not yet been
-published.
+current coverage completion seal. The retained official RSS artifact is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it verifies `PASS`
+with `11` payload artifacts and `450` mapping rows and retains `NO_OVERLAP`.
+Ingestion completeness passes, while source permission and legacy database
+provenance remain failed prerequisites.
 
 The later live metadata-only acquisition
 `NEWS-20261023-060000-gdelt-ogdc2` is a separate sealed `PARTIAL/WARN` pack that
@@ -63,15 +65,18 @@ Its `news-price-coverage-v2` preflight
 `COVERAGE-20261023-110000-gdeltpre1` passes source permission and database
 provenance, fails ingestion completeness, reports `null` publication and availability
 calendar-overlap ranges and `0%` coverage for every split/population, and returns
-`NO_OVERLAP`. The planned final artifact is
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; it is distinct
-from the planned RSS final
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`.
+`NO_OVERLAP`. That preflight remains historical. The retained official GDELT
+artifact is `artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; it
+verifies `PASS` with `11` payload artifacts and `1,968` mapping rows and retains
+`NO_OVERLAP`. Permission and database provenance pass, while ingestion
+completeness fails with `22` provider errors. Both official artifacts were
+generated from clean commit `041c557edf5b15660fd2f02d47ed7f9b8b4152a7`
+with `dirty_tree=false`.
 
-Remaining work is to publish the two planned official audits without
-overwriting the existing preflights, then obtain permitted, complete,
-sufficiently covered evidence whose availability overlaps the immutable
-price/split period. The current policy permits only the exact retained GDELT run
+Remaining work is to obtain permitted, complete, sufficiently covered evidence
+whose availability overlaps the immutable price/split period; the official
+audits are already sealed and must remain immutable. The current policy permits
+only the exact retained GDELT run
 `NEWS-20261023-060000-gdelt-ogdc2` under its permission-relevant controls; it is
 incomplete and cannot be backdated for model features, and a future acquisition
 requires a new review and allowlist update. A historical CSV imported now has

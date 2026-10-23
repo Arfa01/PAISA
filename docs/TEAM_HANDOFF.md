@@ -211,20 +211,31 @@ academic data-engineering results, not financial advice, and even a later
 `READY_FOR_AGGREGATION` result would not prove statistical or predictive value.
 
 The RSS preflight predates the current coverage completion seal and is
-descriptive rather than the official final. Its planned official artifact is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/` and has not yet been
-published.
+descriptive rather than the official final. The retained official RSS artifact
+is `artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. It verifies
+`PASS`, contains `11` payload artifacts and `450` mapping rows, and retains
+`NO_OVERLAP`; source permission and legacy database provenance fail, while
+ingestion completeness passes. Its manifest SHA-256 is
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`
+and its inventory SHA-256 is
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`.
 
 The GDELT run has a distinct `news-price-coverage-v2` preflight,
 `COVERAGE-20261023-110000-gdeltpre1`. Source permission and database provenance
 pass; ingestion completeness fails because the pack is
 `PARTIAL` with `22` provider errors. Publication and availability
 calendar-overlap ranges are `null`, every split/population coverage value is
-`0%`, and readiness is `NO_OVERLAP`. Publish the planned final GDELT audit,
-without overwriting either preflight, at
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; the planned RSS
-final is `artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Neither
-official final has been published.
+`0%`, and readiness is `NO_OVERLAP`. That preflight remains historical. The
+retained official GDELT artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. It verifies
+`PASS`, contains `11` payload artifacts and `1,968` mapping rows, and retains
+`NO_OVERLAP`; source permission and database provenance pass, while ingestion
+completeness fails with `22` provider errors. Its manifest SHA-256 is
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`
+and its inventory SHA-256 is
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
+Both official artifacts were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`.
 
 The article-level sentiment implementation pins the model and tokenizer to
 `ProsusAI/finbert@0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031` and explicitly
@@ -536,40 +547,14 @@ python scripts/run_news_pipeline.py \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 
-# Publish the planned official five-pack audit only if this reserved run ID is
-# still unused. If it exists, verify it; use a fresh run ID for any reproduction.
-python scripts/audit_news_price_overlap.py \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120012-31d811b1 \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120133-43a51981 \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261022-130023-470cb7a7 \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261022-131242-5ddffd2d \
-  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
-  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
-  --source-permission-policy configs/news/historical_source_permissions.json \
-  --readiness-config configs/news_coverage/default_readiness.json \
-  --market-timezone Asia/Karachi \
-  --decision-cutoff 15:30:00 \
-  --real-mode \
-  --allow-legacy-unsealed \
-  --output-dir artifacts/news_coverage \
-  --run-id COVERAGE-20261023-120000-real0002
+# Verify the two retained official audits; never rerun with these immutable IDs.
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-120000-real0002
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001
 
-# Publish the separate final live-GDELT audit only if this immutable run ID is
-# still unused. The PARTIAL input and its provider errors must remain visible.
-python scripts/audit_news_price_overlap.py \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
-  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
-  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
-  --source-permission-policy configs/news/historical_source_permissions.json \
-  --readiness-config configs/news_coverage/default_readiness.json \
-  --market-timezone Asia/Karachi \
-  --decision-cutoff 15:30:00 \
-  --real-mode \
-  --output-dir artifacts/news_coverage \
-  --run-id COVERAGE-20261023-130000-gdelt0001
+# For an independent reproduction, reuse the documented inputs and options but
+# choose a fresh, unique COVERAGE-... value for --run-id.
 
 # Pinned article-level FinBERT inference. Review the license and CLI first,
 # use a copy of legacy retained storage during migration testing, and never
@@ -625,7 +610,7 @@ cd ..
 git diff --check
 ```
 
-Latest exact validation: Python `606 passed, 1 skipped`; frontend `57 passed`,
+Latest exact validation: Python `609 passed, 1 skipped`; frontend `57 passed`,
 with lint and production build passing; `pip check`, `compileall`, and
 `git diff --check` also pass. The single Python skip is the documented
 retained-artifact integration check unavailable in a clean checkout.

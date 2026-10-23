@@ -173,28 +173,35 @@ Use `python scripts/audit_news_price_overlap.py --help` for the authoritative
 option syntax. The decision cutoff is a local market clock time interpreted in
 the named IANA timezone; all persisted comparison timestamps remain UTC.
 
-The retained live GDELT pack has a separate planned final audit identity. If the
-target directory is still absent, run:
+The retained RSS and live-GDELT packs now have separate sealed official audits.
+Verify them instead of rerunning either immutable identity:
 
 ```bash
-python scripts/audit_news_price_overlap.py \
-  --news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
-  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
-  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
-  --source-permission-policy configs/news/historical_source_permissions.json \
-  --output-dir artifacts/news_coverage \
-  --run-id COVERAGE-20261023-130000-gdelt0001 \
-  --decision-cutoff 15:30:00 \
-  --market-timezone Asia/Karachi \
-  --real-mode \
-  --readiness-config configs/news_coverage/default_readiness.json
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-120000-real0002
+python scripts/verify_news_coverage.py \
+  --run-dir artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001
 ```
 
-The intended immutable directory is
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. It must not
-overwrite or be conflated with the planned RSS final at
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`.
+Both verifiers return `PASS`. Both runs were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`, contain
+`11` payload artifacts, and retain `NO_OVERLAP`:
+
+- `COVERAGE-20261023-120000-real0002` contains `450` mapping rows. Source
+  permission and legacy database provenance fail; ingestion completeness
+  passes. Manifest SHA-256 is
+  `57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`;
+  inventory SHA-256 is
+  `1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`.
+- `COVERAGE-20261023-130000-gdelt0001` contains `1,968` mapping rows. Source
+  permission and database provenance pass; ingestion completeness fails with
+  `22` provider errors. Manifest SHA-256 is
+  `9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`;
+  inventory SHA-256 is
+  `51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
+
+For an independent reproduction, use the same documented inputs and options
+with a fresh unique `--run-id`; never reuse either retained official ID.
 
 Real mode is the default. It rejects any news or stock evidence marked fixture,
 mock, test, generated, or synthetic, and it does not infer legitimacy from a
@@ -363,9 +370,10 @@ For the retained October 19--22, 2026 news snapshot and the OGDC price artifact
 ending September 15, 2026, the existing preflight
 `COVERAGE-20261023-100000-preflight003` correctly reports `NO_OVERLAP`. It
 predates the current coverage completion seal and is descriptive rather than
-the official final. The planned official RSS audit
-`COVERAGE-20261023-120000-real0002` must be retained separately if published,
-even if a later permitted historical dataset produces publication overlap.
+the official final. The sealed official RSS audit
+`COVERAGE-20261023-120000-real0002` verifies `PASS` and retains `NO_OVERLAP`; it
+remains separate even if a later permitted historical dataset produces
+publication overlap.
 
 The `news-price-coverage-v2` preflight
 `COVERAGE-20261023-110000-gdeltpre1` for
@@ -376,9 +384,9 @@ provenance pass, but ingestion completeness fails because the selected pack is
 missing and every conservative `available_at` after the price period, the
 publication and availability calendar-overlap ranges are both `null`; all
 all-news, OGDC-linked, and unsupported energy split/population coverage values
-are `0%`. This preflight is descriptive evidence, not the intended final
-`COVERAGE-20261023-130000-gdelt0001` artifact, and it does not unblock
-aggregation.
+are `0%`. This preflight remains descriptive historical evidence. The sealed
+official `COVERAGE-20261023-130000-gdelt0001` artifact verifies `PASS`, retains
+the same `NO_OVERLAP` readiness result, and does not unblock aggregation.
 
 ## Explicitly out of scope
 

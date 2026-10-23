@@ -284,9 +284,15 @@ completion seals. For current packs, the audit verifies every seal against one
 immutable SQLite online-backup image and fingerprints those same bytes. The
 preflight's checksum-bound `article_session_mappings.csv` carries the exhaustive
 occurrence/population and canonical session assignments needed by a later
-aggregation component. The planned official RSS artifact is reserved as
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it has not yet been
-published. See the [coverage
+aggregation component. The retained official RSS artifact is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. It verifies `PASS`,
+contains `11` payload artifacts and `450` mapping rows, and retains
+`NO_OVERLAP`: ingestion completeness passes, while source permission and legacy
+database provenance do not. Its completion marker binds manifest SHA-256
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`
+and inventory SHA-256
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`.
+See the [coverage
 runbook](docs/HISTORICAL_NEWS_COVERAGE.md) and
 [overlap contract](docs/NEWS_PRICE_OVERLAP_CONTRACT.md) for the exact session
 mapping, population, artifact, and readiness rules.
@@ -297,12 +303,20 @@ pass, but ingestion completeness fails because the selected run is `PARTIAL`
 and contains `22` provider errors. Publication and
 availability calendar-overlap ranges are both `null`, every all-news,
 OGDC-linked, and energy population reports `0%` train/validation/test coverage,
-and readiness is `NO_OVERLAP`. The preflight is not the planned final audit:
-the intended final artifact is
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. The separate
-planned RSS final is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Neither preflight
-nor either planned final authorizes daily sentiment aggregation.
+and readiness is `NO_OVERLAP`. The preflight remains historical; the retained
+official GDELT artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. It verifies
+`PASS`, contains `11` payload artifacts and `1,968` mapping rows, and retains
+`NO_OVERLAP`: source permission and database provenance pass, while ingestion
+completeness fails with `22` provider errors. Its completion marker binds
+manifest SHA-256
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`
+and inventory SHA-256
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
+Both official packs were generated from clean code commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`.
+Neither the historical preflights nor the retained official results authorize
+daily sentiment aggregation.
 
 ## Article-level FinBERT sentiment foundation
 

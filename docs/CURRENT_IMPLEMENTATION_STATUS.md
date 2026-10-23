@@ -24,7 +24,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
-| Verification | The latest full validation reports `606 passed, 1 skipped` in Python and `57 passed` in the frontend; frontend lint and production build, `pip check`, bytecode compilation, and `git diff --check` also pass. The skip is the documented retained-artifact integration check that a clean Git clone cannot run; the retained sentiment run below supplies separate real-model execution evidence. |
+| Verification | The latest full validation reports `609 passed, 1 skipped` in Python and `57 passed` in the frontend; frontend lint and production build, `pip check`, bytecode compilation, and `git diff --check` also pass. The skip is the documented retained-artifact integration check that a clean Git clone cannot run; the retained sentiment run below supplies separate real-model execution evidence. |
 
 ## Retained real-run evidence
 
@@ -129,10 +129,13 @@ current news contract and is reported as unsupported, not inferred from
 general news. Generated evidence is under
 `artifacts/news_coverage/COVERAGE-20261023-100000-preflight003/` and remains
 outside Git. That preflight predates the current coverage completion seal and is
-descriptive rather than the official final. The planned official RSS artifact
-is reserved as
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/` and has not yet been
-published.
+descriptive rather than the official final. The retained official RSS artifact
+is `artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Its verifier
+returns `PASS`; it contains `11` payload artifacts and `450` mapping rows, and
+retains `NO_OVERLAP`. Its manifest SHA-256 is
+`57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`
+and its inventory SHA-256 is
+`1316d7fa9164bb8d091664cc102f8a5b4ad89d4760c7caca7fe62d13142d29a8`.
 
 ### Live GDELT acquisition and separate preflight
 
@@ -159,10 +162,19 @@ provenance but fails ingestion completeness because that selected run is
 `PARTIAL` and has `22` provider errors. Publication and availability
 calendar-overlap ranges are `null`; all all-news, exact-OGDC, and unsupported
 energy split/population coverage values are `0%`; readiness is `NO_OVERLAP`.
-The intended final audit has not replaced the preflight and is reserved as
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. The planned RSS
-final is `artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; neither
-official final has been published. Neither preflight permits daily aggregation.
+The preflight remains historical. The retained official GDELT artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; its verifier
+returns `PASS`, it contains `11` payload artifacts and `1,968` mapping rows, and
+it retains `NO_OVERLAP`. Its manifest SHA-256 is
+`9bb6385196d79befde21d422eb28a78d8aa5222b0863ea8d44b330fad3e0968a`
+and its inventory SHA-256 is
+`51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
+Both official artifacts were generated from clean commit
+`041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`. The RSS
+result records source-permission and legacy database-provenance failure but
+passing ingestion completeness; the GDELT result records passing permission and
+database provenance but failing completeness with `22` provider errors. Neither
+official result permits daily aggregation.
 
 The adapter never fetches linked publisher pages or stores publisher bodies.
 GDELT metadata use remains subject to the reviewed source-permission policy,

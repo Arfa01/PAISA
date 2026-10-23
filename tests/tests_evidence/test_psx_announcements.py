@@ -14,6 +14,7 @@ from paisa.evidence.psx_announcements import (
     PsxAnnouncementImportError,
     PsxAnnouncementManualImporter,
     categorize_announcement,
+    replay_psx_announcement_capture,
 )
 
 
@@ -165,6 +166,32 @@ def test_manual_import_captures_exact_input_and_preserves_time_semantics(tmp_pat
         date_only.normalization_warnings
     )
     assert date_only.raw_evidence_reference == "capture_0001_psx_announcements.csv#row=3"
+    assert timed.source_metadata["input_sha256"] == result.captures[0].sha256
+    assert date_only.source_metadata["input_sha256"] == result.captures[0].sha256
+    assert timed.source_metadata["input_row_number"] == 2
+    assert date_only.source_metadata["input_row_number"] == 3
+    assert len(timed.source_metadata["input_row_sha256"]) == 64
+    assert (
+        timed.source_metadata["input_row_sha256"]
+        != date_only.source_metadata["input_row_sha256"]
+    )
+
+    source = result.configured_sources[0]
+    replayed = replay_psx_announcement_capture(
+        result.captures[0].content,
+        imported_at=result.captures[0].fetched_at,
+        permission_policy_id=result.permission_policy_id,
+        permission_decision_id=source["permission_decision_id"],
+        authorization_attestation_sha256=source[
+            "manual_permission_attestation_sha256"
+        ],
+        authorization_reference_sha256=source[
+            "manual_permission_reference_sha256"
+        ],
+        max_bytes=result.effective_config["max_bytes"],
+        max_records=result.effective_config["max_records"],
+    )
+    assert replayed == result.records
 
 
 def test_minute_timestamp_preserves_declared_precision_without_warning(tmp_path: Path):

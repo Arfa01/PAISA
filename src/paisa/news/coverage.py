@@ -548,8 +548,8 @@ class CoverageConfig:
             "decision_cutoff": self.decision_cutoff.isoformat(timespec="seconds"),
             "readiness_thresholds": self.thresholds.to_dict(),
             "threshold_interpretation": (
-                "Engineering/data-coverage gates only; not proof of statistical "
-                "sufficiency or predictive value."
+                "Caller-defined gate satisfaction only; not proof of statistical "
+                "sufficiency, predictive value, or financial merit."
             ),
         }
 

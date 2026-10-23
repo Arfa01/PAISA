@@ -350,13 +350,10 @@ def _rename_noreplace(
         source_status = source.lstat()
         if _directory_identity(source_status) != expected_source_identity:
             raise RuntimeError("sentiment staging root changed before publication")
+        # os.rename is the commit point.  Every fallible integrity check above
+        # must finish before it so a successful rename cannot be followed by a
+        # validation error that leaves a misleading committed directory.
         os.rename(source, destination)
-        published = destination.lstat()
-        if (
-            not stat.S_ISDIR(published.st_mode)
-            or _directory_identity(published) != expected_source_identity
-        ):
-            raise RuntimeError("published sentiment root does not match sealed staging")
         return
 
     parent_flags = (
@@ -424,18 +421,18 @@ def _rename_noreplace(
                     error_number, os.strerror(error_number), destination
                 )
             raise OSError(error_number, os.strerror(error_number), destination)
-
-        published = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(published.st_mode)
-            or _directory_identity(published) != expected_source_identity
-            or _directory_identity(os.fstat(source_fd)) != expected_source_identity
-        ):
-            raise RuntimeError("published sentiment root does not match sealed staging")
     finally:
         if source_fd is not None:
-            os.close(source_fd)
-        os.close(parent_fd)
+            try:
+                os.close(source_fd)
+            except OSError:
+                # Descriptor cleanup must not turn a successful atomic rename
+                # into an apparent publication failure.
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
 
 
 def publish_staged_run(

@@ -1,6 +1,7 @@
 {
   "archive_index_url": "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt",
   "connect_timeout_seconds": 15.0,
+  "dns_timeout_seconds": 5.0,
   "max_compressed_bytes": 16777216,
   "max_compressed_bytes_per_file": 8388608,
   "max_decompressed_bytes": 67108864,
@@ -35,10 +36,10 @@
   ],
   "permission_policy_id": "contemporaneous-evidence-permissions-v1",
   "provider": "gdelt-gkg-2.1",
-  "publication_after_batch_tolerance_seconds": 86400.0,
   "read_timeout_seconds": 90.0,
   "requested_end": "2026-09-15T23:59:59Z",
   "requested_start": "2025-12-16T00:00:00Z",
   "schema_version": "1.0",
+  "total_request_timeout_seconds": 120.0,
   "user_agent": "PAISA-FYP/0.1 academic GDELT GKG metadata research; contact repository owner"
 }

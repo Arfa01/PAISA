@@ -12,7 +12,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import math
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -26,8 +26,8 @@ from paisa.news.coverage import (
 )
 
 
-EVIDENCE_COVERAGE_SCHEMA_VERSION = "1.0"
-EVIDENCE_COVERAGE_ALGORITHM_VERSION = "contemporaneous-evidence-coverage-v1"
+EVIDENCE_COVERAGE_SCHEMA_VERSION = "1.1"
+EVIDENCE_COVERAGE_ALGORITHM_VERSION = "contemporaneous-evidence-coverage-v2"
 EVIDENCE_COVERAGE_PROFILES = (
     "gdelt_gkg_ogdc",
     "psx_ogdc_announcements",
@@ -210,6 +210,12 @@ class EvidenceCoverageComputation:
     missing_intervals: tuple[EvidenceMissingInterval, ...]
     readiness: Mapping[str, EvidenceProfileReadiness]
     summary: Mapping[str, Any]
+    source_records: tuple[EvidenceRecord, ...]
+    stock_symbol: str
+    trading_dates: tuple[date, ...]
+    split_dates: Mapping[str, tuple[date, ...]]
+    market_timezone: str
+    decision_cutoff: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -361,10 +367,18 @@ def assign_evidence_to_session(
             "missing_available_at",
             "UNMAPPED_MISSING_TIME",
         )
-    assignment = assign_to_session(record.available_at, stock, config)
+    # A minute-precision timestamp denotes the whole minute, not its first
+    # second.  Use the interval's inclusive upper bound so a value such as
+    # 15:30 cannot be treated as known at a 15:30:00 decision cutoff.  The
+    # asserted ``available_at`` remains unchanged; no missing seconds are
+    # invented in the retained evidence.
+    eligibility_instant = record.available_at
+    if record.time_precision == "minute":
+        eligibility_instant += timedelta(minutes=1) - timedelta(microseconds=1)
+    assignment = assign_to_session(eligibility_instant, stock, config)
     if assignment.session_date is not None:
         cutoff = _session_cutoff(assignment.session_date, config)
-        instant = record.available_at.astimezone(timezone.utc)
+        instant = eligibility_instant.astimezone(timezone.utc)
         if instant > cutoff:
             raise EvidenceCoverageError(
                 f"Evidence {record.evidence_id} was assigned before availability"
@@ -807,8 +821,8 @@ def compute_evidence_coverage(
         },
         "readiness_criteria": criteria.to_dict(),
         "readiness_interpretation": (
-            "Engineering/data-coverage gates only; not proof of statistical "
-            "sufficiency or predictive value."
+            "Caller-defined gate satisfaction only; not proof of statistical "
+            "sufficiency, predictive value, or financial merit."
         ),
     }
     return EvidenceCoverageComputation(
@@ -818,6 +832,14 @@ def compute_evidence_coverage(
         missing_intervals=tuple(missing_intervals),
         readiness=readiness,
         summary=summary,
+        source_records=tuple(ordered_records),
+        stock_symbol=stock.symbol,
+        trading_dates=tuple(stock.trading_dates),
+        split_dates={
+            split: tuple(stock.split_dates[split]) for split in MODEL_SPLITS
+        },
+        market_timezone=config.market_timezone,
+        decision_cutoff=config.decision_cutoff.isoformat(timespec="seconds"),
     )
 
 

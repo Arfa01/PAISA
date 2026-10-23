@@ -506,6 +506,7 @@ class PsxAnnouncementManualImporter:
 
         self.csv_path = Path(csv_path)
         self.permission_policy = permission_policy
+        self.permission_policy_id = permission_policy.policy_id
         self.permission_status = str(decision["status"])
         self.permission_decision_id = decision_id
         self.authorization_attestation_sha256 = attestation_sha256
@@ -549,7 +550,7 @@ class PsxAnnouncementManualImporter:
             "evidence_type": "exchange_announcement",
             "provider_mode": PROVIDER_MODE,
             "automated_access": False,
-            "permission_policy_id": self.permission_policy.policy_id,
+            "permission_policy_id": self.permission_policy_id,
             "permission_decision_id": self.permission_decision_id,
             "permission_status": self.permission_status,
             "manual_permission_attestation_sha256": (
@@ -567,7 +568,7 @@ class PsxAnnouncementManualImporter:
             provider_mode=PROVIDER_MODE,
             data_class="imported",
             fetched_at=imported_at,
-            permission_policy_id=self.permission_policy.policy_id,
+            permission_policy_id=self.permission_policy_id,
             configured_sources=(configured_source,),
             partition_plan=(
                 {
@@ -614,10 +615,10 @@ class PsxAnnouncementManualImporter:
                 "max_records": self.max_records,
                 "pdf_retrieval": "disabled",
                 "source_url_retrieval": "disabled",
-                "authorization_attestation_sha256": (
+                "manual_permission_attestation_sha256": (
                     self.authorization_attestation_sha256
                 ),
-                "authorization_reference_sha256": (
+                "manual_permission_reference_sha256": (
                     self.authorization_reference_sha256
                 ),
             },
@@ -674,6 +675,11 @@ class PsxAnnouncementManualImporter:
                     raise PsxAnnouncementImportError(
                         f"PSX announcement CSV has extra values at row {source_index}"
                     )
+                raw_row = {
+                    columns[index]: source_row.get(original)
+                    for index, original in enumerate(reader.fieldnames)
+                }
+                input_row_sha256 = _canonical_json_sha256(raw_row)
                 row = {
                     columns[index]: _optional_text(source_row.get(original))
                     for index, original in enumerate(reader.fieldnames)
@@ -785,9 +791,12 @@ class PsxAnnouncementManualImporter:
                     "event_category": category,
                     "title": title,
                     "exchange_posted": posted_evidence,
+                    "exchange_posted_at_raw": row["exchange_posted_at"],
+                    "time_precision": time_precision,
                     "official_source_url": source_url,
                     "pdf_reference": pdf_reference,
                     "pdf_sha256": pdf_sha256,
+                    "input_row_sha256": input_row_sha256,
                 }
                 evidence_digest = hashlib.sha256(
                     f"{PROVIDER_ID}\0{announcement_id}".encode("utf-8")
@@ -814,7 +823,7 @@ class PsxAnnouncementManualImporter:
                         time_precision=time_precision,  # type: ignore[arg-type]
                         contemporaneous_source_id=announcement_id,
                         contemporaneous_batch_at=None,
-                        permission_policy_id=self.permission_policy.policy_id,
+                        permission_policy_id=self.permission_policy_id,
                         raw_evidence_reference=(
                             f"{_RAW_REFERENCE}#row={source_index}"
                         ),
@@ -847,6 +856,7 @@ class PsxAnnouncementManualImporter:
                             ),
                             "input_sha256": hashlib.sha256(payload).hexdigest(),
                             "input_row_number": source_index,
+                            "input_row_sha256": input_row_sha256,
                             "pdf_handling": (
                                 "reference_and_supplied_checksum_only_no_retrieval"
                             ),
@@ -867,6 +877,69 @@ class PsxAnnouncementManualImporter:
         return records
 
 
+def replay_psx_announcement_capture(
+    content: bytes,
+    *,
+    imported_at: datetime,
+    permission_policy_id: str,
+    permission_decision_id: str,
+    authorization_attestation_sha256: str,
+    authorization_reference_sha256: str,
+    max_bytes: int = _DEFAULT_MAX_BYTES,
+    max_records: int = _DEFAULT_MAX_RECORDS,
+) -> tuple[EvidenceRecord, ...]:
+    """Reparse one sealed PSX CSV using the importer normalization contract.
+
+    This helper performs no filesystem or network access.  Its explicit policy
+    arguments are expected to come from the independently sealed provider
+    configuration (and, during publication, the reloaded repository policy).
+    Equality with its returned records therefore binds every normalized field
+    to the captured CSV bytes, cited row, timestamp grammar, and permission
+    provenance.
+    """
+
+    if not isinstance(content, bytes):
+        raise TypeError("PSX replay content must be bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    if len(content) > max_bytes:
+        raise PsxAnnouncementImportError("PSX announcement CSV exceeds max_bytes")
+    if (
+        isinstance(max_records, bool)
+        or not isinstance(max_records, int)
+        or max_records <= 0
+    ):
+        raise ValueError("max_records must be a positive integer")
+    policy_id = _required_text(
+        permission_policy_id, field_name="permission_policy_id"
+    )
+    decision_id = _required_text(
+        permission_decision_id, field_name="permission_decision_id"
+    )
+    for field_name, digest in (
+        ("authorization_attestation_sha256", authorization_attestation_sha256),
+        ("authorization_reference_sha256", authorization_reference_sha256),
+    ):
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise PsxAnnouncementImportError(f"{field_name} is invalid")
+
+    # Reuse the sole normalization implementation without re-running operator
+    # authorization or touching the original path.  Only the attributes read
+    # by _parse_records are populated.
+    parser = object.__new__(PsxAnnouncementManualImporter)
+    parser.max_records = max_records
+    parser.permission_policy_id = policy_id
+    parser.permission_decision_id = decision_id
+    parser.authorization_attestation_sha256 = authorization_attestation_sha256
+    parser.authorization_reference_sha256 = authorization_reference_sha256
+    return tuple(
+        parser._parse_records(
+            content,
+            imported_at=_aware_utc(imported_at, field_name="imported_at"),
+        )
+    )
+
+
 __all__ = [
     "CAPTURE_FILENAME",
     "COMPANY_NAME",
@@ -875,4 +948,5 @@ __all__ = [
     "PsxAnnouncementImportError",
     "PsxAnnouncementManualImporter",
     "categorize_announcement",
+    "replay_psx_announcement_capture",
 ]

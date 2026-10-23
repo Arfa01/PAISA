@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
 
+import paisa.evidence.coverage_artifacts as coverage_artifacts
 from paisa.evidence.artifacts import sha256_file
 from paisa.evidence.coverage import compute_evidence_coverage
 from paisa.evidence.coverage_artifacts import (
@@ -32,9 +35,11 @@ PAYLOAD_FILES = (
     "input_evidence_reference.json",
     "missing_intervals.csv",
     "monthly_coverage.csv",
+    "normalized_evidence.jsonl",
     "quality_report.json",
     "split_coverage.csv",
     "stock_artifact_reference.json",
+    "stock_calendar.json",
 )
 ALL_FILES = set(PAYLOAD_FILES) | {"run_manifest.json", "completion.json"}
 
@@ -133,6 +138,10 @@ def _input_references(
         gdelt.update(
             {
                 "path": "/Users/example/private/evidence",
+                "file_uri": "file:/Users/example/private/evidence.jsonl",
+                "network_file_uri": "file://server/private/evidence.jsonl",
+                "posix_network_path": "//server/share/evidence.jsonl",
+                "unc_path": r"\\server\share\evidence.jsonl",
                 "source_url": (
                     "https://example.com/archive?token=secret-value&part=1"
                 ),
@@ -169,15 +178,17 @@ def _input_references(
 
 
 def _gkg(identifier: str, available_at: datetime) -> EvidenceRecord:
+    record_id = f"{available_at:%Y%m%d%H%M%S}-1"
+    archive_filename = f"{available_at:%Y%m%d%H%M%S}.gkg.csv.zip"
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="gdelt_metadata",
-        provider_id="=archive-provider",
+        provider_id="gdelt-gkg-2.1",
         provider_mode="raw_archive",
         data_class="real",
-        source_name="example.com",
+        source_name="=example.com",
         source_url="https://example.com/story",
-        source_record_id=f"{available_at:%Y%m%d%H%M%S}-1",
+        source_record_id=record_id,
         ticker="OGDC",
         company_name="Oil and Gas Development Company Limited",
         title=None,
@@ -188,14 +199,28 @@ def _gkg(identifier: str, available_at: datetime) -> EvidenceRecord:
         imported_at=_at("2026-10-23"),
         historical_availability_basis="gdelt_gkg_batch_timestamp",
         time_precision="second",
-        contemporaneous_source_id=f"batch-{available_at:%Y%m%d%H%M%S}",
+        contemporaneous_source_id=record_id,
         contemporaneous_batch_at=available_at,
-        permission_policy_id="permission-policy",
+        permission_policy_id="test-evidence-policy",
         raw_evidence_reference=f"capture.zip#{identifier}",
         content_sha256="a" * 64,
         entity_match_evidence=(
-            {"field": "V2ORGANIZATIONS", "matched_alias": "OGDC"},
+            {
+                "field": "V2ENHANCEDORGANIZATIONS",
+                "alias": "OGDC",
+                "matched_value": "OGDC",
+                "match_method": "exact",
+            },
         ),
+        source_metadata={
+            "GKGRECORDID": record_id,
+            "V2.1DATE": f"{available_at:%Y%m%d%H%M%S}",
+            "V2SOURCECOLLECTIONIDENTIFIER": "1",
+            "V2SOURCECOMMONNAME": "=example.com",
+            "V2DOCUMENTIDENTIFIER": "https://example.com/story",
+            "V2ENHANCEDORGANIZATIONS": "OGDC,1",
+            "archive_filename": archive_filename,
+        },
     )
 
 
@@ -239,6 +264,14 @@ def _rewrite_json(path: Path, value) -> None:
 
 
 def _reseal_payload(pack: Path) -> None:
+    normalized_sha = sha256_file(pack / "normalized_evidence.jsonl")
+    calendar_sha = sha256_file(pack / "stock_calendar.json")
+    summary_path = pack / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["normalized_evidence_sha256"] = normalized_sha
+    summary["stock_calendar_sha256"] = calendar_sha
+    _rewrite_json(summary_path, summary)
+
     inventory = regular_file_inventory(pack, files=PAYLOAD_FILES)
     inventory_digest = hashlib.sha256(
         json.dumps(
@@ -253,12 +286,16 @@ def _reseal_payload(pack: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["payload_artifact_inventory"] = inventory
     manifest["payload_artifact_inventory_sha256"] = inventory_digest
+    manifest["normalized_evidence_sha256"] = normalized_sha
+    manifest["stock_calendar_sha256"] = calendar_sha
     _rewrite_json(manifest_path, manifest)
 
     completion_path = pack / "completion.json"
     completion = json.loads(completion_path.read_text(encoding="utf-8"))
     completion["manifest_sha256"] = sha256_file(manifest_path)
     completion["manifest_size_bytes"] = manifest_path.stat().st_size
+    completion["summary_sha256"] = sha256_file(summary_path)
+    completion["summary_size_bytes"] = summary_path.stat().st_size
     completion["payload_artifact_inventory_sha256"] = inventory_digest
     _rewrite_json(completion_path, completion)
 
@@ -286,13 +323,21 @@ def test_publish_verify_private_flat_pack_and_redact_references(
         (pack / "input_evidence_reference.json").read_text(encoding="utf-8")
     )
     assert references["inputs"][0]["path"] == "[REDACTED_ABSOLUTE_PATH]"
+    assert references["inputs"][0]["file_uri"] == "[REDACTED_FILE_URI]"
+    assert references["inputs"][0]["network_file_uri"] == (
+        "[REDACTED_FILE_URI]"
+    )
+    assert references["inputs"][0]["posix_network_path"] == (
+        "[REDACTED_ABSOLUTE_PATH]"
+    )
+    assert references["inputs"][0]["unc_path"] == "[REDACTED_ABSOLUTE_PATH]"
     assert references["inputs"][0]["api_key"] == "[REDACTED]"
 
     with (pack / "evidence_session_mappings.csv").open(
         "r", encoding="utf-8", newline=""
     ) as handle:
         rows = list(csv.DictReader(handle))
-    assert rows[0]["provider_id"] == "'=archive-provider"
+    assert rows[0]["provider_id"] == "gdelt-gkg-2.1"
 
 
 def test_coverage_git_provenance_reports_clean_and_dirty_states(
@@ -366,7 +411,7 @@ def test_resealed_split_contradiction_is_rejected_semantically(
 
     with pytest.raises(
         EvidenceCoverageVerificationError,
-        match="contradictory|disagree",
+        match="contradictory|disagree|recomputation",
     ):
         verify_evidence_coverage_pack(pack)
 
@@ -388,6 +433,24 @@ def test_resealed_source_reference_without_checksum_is_rejected(
         verify_evidence_coverage_pack(pack)
 
 
+def test_resealed_embedded_private_path_is_rejected(tmp_path: Path) -> None:
+    pack = _publish(
+        tmp_path,
+        run_id="ECOV-20261023-120031-pathsafe",
+    )
+    summary_path = pack / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["extra_note"] = "stored at //server/share/private.csv"
+    _rewrite_json(summary_path, summary)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="absolute host path",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
 def test_symlink_artifact_and_non_private_mode_are_rejected(tmp_path: Path) -> None:
     pack = _publish(tmp_path)
     target = pack / "quality_report.json"
@@ -405,8 +468,39 @@ def test_symlink_artifact_and_non_private_mode_are_rejected(tmp_path: Path) -> N
         run_id="ECOV-20261023-120003-abcd1234",
     )
     os.chmod(second / "quality_report.json", 0o644)
-    with pytest.raises(EvidenceCoverageVerificationError, match="not private"):
+    with pytest.raises(
+        EvidenceCoverageVerificationError, match="not private|mode must be"
+    ):
         verify_evidence_coverage_pack(second)
+
+
+def test_copied_coverage_pack_with_public_modes_is_rejected(tmp_path: Path) -> None:
+    pack = _publish(tmp_path)
+    copied = tmp_path / "copied" / RUN_ID
+    copied.parent.mkdir()
+    shutil.copytree(pack, copied)
+
+    os.chmod(copied, 0o755)
+    with pytest.raises(EvidenceCoverageVerificationError, match="0700"):
+        verify_evidence_coverage_pack(copied)
+
+    os.chmod(copied, 0o700)
+    os.chmod(copied / "quality_report.json", 0o644)
+    with pytest.raises(EvidenceCoverageVerificationError, match="0600"):
+        verify_evidence_coverage_pack(copied)
+
+
+def test_coverage_verifier_rejects_symlinked_parent_component(
+    tmp_path: Path,
+) -> None:
+    pack = _publish(tmp_path)
+    alias = tmp_path / "coverage-alias"
+    alias.symlink_to(pack.parent, target_is_directory=True)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError, match="symlink components"
+    ):
+        verify_evidence_coverage_pack(alias / pack.name)
 
 
 def test_zero_match_evidence_audit_still_produces_a_valid_pack(
@@ -461,3 +555,179 @@ def test_publication_rejects_untyped_or_checksum_free_source_references(
             repository_root=tmp_path,
             run_id="ECOV-20261023-120006-badstock",
         )
+
+
+def test_publication_verifies_staging_before_commit_and_run_id_is_reusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_verify = coverage_artifacts._verify_root
+
+    def fail_staging(*args, **kwargs):
+        del args, kwargs
+        raise EvidenceCoverageVerificationError("injected staging failure")
+
+    monkeypatch.setattr(coverage_artifacts, "_verify_root", fail_staging)
+    with pytest.raises(
+        EvidenceCoverageVerificationError, match="injected staging failure"
+    ):
+        _publish(tmp_path)
+
+    output = tmp_path / "coverage"
+    assert not (output / RUN_ID).exists()
+    assert not list(output.glob(f".{RUN_ID}.staging-*"))
+
+    monkeypatch.setattr(coverage_artifacts, "_verify_root", original_verify)
+    assert _publish(tmp_path).name == RUN_ID
+
+
+def test_duplicate_evidence_id_failure_is_unpublished_and_run_id_is_reusable(
+    tmp_path: Path,
+) -> None:
+    run_id = "ECOV-20261023-120007-duplicate"
+    computation = _computation()
+    duplicated = replace(
+        computation,
+        source_records=(
+            *computation.source_records,
+            computation.source_records[0],
+        ),
+        summary={**computation.summary, "record_count_input": 4},
+    )
+    output = tmp_path / "coverage"
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="identities are not canonical and unique",
+    ):
+        publish_evidence_coverage_run(
+            duplicated,
+            output_root=output,
+            input_references=_input_references(gdelt_record_count=4),
+            stock_reference=_stock().reference,
+            repository_root=tmp_path,
+            run_id=run_id,
+            created_at=datetime(2026, 10, 23, 12, 7, tzinfo=UTC),
+        )
+
+    assert not os.path.lexists(output / run_id)
+    assert not tuple(output.glob(f".{run_id}.staging-*"))
+
+    corrected = _publish(tmp_path, run_id=run_id)
+    assert corrected == output / run_id
+    assert verify_evidence_coverage_pack(corrected).mapping_count == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "run_id"),
+    [
+        (
+            "profiles",
+            '["gdelt_gkg_ogdc","combined_ogdc_evidence",'
+            '"psx_ogdc_announcements"]',
+            "ECOV-20261023-120010-profile1",
+        ),
+        ("assigned_session", "2024-01-02", "ECOV-20261023-120011-session1"),
+        (
+            "decision_cutoff_utc",
+            "2024-01-01T09:00:01Z",
+            "ECOV-20261023-120012-cutoff01",
+        ),
+        (
+            "available_at",
+            "2024-01-01T10:31:00Z",
+            "ECOV-20261023-120013-late0001",
+        ),
+    ],
+)
+def test_resealed_mapping_labels_cannot_override_record_calendar_recomputation(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+    run_id: str,
+) -> None:
+    pack = _publish(tmp_path, run_id=run_id)
+    mapping_path = pack / "evidence_session_mappings.csv"
+    with mapping_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = tuple(reader.fieldnames or ())
+        rows = list(reader)
+    rows[0][field] = replacement
+    with mapping_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.chmod(mapping_path, 0o600)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="recomputation|later than its claimed cutoff",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "run_id"),
+    [
+        (
+            "provider_id",
+            "totally-fake-provider",
+            "ECOV-20261023-120020-provider",
+        ),
+        (
+            "evidence_type",
+            "exchange_announcement",
+            "ECOV-20261023-120021-type0001",
+        ),
+        ("data_class", "imported", "ECOV-20261023-120022-class001"),
+        ("time_precision", "minute", "ECOV-20261023-120023-precis01"),
+    ],
+)
+def test_resealed_unknown_or_mismatched_provider_contract_is_rejected(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+    run_id: str,
+) -> None:
+    pack = _publish(tmp_path, run_id=run_id)
+    evidence_path = pack / "normalized_evidence.jsonl"
+    rows = [json.loads(line) for line in evidence_path.read_text("utf-8").splitlines()]
+    rows[0][field] = replacement
+    evidence_path.write_text(
+        "".join(
+            json.dumps(
+                row,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(evidence_path, 0o600)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError, match="evidence contract failed"
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_resealed_stock_calendar_cannot_redirect_session_mapping(
+    tmp_path: Path,
+) -> None:
+    pack = _publish(tmp_path, run_id="ECOV-20261023-120030-calendar")
+    calendar_path = pack / "stock_calendar.json"
+    calendar = json.loads(calendar_path.read_text(encoding="utf-8"))
+    calendar["decision_cutoff"] = "15:29:59"
+    _rewrite_json(calendar_path, calendar)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="recomputation|calendar",
+    ):
+        verify_evidence_coverage_pack(pack)

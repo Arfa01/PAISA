@@ -6,7 +6,10 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import socket
 import stat
+import threading
+import time
 from typing import Any
 from urllib.parse import urlsplit
 import zipfile
@@ -19,10 +22,12 @@ from paisa.evidence.gdelt_gkg import (
     GKG_V21_COLUMNS,
     GdeltGkgArchiveProvider,
     GdeltGkgPartition,
+    GdeltGkgReplayCapture,
     load_gdelt_gkg_config,
     match_ogdc_aliases,
     parse_gkg_record_id_timestamp,
     parse_v21_date,
+    replay_gdelt_gkg_captures,
 )
 
 
@@ -33,7 +38,23 @@ FETCHED_AT = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 REQUESTED_START = datetime(2025, 12, 16, tzinfo=UTC)
 REQUESTED_END = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
 POLICY_ID = "test-gdelt-gkg-policy"
+PUBLIC_TEST_ADDRESS = "93.184.216.34"
 _COLUMN = {name: index for index, name in enumerate(GKG_V21_COLUMNS)}
+
+
+def _resolver(address: str = PUBLIC_TEST_ADDRESS):
+    def resolve(*_args: Any) -> list[tuple[Any, ...]]:
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, 443),
+            )
+        ]
+
+    return resolve
 
 
 def _policy(
@@ -86,10 +107,12 @@ class _Response:
         status_code: int = 200,
         headers: dict[str, str] | None = None,
         chunks: Sequence[bytes] | None = None,
+        peer_address: str = PUBLIC_TEST_ADDRESS,
     ) -> None:
         self.status_code = status_code
         self.headers = headers or {"Content-Length": str(len(content))}
         self.raw = _RawBody(chunks or (content,))
+        self.peer_address = (peer_address, 443)
         self.closed = False
 
     def close(self) -> None:
@@ -151,15 +174,17 @@ def _zip_payload(
     member_name: str | None = None,
     extra_members: Sequence[tuple[str, bytes]] = (),
     symlink: bool = False,
+    special_mode: int | None = None,
 ) -> bytes:
     output = io.BytesIO()
     name = member_name or f"{batch}.gkg.csv"
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         content = b"\n".join(rows) + (b"\n" if rows else b"")
-        if symlink:
+        if symlink or special_mode is not None:
             info = zipfile.ZipInfo(name)
             info.create_system = 3
-            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            member_mode = special_mode if special_mode is not None else stat.S_IFLNK
+            info.external_attr = (member_mode | 0o777) << 16
             archive.writestr(info, content)
         else:
             archive.writestr(name, content)
@@ -209,6 +234,7 @@ def _provider(
         "permission_policy": _policy(),
         "session": session,
         "clock": lambda: FETCHED_AT,
+        "resolver": _resolver(),
     }
     options.update(overrides)
     return GdeltGkgArchiveProvider((partition,), **options)
@@ -317,19 +343,19 @@ def test_provider_rechecks_permission_immediately_before_network() -> None:
 
 def test_ogdc_alias_matching_is_exact_and_prevents_substrings() -> None:
     matches = match_ogdc_aliases(
-        v2_organizations=(
+        v2_enhanced_organizations=(
             "Other Company,1;Oil & Gas Development Company Limited,42;OGDCL,77"
         ),
         document_identifier="https://example.test/company/ogdc/results",
         source_common_name="Unrelated Publisher",
     )
     assert {item["field"] for item in matches} == {
-        "V2ORGANIZATIONS",
+        "V2ENHANCEDORGANIZATIONS",
         "V2DOCUMENTIDENTIFIER",
     }
     assert any(item["matched_value"] == "OGDCL" for item in matches)
     assert not match_ogdc_aliases(
-        v2_organizations="DOGDCX,1;MOGDCLNEWS,2",
+        v2_enhanced_organizations="DOGDCX,1;MOGDCLNEWS,2",
         document_identifier="https://example.test/company/dogdcx",
         source_common_name="MOGDCLNEWS",
     )
@@ -370,6 +396,8 @@ def test_valid_fetch_returns_metadata_only_evidence_and_hardened_request() -> No
         "records_scanned": 1,
         "records_unmatched": 0,
         "records_rejected": 0,
+        "duplicate_record_count": 0,
+        "rejected_reason_counts": {},
         "records_retained": 1,
     }
     assert len(result.records) == len(result.captures) == 1
@@ -396,6 +424,14 @@ def test_valid_fetch_returns_metadata_only_evidence_and_hardened_request() -> No
     assert record.source_metadata["archive_sha256"] == hashlib.sha256(
         payload
     ).hexdigest()
+    assert record.source_metadata["V2ENHANCEDORGANIZATIONS"] == (
+        "Oil & Gas Development Company Limited,22"
+    )
+    assert "V2ORGANIZATIONS" not in record.source_metadata
+    assert {item["field"] for item in record.entity_match_evidence} == {
+        "V2ENHANCEDORGANIZATIONS",
+        "V2DOCUMENTIDENTIFIER",
+    }
     assert "publisher_body_not_retrieved" in record.normalization_warnings
     assert capture.filename == f"{BATCH}.gkg.csv.zip"
     assert capture.content == payload
@@ -412,10 +448,123 @@ def test_valid_fetch_returns_metadata_only_evidence_and_hardened_request() -> No
     assert urlsplit(called_url).hostname == "data.gdeltproject.org"
     assert kwargs["allow_redirects"] is False
     assert kwargs["stream"] is True
+    assert kwargs["verify"] is True
     assert kwargs["proxies"] == {}
     assert "Authorization" not in kwargs["headers"]
     assert kwargs["headers"]["Accept-Encoding"] == "identity"
     assert "publisher.example" not in called_url
+
+
+def test_connected_peer_must_match_bounded_public_dns_resolution() -> None:
+    payload = _zip_payload((_row(),))
+    response = _Response(payload, peer_address="1.1.1.1")
+    result = _provider(
+        _partition(payload),
+        _Session((response,)),
+        resolver=_resolver(PUBLIC_TEST_ADDRESS),
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.records == ()
+    assert result.captures == ()
+    assert "dns_peer_mismatch" in _error_types(result)
+    assert response.closed
+
+
+def test_slow_trickling_response_is_stopped_by_total_deadline() -> None:
+    payload = _zip_payload((_row(),))
+    now = [100.0]
+
+    class _SlowBody:
+        def stream(
+            self, chunk_size: int, *, decode_content: bool
+        ) -> Iterable[bytes]:
+            assert chunk_size > 0
+            assert decode_content is False
+            split = max(len(payload) // 2, 1)
+            yield payload[:split]
+            now[0] += 2.0
+            yield payload[split:]
+
+    response = _Response(payload)
+    response.raw = _SlowBody()
+    result = _provider(
+        _partition(payload),
+        _Session((response,)),
+        total_request_timeout_seconds=1.0,
+        monotonic_clock=lambda: now[0],
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.records == ()
+    assert result.captures == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert response.closed
+
+
+def test_blocked_body_read_is_interrupted_by_total_deadline() -> None:
+    payload = _zip_payload((_row(),))
+    released = threading.Event()
+
+    class _BlockedBody:
+        def stream(
+            self, chunk_size: int, *, decode_content: bool
+        ) -> Iterable[bytes]:
+            assert chunk_size > 0
+            assert decode_content is False
+            released.wait(5.0)
+            if not released.is_set():
+                yield payload
+
+    class _BlockedResponse(_Response):
+        def __init__(self) -> None:
+            super().__init__(payload)
+            self.raw = _BlockedBody()
+
+        def close(self) -> None:
+            released.set()
+            super().close()
+
+    response = _BlockedResponse()
+    result = _provider(
+        _partition(payload),
+        _Session((response,)),
+        total_request_timeout_seconds=0.1,
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.records == ()
+    assert result.captures == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert response.closed
+    assert released.is_set()
+
+
+def test_blocked_request_headers_are_interrupted_by_total_deadline() -> None:
+    payload = _zip_payload((_row(),))
+    released = threading.Event()
+    response = _Response(payload)
+
+    class _BlockedSession(_Session):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            self.calls.append((url, kwargs))
+            released.wait(5.0)
+            return response
+
+        def close(self) -> None:
+            released.set()
+
+    session = _BlockedSession(())
+    started = time.monotonic()
+    result = _provider(
+        _partition(payload),
+        session,
+        total_request_timeout_seconds=0.1,
+    ).fetch(fetched_at=FETCHED_AT)
+    elapsed = time.monotonic() - started
+
+    assert result.records == ()
+    assert result.captures == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert released.is_set()
+    assert elapsed < 1.0
 
 
 @pytest.mark.parametrize(
@@ -448,16 +597,95 @@ def test_redirects_and_http_content_decoding_are_rejected(
     assert session.calls[0][1]["allow_redirects"] is False
 
 
-def test_publication_may_follow_batch_only_within_explicit_tolerance() -> None:
-    payload = _zip_payload((_row(published="20260904130000"),))
+@pytest.mark.parametrize("published", ["20260904115959", BATCH])
+def test_publication_at_or_before_batch_is_accepted(published: str) -> None:
+    payload = _zip_payload((_row(published=published),))
+    result = _provider(_partition(payload), _Session((_Response(payload),))).fetch(
+        fetched_at=FETCHED_AT
+    )
+    assert len(result.records) == 1
+    record = result.records[0]
+    assert record.available_at == record.contemporaneous_batch_at
+    assert record.available_at >= record.source_published_at
+    assert result.timestamp_validation["negative_publication_delay_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("published", "delay"),
+    [
+        ("20260904120001", -1.0),
+        ("20260904120100", -60.0),
+        ("20260905120000", -86_400.0),
+    ],
+)
+def test_any_publication_after_batch_is_quarantined_with_both_timestamps(
+    published: str, delay: float
+) -> None:
+    payload = _zip_payload((_row(published=published),))
+    result = _provider(_partition(payload), _Session((_Response(payload),))).fetch(
+        fetched_at=FETCHED_AT
+    )
+    assert result.records == ()
+    assert result.counters["records_rejected"] == 1
+    error = next(error for error in result.errors if error.error_type == "publication_after_batch")
+    assert error.details["source_published_at"] == (
+        parse_v21_date(published).isoformat().replace("+00:00", "Z")
+    )
+    assert error.details["contemporaneous_batch_at"] == (
+        parse_v21_date(BATCH).isoformat().replace("+00:00", "Z")
+    )
+    assert error.details["publication_delay_seconds"] == delay
+    assert result.timestamp_validation["negative_publication_delay_count"] == 0
+
+
+def test_duplicate_identity_count_is_independent_of_later_row_rejection() -> None:
+    future = _row(published="20260904120001")
+    payload = _zip_payload((future, future))
+    result = _provider(
+        _partition(payload), _Session((_Response(payload),))
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.counters["records_rejected"] == 2
+    assert result.counters["duplicate_record_count"] == 1
+    assert result.counters["rejected_reason_counts"] == {
+        "publication_after_batch": 2
+    }
+
+
+def test_publication_after_batch_wins_at_requested_end_boundary() -> None:
+    payload = _zip_payload((_row(published="20260904120001"),))
+    requested_end = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
     result = _provider(
         _partition(payload),
         _Session((_Response(payload),)),
-        publication_after_batch_tolerance_seconds=3600,
+        requested_end=requested_end,
     ).fetch(fetched_at=FETCHED_AT)
-    assert len(result.records) == 1
-    assert result.timestamp_validation["negative_publication_delay_count"] == 1
-    assert result.records[0].source_metadata["publication_delay_seconds"] == -3600
+
+    error = next(
+        error
+        for error in result.errors
+        if error.error_type == "publication_after_batch"
+    )
+    assert error.details["source_published_at"] == "2026-09-04T12:00:01Z"
+    assert error.details["contemporaneous_batch_at"] == (
+        "2026-09-04T12:00:00Z"
+    )
+    assert error.details["publication_delay_seconds"] == -1.0
+
+
+def test_duplicate_count_precedes_second_rows_malformed_timestamp() -> None:
+    valid = _row()
+    malformed_duplicate = _row(published="not-a-timestamp")
+    payload = _zip_payload((valid, malformed_duplicate))
+    result = _provider(
+        _partition(payload), _Session((_Response(payload),))
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.counters["duplicate_record_count"] == 1
+    assert result.counters["records_rejected"] == 1
+    assert result.counters["rejected_reason_counts"] == {
+        "invalid_publication_time": 1
+    }
 
 
 @pytest.mark.parametrize(
@@ -471,7 +699,7 @@ def test_publication_may_follow_batch_only_within_explicit_tolerance() -> None:
         (_row(published="00000000000000"), "invalid_publication_time"),
         (
             _row(published="20260905120001"),
-            "publication_after_batch_tolerance",
+            "publication_after_batch",
         ),
         (
             _row(published="20251215000000"),
@@ -490,6 +718,96 @@ def test_unsupported_or_incoherent_rows_are_quarantined(
     assert result.counters["records_rejected"] == 1
     assert error_type in _error_types(result)
     assert len(result.captures) == 1
+
+
+def test_timestamp_statistics_include_valid_unmatched_rows_before_entity_filtering() -> None:
+    unmatched = _row(
+        record_id=f"{BATCH}-1",
+        organizations="Other Company,1",
+        document_identifier="https://publisher.example/markets/other",
+        source_name="publisher.example",
+    )
+    matched = _row(record_id=f"{BATCH}-2")
+    payload = _zip_payload((unmatched, matched))
+    result = _provider(_partition(payload), _Session((_Response(payload),))).fetch(
+        fetched_at=FETCHED_AT
+    )
+
+    assert result.counters["records_scanned"] == 2
+    assert result.counters["records_unmatched"] == 1
+    assert result.counters["records_retained"] == 1
+    assert result.timestamp_validation["validated_record_count"] == 2
+
+
+def test_raw_replay_revalidates_archives_rows_duplicates_and_normalized_records() -> None:
+    unmatched = _row(
+        record_id=f"{BATCH}-1",
+        organizations="Other Company,1",
+        document_identifier="https://publisher.example/markets/other",
+        source_name="publisher.example",
+    )
+    matched = _row(record_id=f"{BATCH}-2")
+    future = _row(record_id=f"{BATCH}-3", published="20260904120001")
+    duplicate = _row(record_id=f"{BATCH}-2")
+    raw_rows = (unmatched, matched, future, duplicate)
+    payload = _zip_payload(raw_rows)
+    partition = _partition(payload)
+    acquired = _provider(
+        partition, _Session((_Response(payload),))
+    ).fetch(fetched_at=FETCHED_AT)
+
+    replay = replay_gdelt_gkg_captures(
+        (
+            GdeltGkgReplayCapture(
+                partition=partition,
+                content=payload,
+                fetched_at=FETCHED_AT,
+                capture_reference=f"capture_0001_{partition.filename}",
+            ),
+        ),
+        requested_start=REQUESTED_START,
+        requested_end=REQUESTED_END,
+        permission_policy_id=POLICY_ID,
+    )
+
+    assert replay.records == acquired.records
+    assert replay.scanned_record_count == 4
+    assert replay.timestamp_valid_record_count == 3
+    assert replay.rejected_record_count == 2
+    assert replay.rejected_reason_counts == {
+        "duplicate_source_record": 1,
+        "publication_after_batch": 1,
+    }
+    assert replay.unmatched_record_count == 1
+    assert replay.matched_record_count == 1
+    assert replay.duplicate_record_count == 1
+    assert replay.compressed_bytes == len(payload)
+    assert replay.decompressed_bytes == sum(len(row) + 1 for row in raw_rows)
+    assert replay.publication_delay == {
+        "minimum_seconds": 60.0,
+        "maximum_seconds": 60.0,
+    }
+
+
+def test_raw_replay_rejects_capture_whose_bytes_break_sealed_checksum() -> None:
+    payload = _zip_payload((_row(),))
+    partition = _partition(payload)
+    tampered = payload[:-1] + bytes((payload[-1] ^ 1,))
+
+    with pytest.raises(ValueError, match="archive_checksum_mismatch"):
+        replay_gdelt_gkg_captures(
+            (
+                GdeltGkgReplayCapture(
+                    partition=partition,
+                    content=tampered,
+                    fetched_at=FETCHED_AT,
+                    capture_reference=f"capture_0001_{partition.filename}",
+                ),
+            ),
+            requested_start=REQUESTED_START,
+            requested_end=REQUESTED_END,
+            permission_policy_id=POLICY_ID,
+        )
 
 
 @pytest.mark.parametrize(
@@ -542,6 +860,7 @@ def test_size_md5_and_sha256_claims_are_all_enforced(partition: Any) -> None:
             (_row(),), member_name=f"../{BATCH}.gkg.csv"
         ),
         lambda: _zip_payload((_row(),), symlink=True),
+        lambda: _zip_payload((_row(),), special_mode=stat.S_IFIFO),
     ],
 )
 def test_zip_requires_one_expected_regular_member(payload_factory: Any) -> None:
@@ -610,6 +929,7 @@ def test_record_cap_stops_before_requesting_later_partitions() -> None:
         max_records=1,
         session=session,
         clock=lambda: FETCHED_AT,
+        resolver=_resolver(),
     )
     result = provider.fetch(fetched_at=FETCHED_AT)
     assert "record_limit_exceeded" in _error_types(result)
@@ -733,6 +1053,13 @@ def test_config_loader_requires_explicit_partitions_and_parses_utc_range(
     assert provider.requested_start == REQUESTED_START
     assert provider.requested_end == REQUESTED_END
     assert provider.partitions == partitions
+    assert "publication_after_batch_tolerance_seconds" not in provider.effective_config
+    assert provider.effective_config["dns_resolution_policy"] == (
+        "bounded_global_addresses_only"
+    )
+    assert provider.effective_config["connected_peer_policy"] == (
+        "global_and_in_approved_resolution_set"
+    )
 
     with pytest.raises(EvidencePermissionError, match="differs"):
         GdeltGkgArchiveProvider.from_config(
@@ -740,3 +1067,9 @@ def test_config_loader_requires_explicit_partitions_and_parses_utc_range(
             permission_policy=_policy(policy_id="different-policy"),
             session=_Session(()),
         )
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["publication_after_batch_tolerance_seconds"] = 1
+    path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported GDELT GKG configuration"):
+        load_gdelt_gkg_config(path)

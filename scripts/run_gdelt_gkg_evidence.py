@@ -20,6 +20,16 @@ from paisa.evidence.artifacts import (  # noqa: E402
 )
 from paisa.evidence.gdelt_gkg import GdeltGkgArchiveProvider  # noqa: E402
 from paisa.evidence.policy import load_evidence_permission_policy  # noqa: E402
+from paisa.sentiment.artifacts import logical_storage_label  # noqa: E402
+
+
+def _artifact_directory_label(destination: Path) -> str:
+    parent = logical_storage_label(
+        destination.parent,
+        storage_root=REPOSITORY_ROOT,
+        kind="evidence",
+    )
+    return f"{parent}/{destination.name}"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -105,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 **verification.to_dict(),
-                "artifact_directory": str(destination),
+                "artifact_directory": _artifact_directory_label(destination),
                 "partitions_configured": result.counters.get(
                     "partitions_configured", 0
                 ),

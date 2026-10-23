@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone
 from pathlib import PurePosixPath
 import re
 from typing import Any, Literal, Mapping
+import unicodedata
 from urllib.parse import parse_qsl, urlsplit
 
 
@@ -42,13 +43,78 @@ EVENT_CATEGORIES = frozenset(
 EVIDENCE_TYPES = frozenset(
     {"publisher_news", "gdelt_metadata", "exchange_announcement"}
 )
+PROVIDER_EVIDENCE_CONTRACTS: Mapping[
+    tuple[str, str], tuple[EvidenceType, DataClass, frozenset[str]]
+] = {
+    ("gdelt-gkg-2.1", "raw_archive"): (
+        "gdelt_metadata",
+        "real",
+        frozenset({"second"}),
+    ),
+    ("psx-announcement", "manual_import"): (
+        "exchange_announcement",
+        "imported",
+        frozenset({"second", "minute", "date_only"}),
+    ),
+    ("gdelt-doc", "real"): (
+        "publisher_news",
+        "real",
+        frozenset({"second", "unknown"}),
+    ),
+    ("rss", "real"): (
+        "publisher_news",
+        "real",
+        frozenset({"second", "unknown"}),
+    ),
+    ("manual-csv", "imported"): (
+        "publisher_news",
+        "imported",
+        frozenset({"second", "unknown"}),
+    ),
+}
 PROVIDER_EVIDENCE_TYPES: Mapping[tuple[str, str], EvidenceType] = {
-    ("gdelt-gkg-2.1", "raw_archive"): "gdelt_metadata",
-    ("psx-announcement", "manual_import"): "exchange_announcement",
+    key: contract[0] for key, contract in PROVIDER_EVIDENCE_CONTRACTS.items()
 }
 TIME_PRECISIONS = frozenset({"second", "minute", "date_only", "unknown"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_GDELT_RECORD_ID = re.compile(
+    r"^(?P<batch>[0-9]{14})-(?P<sequence>[0-9]+)$"
+)
+_GDELT_ARCHIVE_FILENAME = re.compile(r"^(?P<batch>[0-9]{14})\.gkg\.csv\.zip$")
+_GDELT_PROVIDER = ("gdelt-gkg-2.1", "raw_archive")
+_GDELT_WEB_SOURCE_COLLECTION_ID = "1"
+_GDELT_MATCH_FIELDS = frozenset(
+    {
+        "V2ENHANCEDORGANIZATIONS",
+        "V2DOCUMENTIDENTIFIER",
+        "V2SOURCECOMMONNAME",
+    }
+)
+_GDELT_MATCH_METHODS: Mapping[str, frozenset[str]] = {
+    "V2ENHANCEDORGANIZATIONS": frozenset({"exact", "normalized_exact"}),
+    "V2DOCUMENTIDENTIFIER": frozenset({"normalized_token_boundary"}),
+    "V2SOURCECOMMONNAME": frozenset({"exact", "normalized_exact"}),
+}
+_OGDC_ALIASES = frozenset(
+    {
+        "Oil and Gas Development Company Limited",
+        "Oil & Gas Development Company Limited",
+        "Oil and Gas Development Company",
+        "Oil & Gas Development Company",
+        "OGDCL",
+        "OGDC",
+    }
+)
+_PSX_DATE_ONLY = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_PSX_MINUTE_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}"
+    r"(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+_PSX_SECOND_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
 _SENSITIVE_QUERY_KEY = re.compile(
     r"(^|[_-])(api[_-]?key|authorization|credential|password|secret|token)([_-]|$)",
     re.IGNORECASE,
@@ -124,6 +190,130 @@ def _single_line(value: str, *, field_name: str, maximum: int = 2_000) -> str:
     if len(text) > maximum:
         raise ValueError(f"{field_name} exceeds its maximum length")
     return text
+
+
+def _parse_gdelt_timestamp14(value: Any, *, field_name: str) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{14}", value):
+        raise ValueError(f"GDELT {field_name} must contain exactly 14 digits")
+    try:
+        return datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError(f"GDELT {field_name} contains an invalid UTC timestamp") from exc
+
+
+def _normalized_entity_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value).casefold().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _contains_normalized_alias(value: str, alias: str) -> bool:
+    normalized_value = _normalized_entity_text(value)
+    normalized_alias = _normalized_entity_text(alias)
+    if not normalized_value or not normalized_alias:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])",
+            normalized_value,
+        )
+    )
+
+
+def _validate_gdelt_match_evidence(
+    matches: tuple[Mapping[str, str], ...],
+    metadata: Mapping[str, Any],
+) -> None:
+    if not matches:
+        raise ValueError("GDELT OGDC evidence requires entity match provenance")
+    for match in matches:
+        field_name = match.get("field")
+        alias = match.get("alias")
+        matched_value = match.get("matched_value")
+        method = match.get("match_method")
+        if not all(
+            isinstance(item, str) and item
+            for item in (field_name, alias, matched_value, method)
+        ):
+            raise ValueError("GDELT entity match provenance is incomplete")
+        if field_name not in _GDELT_MATCH_FIELDS:
+            raise ValueError("GDELT entity match field is unsupported")
+        if alias not in _OGDC_ALIASES:
+            raise ValueError("GDELT entity match alias is not controlled")
+        if method not in _GDELT_MATCH_METHODS[field_name]:
+            raise ValueError("GDELT entity match method is unsupported")
+        source_value = metadata.get(field_name)
+        if not isinstance(source_value, str) or not source_value:
+            raise ValueError("GDELT entity match source field is missing")
+        if not _contains_normalized_alias(matched_value, alias):
+            raise ValueError("GDELT matched value does not contain its alias")
+        if not _contains_normalized_alias(source_value, alias):
+            raise ValueError("GDELT source field does not contain its alias")
+        if field_name in {"V2DOCUMENTIDENTIFIER", "V2SOURCECOMMONNAME"}:
+            if matched_value != source_value:
+                raise ValueError("GDELT matched value differs from its source field")
+        elif not _contains_normalized_alias(source_value, matched_value):
+            raise ValueError("GDELT organization match is absent from the raw field")
+
+
+def _validate_psx_source_evidence(record: "EvidenceRecord") -> None:
+    metadata = record.source_metadata
+    raw_posted = metadata.get("exchange_posted_at_raw")
+    if not isinstance(raw_posted, str) or not raw_posted:
+        raise ValueError("PSX evidence requires the exact source timestamp text")
+    if metadata.get("source_mode") != "manual_import":
+        raise ValueError("PSX source mode provenance is invalid")
+    if metadata.get("automated_access") is not False:
+        raise ValueError("PSX manual evidence cannot claim automated access")
+    decision_id = metadata.get("permission_decision_id")
+    if not isinstance(decision_id, str) or not decision_id:
+        raise ValueError("PSX evidence requires a permission decision")
+    for name in (
+        "manual_permission_attestation_sha256",
+        "manual_permission_reference_sha256",
+    ):
+        if not isinstance(metadata.get(name), str) or not _SHA256.fullmatch(
+            metadata[name]
+        ):
+            raise ValueError("PSX evidence requires checksum-bound permission evidence")
+    if record.time_precision == "date_only":
+        if not _PSX_DATE_ONLY.fullmatch(raw_posted):
+            raise ValueError("PSX date-only precision differs from source evidence")
+        if record.source_published_date is None or (
+            record.source_published_date.isoformat() != raw_posted
+        ):
+            raise ValueError("PSX source date differs from normalized evidence")
+    else:
+        grammar = (
+            _PSX_MINUTE_TIMESTAMP
+            if record.time_precision == "minute"
+            else _PSX_SECOND_TIMESTAMP
+        )
+        if not grammar.fullmatch(raw_posted):
+            raise ValueError("PSX timestamp precision differs from source evidence")
+        try:
+            parsed = datetime.fromisoformat(raw_posted.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("PSX source timestamp is invalid") from exc
+        parsed = _aware_utc(parsed, field_name="PSX source timestamp")
+        if parsed != record.source_published_at:
+            raise ValueError("PSX source timestamp differs from normalized evidence")
+        if record.time_precision == "minute" and (
+            parsed.second != 0 or parsed.microsecond != 0
+        ):
+            raise ValueError("PSX minute precision cannot invent seconds")
+
+    exact_ticker_matches = [
+        item
+        for item in record.entity_match_evidence
+        if item.get("field") == "ticker"
+        and item.get("matched_value") == "OGDC"
+        and item.get("match_method") == "official_exact_ticker"
+    ]
+    if not exact_ticker_matches:
+        raise ValueError("PSX evidence requires official exact-ticker provenance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,16 +425,36 @@ class EvidenceRecord:
             raise ValueError(f"Unsupported data_class: {self.data_class}")
         if self.time_precision not in TIME_PRECISIONS:
             raise ValueError(f"Unsupported time_precision: {self.time_precision}")
-        expected_evidence_type = PROVIDER_EVIDENCE_TYPES.get(
+        provider_contract = PROVIDER_EVIDENCE_CONTRACTS.get(
             (self.provider_id, self.provider_mode)
         )
-        if (
-            expected_evidence_type is not None
-            and self.evidence_type != expected_evidence_type
-        ):
+        if provider_contract is None:
+            if self.evidence_type == "gdelt_metadata":
+                raise ValueError(
+                    "GDELT metadata evidence requires the approved raw provider"
+                )
+            if self.evidence_type == "exchange_announcement":
+                raise ValueError(
+                    "Exchange announcements require the authorized PSX manual provider"
+                )
+            raise ValueError("Unknown evidence provider/mode combination")
+        expected_evidence_type, expected_data_class, allowed_precisions = (
+            provider_contract
+        )
+        if self.evidence_type != expected_evidence_type:
             raise ValueError(
                 "Provider mode requires evidence_type "
                 f"{expected_evidence_type!r}"
+            )
+        if self.data_class != expected_data_class:
+            raise ValueError(
+                "Provider mode requires data_class "
+                f"{expected_data_class!r}"
+            )
+        if self.time_precision not in allowed_precisions:
+            raise ValueError(
+                "Provider mode does not permit time_precision "
+                f"{self.time_precision!r}"
             )
         for name in (
             "provider_id",
@@ -311,6 +521,10 @@ class EvidenceRecord:
             )
 
         if self.evidence_type == "gdelt_metadata":
+            if (self.provider_id, self.provider_mode) != _GDELT_PROVIDER:
+                raise ValueError(
+                    "GDELT metadata evidence requires the approved raw provider"
+                )
             if self.provider_mode != "raw_archive":
                 raise ValueError("GDELT metadata evidence requires raw_archive mode")
             if self.data_class != "real":
@@ -323,11 +537,88 @@ class EvidenceRecord:
                 raise ValueError("GDELT available_at must equal its batch timestamp")
             if self.source_published_at is None:
                 raise ValueError("GDELT web evidence requires V2.1DATE")
+            if self.source_published_at > self.available_at:
+                raise ValueError(
+                    "GDELT publication timestamp cannot follow its availability basis"
+                )
+            if self.contemporaneous_batch_at > self.fetched_at:
+                raise ValueError("GDELT batch timestamp cannot follow fetched_at")
+            if self.contemporaneous_batch_at > self.imported_at:
+                raise ValueError("GDELT batch timestamp cannot follow imported_at")
             if self.historical_availability_basis != "gdelt_gkg_batch_timestamp":
                 raise ValueError("GDELT availability basis is invalid")
+            record_id = self.source_metadata.get("GKGRECORDID")
+            if (
+                not isinstance(record_id, str)
+                or record_id != self.source_record_id
+                or record_id != self.contemporaneous_source_id
+            ):
+                raise ValueError("GDELT record identities disagree")
+            record_match = _GDELT_RECORD_ID.fullmatch(record_id)
+            if record_match is None:
+                raise ValueError("GDELT GKGRECORDID is malformed")
+            record_batch = _parse_gdelt_timestamp14(
+                record_match.group("batch"), field_name="GKGRECORDID"
+            )
+            if record_batch != self.contemporaneous_batch_at:
+                raise ValueError(
+                    "GDELT GKGRECORDID timestamp differs from the batch timestamp"
+                )
+            archive_filename = self.source_metadata.get("archive_filename")
+            archive_match = (
+                _GDELT_ARCHIVE_FILENAME.fullmatch(archive_filename)
+                if isinstance(archive_filename, str)
+                else None
+            )
+            if archive_match is None:
+                raise ValueError("GDELT archive filename provenance is invalid")
+            archive_batch = _parse_gdelt_timestamp14(
+                archive_match.group("batch"), field_name="archive filename"
+            )
+            if archive_batch != self.contemporaneous_batch_at:
+                raise ValueError(
+                    "GDELT archive batch differs from the record batch timestamp"
+                )
+            metadata_publication = _parse_gdelt_timestamp14(
+                self.source_metadata.get("V2.1DATE"), field_name="V2.1DATE"
+            )
+            if metadata_publication != self.source_published_at:
+                raise ValueError(
+                    "GDELT V2.1DATE differs from source_published_at"
+                )
+            if (
+                self.source_metadata.get("V2SOURCECOLLECTIONIDENTIFIER")
+                != _GDELT_WEB_SOURCE_COLLECTION_ID
+            ):
+                raise ValueError("GDELT source collection is unsupported")
+            if "V2ORGANIZATIONS" in self.source_metadata:
+                raise ValueError(
+                    "GDELT provenance must use V2ENHANCEDORGANIZATIONS"
+                )
+            if self.source_metadata.get("V2SOURCECOMMONNAME") != self.source_name:
+                raise ValueError("GDELT source common name provenance differs")
+            if self.source_metadata.get("V2DOCUMENTIDENTIFIER") != self.source_url:
+                raise ValueError("GDELT document identifier provenance differs")
+            organizations = self.source_metadata.get("V2ENHANCEDORGANIZATIONS")
+            if not isinstance(organizations, str) or not organizations:
+                raise ValueError(
+                    "GDELT V2ENHANCEDORGANIZATIONS provenance is missing"
+                )
+            _validate_gdelt_match_evidence(
+                self.entity_match_evidence, self.source_metadata
+            )
         elif self.evidence_type == "exchange_announcement":
+            if (self.provider_id, self.provider_mode) != (
+                "psx-announcement",
+                "manual_import",
+            ):
+                raise ValueError(
+                    "Exchange announcements require the authorized PSX manual provider"
+                )
             if self.ticker.upper() != "OGDC":
                 raise ValueError("The initial PSX announcement slice requires OGDC")
+            if self.contemporaneous_batch_at is not None:
+                raise ValueError("PSX announcements cannot claim a GKG batch")
             if self.event_category is None or self.announcement_type is None:
                 raise ValueError(
                     "Exchange announcements require type and event category"
@@ -352,10 +643,14 @@ class EvidenceRecord:
                     != "official_exchange_posted_timestamp"
                 ):
                     raise ValueError("Timed exchange availability basis is invalid")
-        elif self.available_at is not None and self.available_at < self.fetched_at:
-            raise ValueError(
-                "Publisher news cannot claim availability before PAISA fetched it"
-            )
+            _validate_psx_source_evidence(self)
+        else:
+            if self.contemporaneous_batch_at is not None:
+                raise ValueError("Publisher news cannot claim a GKG batch")
+            if self.available_at is not None and self.available_at < self.fetched_at:
+                raise ValueError(
+                    "Publisher news cannot claim availability before PAISA fetched it"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -495,7 +790,7 @@ class EvidenceFetchResult:
     captures: tuple[EvidenceCapture, ...] = ()
     errors: tuple[EvidenceError, ...] = ()
     warnings: tuple[str, ...] = ()
-    counters: Mapping[str, int] = field(default_factory=dict)
+    counters: Mapping[str, Any] = field(default_factory=dict)
     timestamp_validation: Mapping[str, Any] = field(default_factory=dict)
     effective_config: Mapping[str, Any] = field(default_factory=dict)
 

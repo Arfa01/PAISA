@@ -19,6 +19,16 @@ from paisa.evidence.policy import load_evidence_permission_policy  # noqa: E402
 from paisa.evidence.psx_announcements import (  # noqa: E402
     PsxAnnouncementManualImporter,
 )
+from paisa.sentiment.artifacts import logical_storage_label  # noqa: E402
+
+
+def _artifact_directory_label(destination: Path) -> str:
+    parent = logical_storage_label(
+        destination.parent,
+        storage_root=REPOSITORY_ROOT,
+        kind="evidence",
+    )
+    return f"{parent}/{destination.name}"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -119,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                 "provider_id": result.provider_id,
                 "provider_mode": result.provider_mode,
                 "record_count": len(result.records),
-                "artifact_directory": str(destination),
+                "artifact_directory": _artifact_directory_label(destination),
                 "academic_disclaimer": (
                     "Academic simulation; not financial advice."
                 ),

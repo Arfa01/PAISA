@@ -8,7 +8,9 @@ downloads only explicitly configured official GKG archive files, never follows
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -33,6 +35,12 @@ from paisa.evidence.models import (
     EvidenceFetchResult,
     EvidenceRecord,
     utc_iso,
+)
+from paisa.evidence.network_boundary import (
+    MonotonicDeadline,
+    NetworkBoundaryError,
+    resolve_global_addresses,
+    verify_connected_peer,
 )
 from paisa.evidence.policy import (
     EvidencePermissionError,
@@ -124,10 +132,17 @@ _CHECKPOINT_SCHEMA_VERSION = "1.0"
 class _GkgRejected(ValueError):
     """Deterministic provider rejection safe for persisted error evidence."""
 
-    def __init__(self, error_type: str, message: str):
+    def __init__(
+        self,
+        error_type: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.error_type = error_type
         self.safe_message = message
+        self.details = dict(details or {})
 
 
 def _validated_gdelt_permission(
@@ -420,7 +435,7 @@ def _url_alias_matches(value: str) -> list[dict[str, str]]:
                 {
                     "field": "V2DOCUMENTIDENTIFIER",
                     "alias": alias,
-                    "matched_value": normalized_alias,
+                    "matched_value": value,
                     "match_method": "normalized_token_boundary",
                 }
             )
@@ -430,21 +445,21 @@ def _url_alias_matches(value: str) -> list[dict[str, str]]:
 
 def match_ogdc_aliases(
     *,
-    v2_organizations: str,
+    v2_enhanced_organizations: str,
     document_identifier: str | None = None,
     source_common_name: str | None = None,
 ) -> tuple[Mapping[str, str], ...]:
     """Return exact, auditable OGDC matches without substring matching."""
 
     matches: list[dict[str, str]] = []
-    for organization in _organization_names(v2_organizations):
+    for organization in _organization_names(v2_enhanced_organizations):
         matched = _alias_match(organization)
         if matched is None:
             continue
         alias, method = matched
         matches.append(
             {
-                "field": "V2ORGANIZATIONS",
+                "field": "V2ENHANCEDORGANIZATIONS",
                 "alias": alias,
                 "matched_value": organization,
                 "match_method": method,
@@ -540,12 +555,104 @@ def _wire_chunks(response: Any) -> Iterable[bytes]:
     yield bytes(response.content)
 
 
+def _request_before_deadline(
+    session: Any,
+    url: str,
+    *,
+    deadline: MonotonicDeadline,
+    **kwargs: Any,
+) -> Any:
+    """Bound internal DNS, connect, TLS, and response-header processing."""
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="paisa-gdelt-request",
+    )
+    future = executor.submit(session.get, url, **kwargs)
+
+    def close_eventual_response(completed: Any) -> None:
+        try:
+            eventual_response = completed.result()
+        except BaseException:
+            return
+        close = getattr(eventual_response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    try:
+        try:
+            return future.result(timeout=deadline.remaining())
+        except FutureTimeout as exc:
+            future.add_done_callback(close_eventual_response)
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                try:
+                    close_session()
+                except Exception:
+                    pass
+            future.cancel()
+            raise NetworkBoundaryError(
+                "request_deadline_exceeded",
+                "GDELT archive request exceeded its total deadline",
+            ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _wire_chunks_before_deadline(
+    response: Any, deadline: MonotonicDeadline
+) -> Iterable[bytes]:
+    """Advance a possibly blocking response iterator under the total deadline."""
+
+    iterator = iter(_wire_chunks(response))
+
+    def next_chunk() -> tuple[bool, bytes]:
+        try:
+            return True, bytes(next(iterator))
+        except StopIteration:
+            return False, b""
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="paisa-gdelt-body",
+    )
+    try:
+        while True:
+            remaining = deadline.remaining()
+            future = executor.submit(next_chunk)
+            try:
+                present, chunk = future.result(timeout=remaining)
+            except FutureTimeout as exc:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except OSError:
+                        pass
+                future.cancel()
+                raise NetworkBoundaryError(
+                    "request_deadline_exceeded",
+                    "GDELT archive request exceeded its total deadline",
+                ) from exc
+            if not present:
+                break
+            deadline.check()
+            yield chunk
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _read_bounded_response(
     response: Any,
     *,
     per_file_limit: int,
     remaining_total_limit: int,
+    deadline: MonotonicDeadline,
 ) -> bytes:
+    deadline.check()
     headers = {str(key).casefold(): value for key, value in response.headers.items()}
     encoding = str(headers.get("content-encoding") or "identity").strip().casefold()
     if encoding not in {"", "identity"}:
@@ -571,7 +678,8 @@ def _read_bounded_response(
             )
     chunks: list[bytes] = []
     size = 0
-    for value in _wire_chunks(response):
+    for value in _wire_chunks_before_deadline(response, deadline):
+        deadline.check()
         chunk = bytes(value)
         size += len(chunk)
         if size > per_file_limit or size > remaining_total_limit:
@@ -580,6 +688,8 @@ def _read_bounded_response(
                 "GDELT GKG archive exceeds the configured compressed-byte limit",
             )
         chunks.append(chunk)
+        deadline.check()
+    deadline.check()
     return b"".join(chunks)
 
 
@@ -633,13 +743,14 @@ def _read_safe_zip_member(
             expected_name = partition.filename.removesuffix(".zip")
             match = _MEMBER_NAME.fullmatch(name)
             unix_mode = member.external_attr >> 16
+            member_type = stat.S_IFMT(unix_mode)
             if (
                 path.name != name
                 or path.is_absolute()
                 or ".." in path.parts
                 or "\\" in name
                 or member.is_dir()
-                or stat.S_ISLNK(unix_mode)
+                or member_type not in {0, stat.S_IFREG}
                 or member.flag_bits & 0x1
                 or match is None
                 or name != expected_name
@@ -731,10 +842,71 @@ class _ParsedPartition:
     records: tuple[EvidenceRecord, ...]
     errors: tuple[EvidenceError, ...]
     scanned_count: int
+    timestamp_valid_count: int
     unmatched_count: int
     rejected_count: int
+    duplicate_count: int
+    rejected_reason_counts: Mapping[str, int]
     publication_delays: tuple[float, ...]
     batch_delays: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GdeltGkgReplayCapture:
+    """One sealed raw archive and the provenance needed for offline replay."""
+
+    partition: GdeltGkgPartition
+    content: bytes
+    fetched_at: datetime
+    capture_reference: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.partition, GdeltGkgPartition):
+            raise TypeError("GDELT replay partition is invalid")
+        if not isinstance(self.content, bytes):
+            raise TypeError("GDELT replay capture content must be bytes")
+        _aware_utc(self.fetched_at, field_name="fetched_at")
+        reference = str(self.capture_reference)
+        if (
+            PurePosixPath(reference).name != reference
+            or not reference.startswith("capture_")
+            or not reference.endswith(f"_{self.partition.filename}")
+        ):
+            raise ValueError("GDELT replay capture reference is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class GdeltGkgReplayResult:
+    """Deterministic semantic replay of sealed GKG raw captures."""
+
+    records: tuple[EvidenceRecord, ...]
+    errors: tuple[EvidenceError, ...]
+    scanned_record_count: int
+    timestamp_valid_record_count: int
+    rejected_record_count: int
+    rejected_reason_counts: Mapping[str, int]
+    unmatched_record_count: int
+    matched_record_count: int
+    duplicate_record_count: int
+    compressed_bytes: int
+    decompressed_bytes: int
+    publication_delay: Mapping[str, float | None]
+    batch_delay: Mapping[str, float | None]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scanned_record_count": self.scanned_record_count,
+            "timestamp_valid_record_count": self.timestamp_valid_record_count,
+            "rejected_record_count": self.rejected_record_count,
+            "rejected_reason_counts": dict(self.rejected_reason_counts),
+            "unmatched_record_count": self.unmatched_record_count,
+            "matched_record_count": self.matched_record_count,
+            "duplicate_record_count": self.duplicate_record_count,
+            "compressed_bytes": self.compressed_bytes,
+            "decompressed_bytes": self.decompressed_bytes,
+            "publication_delay": dict(self.publication_delay),
+            "batch_delay": dict(self.batch_delay),
+        }
 
 
 def _record_error(
@@ -746,7 +918,14 @@ def _record_error(
     error_type: str,
     message: str,
     row: bytes,
+    extra_details: Mapping[str, Any] | None = None,
 ) -> EvidenceError:
+    details = {
+        "row_number": row_number,
+        "row_sha256": hashlib.sha256(row).hexdigest(),
+        "archive_filename": partition.filename,
+    }
+    details.update(extra_details or {})
     return EvidenceError(
         provider_id=provider_id,
         configured_source=f"gdelt-gkg:{partition.partition_id}",
@@ -754,11 +933,7 @@ def _record_error(
         message=message,
         occurred_at=occurred_at,
         partition_id=partition.partition_id,
-        details={
-            "row_number": row_number,
-            "row_sha256": hashlib.sha256(row).hexdigest(),
-            "archive_filename": partition.filename,
-        },
+        details=details,
     )
 
 
@@ -773,7 +948,6 @@ def _parse_partition_rows(
     fetched_at: datetime,
     requested_start: datetime,
     requested_end: datetime,
-    publication_after_batch_tolerance_seconds: float,
     max_records_remaining: int,
     max_row_bytes: int,
     max_field_characters: int,
@@ -784,7 +958,8 @@ def _parse_partition_rows(
 ) -> _ParsedPartition:
     records: list[EvidenceRecord] = []
     errors: list[EvidenceError] = []
-    scanned = unmatched = rejected = 0
+    rejected_reason_counts: Counter[str] = Counter()
+    scanned = timestamp_valid = unmatched = rejected = duplicates = 0
     publication_delays: list[float] = []
     batch_delays: list[float] = []
     for row_number, line in enumerate(io.BytesIO(payload), start=1):
@@ -799,6 +974,7 @@ def _parse_partition_rows(
         scanned += 1
         if len(raw_line) > max_row_bytes:
             rejected += 1
+            rejected_reason_counts["row_limit_exceeded"] += 1
             if len(errors) < maximum_errors:
                 errors.append(
                     _record_error(
@@ -816,6 +992,7 @@ def _parse_partition_rows(
             text = raw_line.decode("utf-8")
         except UnicodeDecodeError:
             rejected += 1
+            rejected_reason_counts["invalid_text_encoding"] += 1
             if len(errors) < maximum_errors:
                 errors.append(
                     _record_error(
@@ -832,6 +1009,7 @@ def _parse_partition_rows(
         fields = text.split("\t")
         if len(fields) != len(GKG_V21_COLUMNS):
             rejected += 1
+            rejected_reason_counts["invalid_column_count"] += 1
             if len(errors) < maximum_errors:
                 errors.append(
                     _record_error(
@@ -865,11 +1043,27 @@ def _parse_partition_rows(
                 )
             source_id = row["GKGRECORDID"]
             batch_at = parse_gkg_record_id_timestamp(source_id)
+            is_duplicate = source_id in seen_source_ids
+            if is_duplicate:
+                duplicates += 1
+            else:
+                seen_source_ids.add(source_id)
             published_at = parse_v21_date(row["V2.1DATE"])
             if batch_at != partition.batch_at:
                 raise _GkgRejected(
                     "archive_batch_mismatch",
                     "GKGRECORDID timestamp conflicts with its archive filename",
+                )
+            publication_delay = (batch_at - published_at).total_seconds()
+            if published_at > batch_at:
+                raise _GkgRejected(
+                    "publication_after_batch",
+                    "GDELT publication time contradicts its earlier batch timestamp",
+                    details={
+                        "source_published_at": utc_iso(published_at),
+                        "contemporaneous_batch_at": utc_iso(batch_at),
+                        "publication_delay_seconds": publication_delay,
+                    },
                 )
             if not (requested_start <= batch_at <= requested_end) or not (
                 requested_start <= published_at <= requested_end
@@ -878,24 +1072,21 @@ def _parse_partition_rows(
                     "record_outside_requested_interval",
                     "GDELT GKG record falls outside the requested interval",
                 )
-            if row["V2SOURCECOLLECTIONIDENTIFIER"] != GDELT_WEB_SOURCE_COLLECTION_ID:
-                raise _GkgRejected(
-                    "unsupported_source_collection",
-                    "GDELT GKG record is not from the supported web collection",
-                )
-            publication_delay = (batch_at - published_at).total_seconds()
-            if publication_delay < -publication_after_batch_tolerance_seconds:
-                raise _GkgRejected(
-                    "publication_after_batch_tolerance",
-                    "GDELT publication time is implausibly later than its batch",
-                )
             batch_delay = (fetched_at - batch_at).total_seconds()
             if batch_delay < 0:
                 raise _GkgRejected(
                     "batch_after_fetch_time",
                     "GDELT batch timestamp is later than PAISA fetched_at",
                 )
-            if source_id in seen_source_ids:
+            timestamp_valid += 1
+            publication_delays.append(publication_delay)
+            batch_delays.append(batch_delay)
+            if row["V2SOURCECOLLECTIONIDENTIFIER"] != GDELT_WEB_SOURCE_COLLECTION_ID:
+                raise _GkgRejected(
+                    "unsupported_source_collection",
+                    "GDELT GKG record is not from the supported web collection",
+                )
+            if is_duplicate:
                 raise _GkgRejected(
                     "duplicate_source_record",
                     "GDELT GKG record identity is duplicated across partitions",
@@ -912,13 +1103,12 @@ def _parse_partition_rows(
                 source_common_name = str(urlsplit(safe_url).hostname)
             organizations = row["V2ENHANCEDORGANIZATIONS"]
             matches = match_ogdc_aliases(
-                v2_organizations=organizations,
+                v2_enhanced_organizations=organizations,
                 document_identifier=safe_url,
                 source_common_name=source_common_name,
             )
             if not matches:
                 unmatched += 1
-                seen_source_ids.add(source_id)
                 continue
             themes = _parse_themes(row["V2ENHANCEDTHEMES"])
             tone = _parse_tone(row["V1.5TONE"])
@@ -927,7 +1117,7 @@ def _parse_partition_rows(
                 "source_published_at": utc_iso(published_at),
                 "source_common_name": source_common_name,
                 "document_identifier": safe_url,
-                "v2_organizations": organizations,
+                "v2_enhanced_organizations": organizations,
                 "themes": themes,
                 "tone": tone,
                 "archive_sha256": archive_sha256,
@@ -975,7 +1165,6 @@ def _parse_partition_rows(
                         document_identifier.encode("utf-8")
                     ).hexdigest(),
                     "V1ORGANIZATIONS": row["V1ORGANIZATIONS"],
-                    "V2ORGANIZATIONS": organizations,
                     "V2ENHANCEDORGANIZATIONS": organizations,
                     "V2ENHANCEDTHEMES": list(themes),
                     "V1.5TONE": list(tone),
@@ -991,9 +1180,6 @@ def _parse_partition_rows(
                 },
             )
             records.append(record)
-            publication_delays.append(publication_delay)
-            batch_delays.append(batch_delay)
-            seen_source_ids.add(source_id)
         except ValueError as exc:
             rejected += 1
             if isinstance(exc, _GkgRejected):
@@ -1010,6 +1196,7 @@ def _parse_partition_rows(
                 else:
                     error_type = "record_validation_error"
                     message = "GDELT GKG record failed validation"
+            rejected_reason_counts[error_type] += 1
             if len(errors) < maximum_errors:
                 errors.append(
                     _record_error(
@@ -1020,16 +1207,195 @@ def _parse_partition_rows(
                         error_type=error_type,
                         message=message,
                         row=raw_line,
+                        extra_details=(
+                            exc.details if isinstance(exc, _GkgRejected) else None
+                        ),
                     )
                 )
     return _ParsedPartition(
         records=tuple(records),
         errors=tuple(errors),
         scanned_count=scanned,
+        timestamp_valid_count=timestamp_valid,
         unmatched_count=unmatched,
         rejected_count=rejected,
+        duplicate_count=duplicates,
+        rejected_reason_counts=dict(sorted(rejected_reason_counts.items())),
         publication_delays=tuple(publication_delays),
         batch_delays=tuple(batch_delays),
+    )
+
+
+def _delay_bounds(values: Sequence[float]) -> dict[str, float | None]:
+    return {
+        "minimum_seconds": min(values) if values else None,
+        "maximum_seconds": max(values) if values else None,
+    }
+
+
+def replay_gdelt_gkg_captures(
+    captures: Sequence[GdeltGkgReplayCapture],
+    *,
+    requested_start: datetime,
+    requested_end: datetime,
+    permission_policy_id: str,
+    max_files: int = 32,
+    max_compressed_bytes_per_file: int = 64 * 1024 * 1024,
+    max_compressed_bytes: int = 256 * 1024 * 1024,
+    max_decompressed_bytes_per_file: int = 256 * 1024 * 1024,
+    max_decompressed_bytes: int = 1024 * 1024 * 1024,
+    max_records: int = 1_000_000,
+    max_row_bytes: int = 2 * 1024 * 1024,
+    max_field_characters: int = 1_000_000,
+    maximum_errors: int = 1_000,
+) -> GdeltGkgReplayResult:
+    """Reparse sealed GKG archives with the acquisition parser, without network I/O."""
+
+    selected_max_files = _bounded_positive_integer(
+        max_files, field_name="max_files", maximum=_MAX_FILES_HARD
+    )
+    if len(captures) > selected_max_files:
+        raise ValueError("GDELT replay exceeds max_files")
+    compressed_per_file_limit = _bounded_positive_integer(
+        max_compressed_bytes_per_file,
+        field_name="max_compressed_bytes_per_file",
+        maximum=_MAX_COMPRESSED_BYTES_HARD,
+    )
+    compressed_total_limit = _bounded_positive_integer(
+        max_compressed_bytes,
+        field_name="max_compressed_bytes",
+        maximum=_MAX_COMPRESSED_BYTES_HARD,
+    )
+    decompressed_per_file_limit = _bounded_positive_integer(
+        max_decompressed_bytes_per_file,
+        field_name="max_decompressed_bytes_per_file",
+        maximum=_MAX_DECOMPRESSED_BYTES_HARD,
+    )
+    decompressed_total_limit = _bounded_positive_integer(
+        max_decompressed_bytes,
+        field_name="max_decompressed_bytes",
+        maximum=_MAX_DECOMPRESSED_BYTES_HARD,
+    )
+    selected_max_records = _bounded_positive_integer(
+        max_records, field_name="max_records", maximum=_MAX_RECORDS_HARD
+    )
+    selected_max_row_bytes = _bounded_positive_integer(
+        max_row_bytes, field_name="max_row_bytes", maximum=_MAX_ROW_BYTES_HARD
+    )
+    selected_max_field_characters = _bounded_positive_integer(
+        max_field_characters,
+        field_name="max_field_characters",
+        maximum=_MAX_FIELD_CHARACTERS_HARD,
+    )
+    selected_maximum_errors = _bounded_positive_integer(
+        maximum_errors, field_name="maximum_errors", maximum=100_000
+    )
+    start = _aware_utc(requested_start, field_name="requested_start")
+    end = _aware_utc(requested_end, field_name="requested_end")
+    if start > end:
+        raise ValueError("requested_start must not follow requested_end")
+    if not isinstance(permission_policy_id, str) or not permission_policy_id.strip():
+        raise ValueError("permission_policy_id must be non-empty")
+    if any(not isinstance(item, GdeltGkgReplayCapture) for item in captures):
+        raise TypeError("GDELT replay captures are invalid")
+    if len({item.capture_reference for item in captures}) != len(captures):
+        raise ValueError("GDELT replay capture references must be unique")
+    if len({item.partition.partition_id for item in captures}) != len(captures):
+        raise ValueError("GDELT replay partition IDs must be unique")
+    if len({item.partition.batch_at for item in captures}) != len(captures):
+        raise ValueError("GDELT replay archive batches must be unique")
+
+    records: list[EvidenceRecord] = []
+    errors: list[EvidenceError] = []
+    seen_source_ids: set[str] = set()
+    rejected_reason_counts: Counter[str] = Counter()
+    publication_delays: list[float] = []
+    batch_delays: list[float] = []
+    compressed_total = 0
+    decompressed_total = 0
+    scanned_total = 0
+    timestamp_valid_total = 0
+    unmatched_total = 0
+    rejected_total = 0
+    duplicate_total = 0
+
+    for capture in captures:
+        partition = capture.partition
+        if partition.expected_size_bytes is None or partition.expected_md5 is None:
+            raise ValueError(
+                "Every GDELT replay partition requires official size and MD5 claims"
+            )
+        if not start <= partition.batch_at <= end:
+            raise ValueError("GDELT replay partition is outside the requested interval")
+        payload = capture.content
+        if len(payload) > compressed_per_file_limit:
+            raise ValueError("GDELT replay capture exceeds the per-file byte limit")
+        if compressed_total + len(payload) > compressed_total_limit:
+            raise ValueError("GDELT replay captures exceed the total byte limit")
+        if scanned_total >= selected_max_records:
+            raise ValueError("GDELT replay exceeds the configured record limit")
+        try:
+            archive_md5, archive_sha256 = _validate_archive_checksums(
+                payload, partition
+            )
+            archive_member, decompressed = _read_safe_zip_member(
+                payload,
+                partition=partition,
+                per_file_limit=decompressed_per_file_limit,
+                remaining_total_limit=(
+                    decompressed_total_limit - decompressed_total
+                ),
+            )
+            parsed = _parse_partition_rows(
+                decompressed,
+                partition=partition,
+                archive_sha256=archive_sha256,
+                archive_md5=archive_md5,
+                archive_size_bytes=len(payload),
+                archive_member=archive_member,
+                fetched_at=capture.fetched_at,
+                requested_start=start,
+                requested_end=end,
+                max_records_remaining=selected_max_records - scanned_total,
+                max_row_bytes=selected_max_row_bytes,
+                max_field_characters=selected_max_field_characters,
+                permission_policy_id=permission_policy_id,
+                capture_reference=capture.capture_reference,
+                seen_source_ids=seen_source_ids,
+                maximum_errors=max(selected_maximum_errors - len(errors), 1),
+            )
+        except _GkgRejected as exc:
+            raise ValueError(
+                f"GDELT raw replay rejected capture: {exc.error_type}"
+            ) from exc
+        compressed_total += len(payload)
+        decompressed_total += len(decompressed)
+        records.extend(parsed.records)
+        errors.extend(parsed.errors[: max(selected_maximum_errors - len(errors), 0)])
+        scanned_total += parsed.scanned_count
+        timestamp_valid_total += parsed.timestamp_valid_count
+        unmatched_total += parsed.unmatched_count
+        rejected_total += parsed.rejected_count
+        duplicate_total += parsed.duplicate_count
+        rejected_reason_counts.update(parsed.rejected_reason_counts)
+        publication_delays.extend(parsed.publication_delays)
+        batch_delays.extend(parsed.batch_delays)
+
+    reasons = dict(sorted(rejected_reason_counts.items()))
+    return GdeltGkgReplayResult(
+        records=tuple(records),
+        errors=tuple(errors),
+        scanned_record_count=scanned_total,
+        timestamp_valid_record_count=timestamp_valid_total,
+        rejected_record_count=rejected_total,
+        rejected_reason_counts=reasons,
+        unmatched_record_count=unmatched_total,
+        matched_record_count=len(records),
+        duplicate_record_count=duplicate_total,
+        compressed_bytes=compressed_total,
+        decompressed_bytes=decompressed_total,
+        publication_delay=_delay_bounds(publication_delays),
+        batch_delay=_delay_bounds(batch_delays),
     )
 
 
@@ -1247,13 +1613,16 @@ class GdeltGkgArchiveProvider:
         max_row_bytes: int = 2 * 1024 * 1024,
         max_field_characters: int = 1_000_000,
         maximum_errors: int = 1_000,
-        publication_after_batch_tolerance_seconds: float = 24 * 60 * 60,
+        dns_timeout_seconds: float = 5.0,
         connect_timeout_seconds: float = 10.0,
         read_timeout_seconds: float = 60.0,
+        total_request_timeout_seconds: float = 120.0,
         user_agent: str = _DEFAULT_USER_AGENT,
         checkpoint_directory: str | Path | None = None,
         session: Any | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        resolver: Callable[..., Iterable[tuple[Any, ...]]] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         permission_decision = _validated_gdelt_permission(permission_policy)
         if not partitions:
@@ -1340,10 +1709,10 @@ class GdeltGkgArchiveProvider:
         self.maximum_errors = _bounded_positive_integer(
             maximum_errors, field_name="maximum_errors", maximum=100_000
         )
-        self.publication_after_batch_tolerance_seconds = _bounded_nonnegative_number(
-            publication_after_batch_tolerance_seconds,
-            field_name="publication_after_batch_tolerance_seconds",
-            maximum=7 * 24 * 60 * 60,
+        self.dns_timeout_seconds = _bounded_nonnegative_number(
+            dns_timeout_seconds,
+            field_name="dns_timeout_seconds",
+            maximum=300,
         )
         self.connect_timeout_seconds = _bounded_nonnegative_number(
             connect_timeout_seconds,
@@ -1355,7 +1724,17 @@ class GdeltGkgArchiveProvider:
             field_name="read_timeout_seconds",
             maximum=300,
         )
-        if not self.connect_timeout_seconds or not self.read_timeout_seconds:
+        self.total_request_timeout_seconds = _bounded_nonnegative_number(
+            total_request_timeout_seconds,
+            field_name="total_request_timeout_seconds",
+            maximum=600,
+        )
+        if (
+            not self.dns_timeout_seconds
+            or not self.connect_timeout_seconds
+            or not self.read_timeout_seconds
+            or not self.total_request_timeout_seconds
+        ):
             raise ValueError("Network timeouts must be strictly positive")
         self.user_agent = str(user_agent).strip()
         if not self.user_agent or "\n" in self.user_agent or "\r" in self.user_agent:
@@ -1364,6 +1743,8 @@ class GdeltGkgArchiveProvider:
             Path(checkpoint_directory) if checkpoint_directory is not None else None
         )
         self.clock = clock
+        self.resolver = resolver
+        self.monotonic_clock = monotonic_clock
         self._owns_session = session is None
         self.session = session or requests.Session()
         if hasattr(self.session, "trust_env"):
@@ -1426,11 +1807,16 @@ class GdeltGkgArchiveProvider:
             "max_records": self.max_records,
             "max_row_bytes": self.max_row_bytes,
             "max_field_characters": self.max_field_characters,
-            "publication_after_batch_tolerance_seconds": (
-                self.publication_after_batch_tolerance_seconds
-            ),
+            "maximum_errors": self.maximum_errors,
             "source_collection_policy": "web_only_identifier_1",
+            "dns_resolution_policy": "bounded_global_addresses_only",
+            "connected_peer_policy": "global_and_in_approved_resolution_set",
+            "tls_hostname_verification": "required",
             "redirect_policy": "reject",
+            "dns_timeout_seconds": self.dns_timeout_seconds,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "read_timeout_seconds": self.read_timeout_seconds,
+            "total_request_timeout_seconds": self.total_request_timeout_seconds,
             "environment_authentication": "disabled",
             "publisher_page_fetching": "disabled",
             "checkpointing": "validated_archive_cache" if self.checkpoint_directory else "disabled",
@@ -1491,11 +1877,36 @@ class GdeltGkgArchiveProvider:
         self._assert_permission_current()
         response: Any | None = None
         try:
-            response = self.session.get(
+            deadline = MonotonicDeadline.start(
+                self.total_request_timeout_seconds,
+                **(
+                    {"clock": self.monotonic_clock}
+                    if self.monotonic_clock is not None
+                    else {}
+                ),
+            )
+            approved_addresses = resolve_global_addresses(
+                GDELT_GKG_ARCHIVE_HOST,
+                port=443,
+                timeout_seconds=min(
+                    self.dns_timeout_seconds,
+                    deadline.remaining(),
+                ),
+                **({"resolver": self.resolver} if self.resolver is not None else {}),
+            )
+            deadline.check()
+            remaining = deadline.remaining()
+            response = _request_before_deadline(
+                self.session,
                 partition.archive_url,
-                timeout=(self.connect_timeout_seconds, self.read_timeout_seconds),
+                deadline=deadline,
+                timeout=(
+                    min(self.connect_timeout_seconds, remaining),
+                    min(self.read_timeout_seconds, remaining),
+                ),
                 allow_redirects=False,
                 stream=True,
+                verify=True,
                 proxies={},
                 headers={
                     "User-Agent": self.user_agent,
@@ -1503,6 +1914,12 @@ class GdeltGkgArchiveProvider:
                     "Accept-Encoding": "identity",
                 },
             )
+            deadline.check()
+            verify_connected_peer(
+                response,
+                approved_addresses=approved_addresses,
+            )
+            deadline.check()
             status = int(response.status_code)
             if status != 200:
                 raise _GkgRejected(
@@ -1512,11 +1929,14 @@ class GdeltGkgArchiveProvider:
                 response,
                 per_file_limit=self.max_compressed_bytes_per_file,
                 remaining_total_limit=remaining_total_bytes,
+                deadline=deadline,
             )
             acquisition_time = _aware_utc(
                 fetched_at or self.clock(), field_name="fetched_at"
             )
             return payload, acquisition_time
+        except NetworkBoundaryError as exc:
+            raise _GkgRejected(exc.error_type, exc.safe_message) from exc
         finally:
             if response is not None:
                 close = getattr(response, "close", None)
@@ -1575,11 +1995,7 @@ class GdeltGkgArchiveProvider:
                     ),
                 ),
                 counters={"partitions_configured": len(self.partitions)},
-                timestamp_validation={
-                    "publication_after_batch_tolerance_seconds": (
-                        self.publication_after_batch_tolerance_seconds
-                    )
-                },
+                timestamp_validation={"future_publication_policy": "reject"},
                 effective_config=self.effective_config,
             )
 
@@ -1587,10 +2003,12 @@ class GdeltGkgArchiveProvider:
         records: list[EvidenceRecord] = []
         errors: list[EvidenceError] = []
         seen_source_ids: set[str] = set()
+        rejected_reason_counts: Counter[str] = Counter()
         publication_delays: list[float] = []
         batch_delays: list[float] = []
         compressed_total = decompressed_total = scanned_total = 0
-        unmatched_total = rejected_total = 0
+        timestamp_valid_total = 0
+        unmatched_total = rejected_total = duplicate_total = 0
         downloaded_count = resumed_count = completed_count = 0
         observed_fetch_times: list[datetime] = []
 
@@ -1669,9 +2087,6 @@ class GdeltGkgArchiveProvider:
                     fetched_at=acquisition_time,
                     requested_start=self.requested_start,
                     requested_end=self.requested_end,
-                    publication_after_batch_tolerance_seconds=(
-                        self.publication_after_batch_tolerance_seconds
-                    ),
                     max_records_remaining=self.max_records - scanned_total,
                     max_row_bytes=self.max_row_bytes,
                     max_field_characters=self.max_field_characters,
@@ -1702,8 +2117,11 @@ class GdeltGkgArchiveProvider:
                 records.extend(parsed.records)
                 errors.extend(parsed.errors[: max(self.maximum_errors - len(errors), 0)])
                 scanned_total += parsed.scanned_count
+                timestamp_valid_total += parsed.timestamp_valid_count
                 unmatched_total += parsed.unmatched_count
                 rejected_total += parsed.rejected_count
+                duplicate_total += parsed.duplicate_count
+                rejected_reason_counts.update(parsed.rejected_reason_counts)
                 publication_delays.extend(parsed.publication_delays)
                 batch_delays.extend(parsed.batch_delays)
                 observed_fetch_times.append(acquisition_time)
@@ -1773,12 +2191,6 @@ class GdeltGkgArchiveProvider:
         ):
             warnings.append("one_or_more_partitions_lack_upstream_checksum")
 
-        def bounds(values: Sequence[float]) -> dict[str, float | None]:
-            return {
-                "minimum_seconds": min(values) if values else None,
-                "maximum_seconds": max(values) if values else None,
-            }
-
         return EvidenceFetchResult(
             provider_id=self.provider_id,
             provider_mode=self.provider_mode,
@@ -1801,19 +2213,18 @@ class GdeltGkgArchiveProvider:
                 "records_scanned": scanned_total,
                 "records_unmatched": unmatched_total,
                 "records_rejected": rejected_total,
+                "duplicate_record_count": duplicate_total,
+                "rejected_reason_counts": dict(sorted(rejected_reason_counts.items())),
                 "records_retained": len(records),
             },
             timestamp_validation={
-                "publication_after_batch_tolerance_seconds": (
-                    self.publication_after_batch_tolerance_seconds
-                ),
-                "publication_delay": bounds(publication_delays),
-                "batch_delay": bounds(batch_delays),
-                "negative_publication_delay_count": sum(
-                    value < 0 for value in publication_delays
-                ),
-                "validated_record_count": len(records),
+                "future_publication_policy": "reject",
+                "publication_delay": _delay_bounds(publication_delays),
+                "batch_delay": _delay_bounds(batch_delays),
+                "negative_publication_delay_count": 0,
+                "validated_record_count": timestamp_valid_total,
                 "rejected_record_count": rejected_total,
+                "rejected_reason_counts": dict(sorted(rejected_reason_counts.items())),
             },
             effective_config=self.effective_config,
         )
@@ -1835,9 +2246,10 @@ _CONFIG_KEYS = {
     "max_row_bytes",
     "max_field_characters",
     "maximum_errors",
-    "publication_after_batch_tolerance_seconds",
+    "dns_timeout_seconds",
     "connect_timeout_seconds",
     "read_timeout_seconds",
+    "total_request_timeout_seconds",
     "user_agent",
     "checkpoint_directory",
     "partitions",
@@ -1902,9 +2314,12 @@ __all__ = [
     "GKG_V21_COLUMNS",
     "GdeltGkgArchiveProvider",
     "GdeltGkgPartition",
+    "GdeltGkgReplayCapture",
+    "GdeltGkgReplayResult",
     "OGDC_ALIASES",
     "load_gdelt_gkg_config",
     "match_ogdc_aliases",
     "parse_gkg_record_id_timestamp",
     "parse_v21_date",
+    "replay_gdelt_gkg_captures",
 ]

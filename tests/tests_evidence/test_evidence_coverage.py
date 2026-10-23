@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timezone
 
 import pytest
@@ -58,7 +59,15 @@ def _stock(
     )
 
 
-def _gkg(identifier: str, available_at: datetime) -> EvidenceRecord:
+def _gkg(
+    identifier: str,
+    available_at: datetime,
+    *,
+    published_at: datetime | None = None,
+) -> EvidenceRecord:
+    published_at = published_at or available_at
+    record_id = f"{available_at:%Y%m%d%H%M%S}-1"
+    archive_filename = f"{available_at:%Y%m%d%H%M%S}.gkg.csv.zip"
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="gdelt_metadata",
@@ -67,25 +76,39 @@ def _gkg(identifier: str, available_at: datetime) -> EvidenceRecord:
         data_class="real",
         source_name="example.com",
         source_url="https://example.com/story",
-        source_record_id=f"{available_at:%Y%m%d%H%M%S}-1",
+        source_record_id=record_id,
         ticker="OGDC",
         company_name="Oil and Gas Development Company Limited",
         title=None,
-        source_published_at=available_at,
+        source_published_at=published_at,
         source_published_date=None,
         available_at=available_at,
         fetched_at=_at("2026-10-23"),
         imported_at=_at("2026-10-23"),
         historical_availability_basis="gdelt_gkg_batch_timestamp",
         time_precision="second",
-        contemporaneous_source_id=f"batch-{available_at:%Y%m%d%H%M%S}",
+        contemporaneous_source_id=record_id,
         contemporaneous_batch_at=available_at,
         permission_policy_id="gdelt-policy",
         raw_evidence_reference=f"capture.zip#{identifier}",
         content_sha256=SHA256,
         entity_match_evidence=(
-            {"field": "V2ORGANIZATIONS", "matched_alias": "OGDC"},
+            {
+                "field": "V2ENHANCEDORGANIZATIONS",
+                "alias": "OGDC",
+                "matched_value": "OGDC",
+                "match_method": "exact",
+            },
         ),
+        source_metadata={
+            "GKGRECORDID": record_id,
+            "V2.1DATE": f"{published_at:%Y%m%d%H%M%S}",
+            "V2SOURCECOLLECTIONIDENTIFIER": "1",
+            "V2SOURCECOMMONNAME": "example.com",
+            "V2DOCUMENTIDENTIFIER": "https://example.com/story",
+            "V2ENHANCEDORGANIZATIONS": "OGDC,1",
+            "archive_filename": archive_filename,
+        },
     )
 
 
@@ -93,7 +116,7 @@ def _psx_date(identifier: str, source_date: date) -> EvidenceRecord:
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="exchange_announcement",
-        provider_id="psx-ogdc-announcements",
+        provider_id="psx-announcement",
         provider_mode="manual_import",
         data_class="imported",
         source_name="Pakistan Stock Exchange",
@@ -118,14 +141,34 @@ def _psx_date(identifier: str, source_date: date) -> EvidenceRecord:
         content_sha256=SHA256,
         event_category="material_information",
         announcement_type="Material information",
+        entity_match_evidence=(
+            {
+                "field": "ticker",
+                "matched_value": "OGDC",
+                "match_method": "official_exact_ticker",
+            },
+        ),
+        source_metadata={
+            "source_mode": "manual_import",
+            "automated_access": False,
+            "exchange_posted_at_raw": source_date.isoformat(),
+            "permission_decision_id": "psx-test-decision",
+            "manual_permission_attestation_sha256": "b" * 64,
+            "manual_permission_reference_sha256": "c" * 64,
+        },
     )
 
 
-def _psx_timed(identifier: str, posted_at: datetime) -> EvidenceRecord:
+def _psx_timed(
+    identifier: str,
+    posted_at: datetime,
+    *,
+    precision: str = "second",
+) -> EvidenceRecord:
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="exchange_announcement",
-        provider_id="psx-ogdc-announcements",
+        provider_id="psx-announcement",
         provider_mode="manual_import",
         data_class="imported",
         source_name="Pakistan Stock Exchange",
@@ -140,7 +183,7 @@ def _psx_timed(identifier: str, posted_at: datetime) -> EvidenceRecord:
         fetched_at=_at("2026-10-23"),
         imported_at=_at("2026-10-23"),
         historical_availability_basis="official_exchange_posted_timestamp",
-        time_precision="second",
+        time_precision=precision,
         contemporaneous_source_id=identifier,
         contemporaneous_batch_at=None,
         permission_policy_id="psx-manual-policy",
@@ -148,6 +191,23 @@ def _psx_timed(identifier: str, posted_at: datetime) -> EvidenceRecord:
         content_sha256=SHA256,
         event_category="financial_results",
         announcement_type="Financial results",
+        entity_match_evidence=(
+            {
+                "field": "ticker",
+                "matched_value": "OGDC",
+                "match_method": "official_exact_ticker",
+            },
+        ),
+        source_metadata={
+            "source_mode": "manual_import",
+            "automated_access": False,
+            "exchange_posted_at_raw": posted_at.isoformat(
+                timespec="minutes" if precision == "minute" else "seconds"
+            ),
+            "permission_decision_id": "psx-test-decision",
+            "manual_permission_attestation_sha256": "b" * 64,
+            "manual_permission_reference_sha256": "c" * 64,
+        },
     )
 
 
@@ -160,8 +220,8 @@ def _publisher(
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="publisher_news",
-        provider_id="publisher-rss",
-        provider_mode="rss",
+        provider_id="rss",
+        provider_mode="real",
         data_class="real",
         source_name="Example News",
         source_url="https://example.com/news",
@@ -220,26 +280,87 @@ def test_date_only_mapping_is_strictly_next_session_for_trading_days_and_holiday
     assert before_period.mapping_status == "BEFORE_PRICE_PERIOD"
 
 
-def test_timed_exchange_posting_obeys_exact_cutoff_and_next_session_policy():
+def test_timed_exchange_posting_uses_precision_aware_cutoff_intervals():
     stock = _stock()
     config = CoverageConfig(
         market_timezone="Asia/Karachi", decision_cutoff=time(15, 30)
     )
-    exact = assign_evidence_to_session(
-        _psx_timed("psx-exact", _at("2024-01-05", "10:30:00")),
+    assignments = {
+        "minute_1529": assign_evidence_to_session(
+            _psx_timed(
+                "psx-minute-1529",
+                _at("2024-01-05", "10:29:00"),
+                precision="minute",
+            ),
+            stock,
+            config,
+        ),
+        "minute_1530": assign_evidence_to_session(
+            _psx_timed(
+                "psx-minute-1530",
+                _at("2024-01-05", "10:30:00"),
+                precision="minute",
+            ),
+            stock,
+            config,
+        ),
+        "second_152959": assign_evidence_to_session(
+            _psx_timed("psx-second-152959", _at("2024-01-05", "10:29:59")),
+            stock,
+            config,
+        ),
+        "second_153000": assign_evidence_to_session(
+            _psx_timed("psx-second-153000", _at("2024-01-05", "10:30:00")),
+            stock,
+            config,
+        ),
+        "second_153001": assign_evidence_to_session(
+            _psx_timed("psx-second-153001", _at("2024-01-05", "10:30:01")),
+            stock,
+            config,
+        ),
+    }
+
+    assert assignments["minute_1529"].session_date == date(2024, 1, 5)
+    assert assignments["minute_1530"].session_date == date(2024, 1, 8)
+    assert assignments["second_152959"].session_date == date(2024, 1, 5)
+    assert assignments["second_153000"].session_date == date(2024, 1, 5)
+    assert assignments["second_153001"].session_date == date(2024, 1, 8)
+    assert (
+        assignments["minute_1530"].mapping_status
+        == "AFTER_CUTOFF_CARRIED_TO_NEXT_SESSION"
+    )
+
+
+def test_timed_exchange_weekend_and_holiday_map_to_exact_next_observed_session():
+    dates = tuple(
+        date.fromisoformat(value)
+        for value in ("2024-01-05", "2024-01-08", "2024-01-10")
+    )
+    stock = _stock(dates)
+    config = CoverageConfig(
+        market_timezone="Asia/Karachi", decision_cutoff=time(15, 30)
+    )
+
+    weekend = assign_evidence_to_session(
+        _psx_timed(
+            "psx-weekend",
+            _at("2024-01-06", "10:00:00"),
+            precision="minute",
+        ),
         stock,
         config,
     )
-    late = assign_evidence_to_session(
-        _psx_timed("psx-late", _at("2024-01-05", "10:30:01")),
+    holiday = assign_evidence_to_session(
+        _psx_timed("psx-holiday", _at("2024-01-09", "10:00:00")),
         stock,
         config,
     )
 
-    assert exact.session_date == date(2024, 1, 5)
-    assert exact.mapping_status == "SAME_SESSION_BEFORE_CUTOFF"
-    assert late.session_date == date(2024, 1, 8)
-    assert late.mapping_status == "AFTER_CUTOFF_CARRIED_TO_NEXT_SESSION"
+    assert weekend.session_date == date(2024, 1, 8)
+    assert weekend.mapping_status == "NON_TRADING_DAY_CARRIED_TO_NEXT_SESSION"
+    assert holiday.session_date == date(2024, 1, 10)
+    assert holiday.mapping_status == "NON_TRADING_DAY_CARRIED_TO_NEXT_SESSION"
 
 
 def test_historical_batch_time_not_later_fetch_time_drives_session_mapping():
@@ -251,6 +372,23 @@ def test_historical_batch_time_not_later_fetch_time_drives_session_mapping():
     assert record.fetched_at.year == 2026
     assert assignment.session_date == date(2024, 1, 3)
     assert assignment.mapping_status == "SAME_SESSION_BEFORE_CUTOFF"
+
+
+def test_gkg_mapping_never_precedes_both_publication_and_batch_time():
+    stock = _stock()
+    config = CoverageConfig(
+        market_timezone="Asia/Karachi", decision_cutoff=time(15, 30)
+    )
+    record = _gkg(
+        "gkg-batch-after-cutoff",
+        _at("2024-01-03", "10:31:00"),
+        published_at=_at("2024-01-03", "10:29:00"),
+    )
+
+    assignment = assign_evidence_to_session(record, stock, config)
+
+    assert assignment.session_date == date(2024, 1, 4)
+    assert assignment.mapping_status == "AFTER_CUTOFF_CARRIED_TO_NEXT_SESSION"
 
 
 def test_future_availability_is_never_backdated_to_publication_session():
@@ -449,3 +587,61 @@ def test_ogdc_publisher_news_is_general_news_and_combined_ogdc_evidence():
     combined = _row(result, "combined_ogdc_evidence", "test")
     assert combined.record_count == 1
     assert combined.evidence_type_counts["publisher_news"] == 1
+
+
+@pytest.mark.parametrize(
+    ("record", "changes", "message"),
+    [
+        (
+            _publisher("publisher-provider", _at("2024-01-05")),
+            {"provider_id": "unknown-publisher"},
+            "Unknown evidence provider",
+        ),
+        (
+            _publisher("publisher-type", _at("2024-01-05")),
+            {"evidence_type": "gdelt_metadata"},
+            "requires evidence_type 'publisher_news'",
+        ),
+        (
+            _publisher("publisher-class", _at("2024-01-05")),
+            {"data_class": "imported"},
+            "requires data_class 'real'",
+        ),
+        (
+            _publisher("publisher-precision", _at("2024-01-05")),
+            {"time_precision": "minute"},
+            "does not permit time_precision",
+        ),
+        (
+            _psx_timed("psx-provider", _at("2024-01-05")),
+            {"provider_id": "unknown-psx"},
+            "authorized PSX manual provider",
+        ),
+        (
+            _psx_timed("psx-class", _at("2024-01-05")),
+            {"data_class": "real"},
+            "requires data_class 'imported'",
+        ),
+        (
+            _psx_timed("psx-precision", _at("2024-01-05")),
+            {"time_precision": "minute"},
+            "precision differs from source evidence",
+        ),
+    ],
+)
+def test_provider_type_data_class_and_precision_contracts_are_bidirectional(
+    record: EvidenceRecord,
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(record, **changes)
+
+
+def test_psx_record_requires_checksum_bound_permission_evidence() -> None:
+    record = _psx_timed("psx-permission", _at("2024-01-05"))
+    metadata = dict(record.source_metadata)
+    metadata.pop("manual_permission_reference_sha256")
+
+    with pytest.raises(ValueError, match="checksum-bound permission evidence"):
+        replace(record, source_metadata=metadata)

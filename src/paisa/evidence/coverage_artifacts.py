@@ -1,10 +1,11 @@
 """Immutable artifacts for contemporaneous-evidence coverage audits.
 
-The pack verifier deliberately distinguishes internal, artifact-bound semantic
-reconciliation from a source-evidence replay.  A successfully verified pack
-proves that its sealed tables agree with one another; it does not claim that
-the original evidence or stock artifacts were reopened.  Coverage readiness is
-an engineering gate for an academic simulation, not financial advice.
+Each pack seals canonical normalized evidence and the exact stock calendar.
+The portable verifier rebuilds provider-derived profiles and session mappings
+from those inputs instead of trusting persisted labels.  This is still not a
+replay of the original provider archives.  Coverage readiness records
+caller-defined gate satisfaction for an academic simulation, not financial
+advice.
 """
 
 from __future__ import annotations
@@ -18,13 +19,19 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
 import subprocess
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
+from paisa.evidence.artifact_security import (
+    make_pack_private,
+    prepare_output_root,
+    reject_symlink_components,
+    remove_staging_tree,
+    verify_pack_modes,
+)
 from paisa.evidence.artifacts import sha256_file
 from paisa.evidence.coverage import (
     AUDIT_PERIODS,
@@ -36,8 +43,15 @@ from paisa.evidence.coverage import (
     EvidenceCoverageRow,
     EvidenceReadinessCriteria,
     calculate_evidence_readiness,
+    compute_evidence_coverage,
 )
-from paisa.evidence.models import EVIDENCE_TYPES, TIME_PRECISIONS, utc_iso
+from paisa.evidence.models import (
+    EVIDENCE_TYPES,
+    TIME_PRECISIONS,
+    EvidenceRecord,
+    utc_iso,
+)
+from paisa.news.coverage import CoverageConfig, StockEvidence, parse_cutoff
 from paisa.sentiment.artifacts import (
     SentimentRunCollisionError,
     artifact_inventory,
@@ -46,7 +60,7 @@ from paisa.sentiment.artifacts import (
 )
 
 
-EVIDENCE_COVERAGE_PACK_SCHEMA_VERSION = "1.0"
+EVIDENCE_COVERAGE_PACK_SCHEMA_VERSION = "1.1"
 ACADEMIC_DISCLAIMER = "Academic simulation; not financial advice."
 _RUN_ID = re.compile(
     r"^ECOV-[0-9]{8}-[0-9]{6}-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
@@ -69,10 +83,28 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
+_WINDOWS_UNC = re.compile(r"^\\\\[^\\/\s]+[\\/][^\\/\s]+")
+_EMBEDDED_POSIX_ABSOLUTE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?!/)[^\s\"'<>]+"
+)
+_EMBEDDED_POSIX_NETWORK_ABSOLUTE = re.compile(
+    r"(?<![A-Za-z0-9:/])//[^/\s\"'<>]+/[^\s\"'<>]+"
+)
+_EMBEDDED_WINDOWS_ABSOLUTE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"'<>]+"
+)
+_EMBEDDED_WINDOWS_UNC = re.compile(
+    r"(?<![A-Za-z0-9])\\\\[^\\/\s]+[\\/][^\s\"'<>]+"
+)
+_FILE_URI = re.compile(
+    r"(?i)(?<![A-Za-z0-9])file:(?://[^/\s\"'<>]*)?/[^\s\"'<>]*"
+)
 _SEAL_FILES = frozenset({"run_manifest.json", "completion.json"})
 _PAYLOAD_FILES = frozenset(
     {
         "input_evidence_reference.json",
+        "normalized_evidence.jsonl",
+        "stock_calendar.json",
         "stock_artifact_reference.json",
         "evidence_session_mappings.csv",
         "split_coverage.csv",
@@ -156,7 +188,7 @@ class EvidenceCoverageRunVerification:
     artifact_count: int
     manifest_sha256: str
     payload_inventory_sha256: str
-    verification_basis: str = "PACK_SEMANTIC_RECONCILIATION"
+    verification_basis: str = "PORTABLE_RECORD_CALENDAR_RECOMPUTATION"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,7 +205,7 @@ class EvidenceCoverageRunVerification:
             "verification_basis": self.verification_basis,
             "source_evidence_bound": False,
             "completion_acceptance": (
-                "PACK_SEMANTIC_RECONCILIATION_NOT_SOURCE_EVIDENCE_BOUND"
+                "PACK_RECORD_CALENDAR_RECOMPUTATION_NOT_SOURCE_ARCHIVE_BOUND"
             ),
         }
 
@@ -245,6 +277,15 @@ def _write_json(path: Path, value: Any) -> None:
     _write_private(path, _json_bytes(value))
 
 
+def _write_evidence_jsonl(
+    path: Path, records: Sequence[EvidenceRecord]
+) -> None:
+    payload = b"".join(
+        _canonical_bytes(record.to_dict()) + b"\n" for record in records
+    )
+    _write_private(path, payload)
+
+
 def _csv_scalar(value: Any) -> str:
     if value is None:
         return ""
@@ -291,8 +332,82 @@ def _write_csv(
         raise
 
 
+def _stock_calendar_document(
+    computation: EvidenceCoverageComputation,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "symbol": computation.stock_symbol,
+        "market_timezone": computation.market_timezone,
+        "decision_cutoff": computation.decision_cutoff,
+        "trading_dates": [value.isoformat() for value in computation.trading_dates],
+        "split_dates": {
+            split: [value.isoformat() for value in computation.split_dates[split]]
+            for split in MODEL_SPLITS
+        },
+    }
+
+
+def _sorted_computation_tables(
+    computation: EvidenceCoverageComputation,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    profile_order = {
+        name: index for index, name in enumerate(EVIDENCE_COVERAGE_PROFILES)
+    }
+    period_order = {name: index for index, name in enumerate(AUDIT_PERIODS)}
+    mappings = sorted(
+        (item.to_dict() for item in computation.mapping_rows),
+        key=lambda item: str(item["evidence_id"]),
+    )
+    split_rows = sorted(
+        (item.to_dict() for item in computation.split_rows),
+        key=lambda item: (
+            profile_order.get(str(item["profile"]), 999),
+            period_order.get(str(item["split"]), 999),
+        ),
+    )
+    monthly_rows = sorted(
+        (item.to_dict() for item in computation.monthly_rows),
+        key=lambda item: (
+            profile_order.get(str(item["profile"]), 999),
+            period_order.get(str(item["split"]), 999),
+            str(item["month"]),
+        ),
+    )
+    missing_rows = sorted(
+        (item.to_dict() for item in computation.missing_intervals),
+        key=lambda item: (
+            profile_order.get(str(item["profile"]), 999),
+            period_order.get(str(item["split"]), 999),
+            str(item["start_date"]),
+        ),
+    )
+    return mappings, split_rows, monthly_rows, missing_rows
+
+
+def _csv_formatted_rows(
+    rows: Sequence[Mapping[str, Any]], fields: Sequence[str]
+) -> list[dict[str, str]]:
+    return [
+        {field: _csv_scalar(row.get(field)) for field in fields}
+        for row in rows
+    ]
+
+
 def _sanitize_text(value: str) -> str:
     text = _JWT.sub("[REDACTED_JWT]", value)
+    text = _FILE_URI.sub("[REDACTED_FILE_URI]", text)
+    text = _EMBEDDED_POSIX_NETWORK_ABSOLUTE.sub(
+        "[REDACTED_ABSOLUTE_PATH]", text
+    )
+    text = _EMBEDDED_POSIX_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_UNC.sub("[REDACTED_ABSOLUTE_PATH]", text)
     parsed = urlsplit(text)
     if parsed.scheme in {"http", "https"} and parsed.hostname:
         host = parsed.hostname
@@ -319,7 +434,11 @@ def _sanitize_text(value: str) -> str:
         return urlunsplit(
             (parsed.scheme, host, parsed.path, query, parsed.fragment)
         )
-    if text.startswith("/") or _WINDOWS_ABSOLUTE.match(text):
+    if (
+        text.startswith("/")
+        or _WINDOWS_ABSOLUTE.match(text)
+        or _WINDOWS_UNC.match(text)
+    ):
         return "[REDACTED_ABSOLUTE_PATH]"
     if "/" in text and ".." in PurePosixPath(text).parts:
         return "[REDACTED_UNSAFE_PATH]"
@@ -360,6 +479,19 @@ def _assert_hygiene(value: Any, *, key: str = "") -> None:
         raise EvidenceCoverageVerificationError(
             "Coverage references contain an unredacted token"
         )
+    if _FILE_URI.search(value):
+        raise EvidenceCoverageVerificationError(
+            "Coverage references contain an absolute file URI"
+        )
+    if (
+        _EMBEDDED_POSIX_NETWORK_ABSOLUTE.search(value)
+        or _EMBEDDED_POSIX_ABSOLUTE.search(value)
+        or _EMBEDDED_WINDOWS_ABSOLUTE.search(value)
+        or _EMBEDDED_WINDOWS_UNC.search(value)
+    ):
+        raise EvidenceCoverageVerificationError(
+            "Coverage references contain an embedded absolute host path"
+        )
     parsed = urlsplit(value)
     if parsed.scheme in {"http", "https"}:
         if parsed.username is not None or parsed.password is not None:
@@ -377,7 +509,12 @@ def _assert_hygiene(value: Any, *, key: str = "") -> None:
                     "Coverage references contain a credential query value"
                 )
         return
-    if value.startswith("/") or _WINDOWS_ABSOLUTE.match(value):
+    if (
+        value.startswith("/")
+        or _WINDOWS_ABSOLUTE.match(value)
+        or _WINDOWS_UNC.match(value)
+        or _EMBEDDED_WINDOWS_UNC.search(value)
+    ):
         raise EvidenceCoverageVerificationError(
             "Coverage references contain an absolute host path"
         )
@@ -675,6 +812,77 @@ def _referenced_record_count(value: Mapping[str, Any]) -> int:
     )
 
 
+def _referenced_population_counts(value: Mapping[str, Any]) -> dict[str, int]:
+    counts = {name: 0 for name in EVIDENCE_TYPES}
+    for item in value.get("inputs", []):
+        if not isinstance(item, Mapping):
+            continue
+        kind = item.get("input_kind")
+        if kind == "gdelt_gkg":
+            counts["gdelt_metadata"] += int(item["record_count"])
+        elif kind == "psx_announcement_evidence":
+            counts["exchange_announcement"] += int(item["record_count"])
+        elif kind == "publisher_news":
+            counts["publisher_news"] += int(item["record_count"])
+    return counts
+
+
+def _permission_ids_by_evidence_type(
+    value: Mapping[str, Any],
+) -> dict[str, set[str]]:
+    result = {name: set() for name in EVIDENCE_TYPES}
+    for item in value.get("inputs", []):
+        if not isinstance(item, Mapping):
+            continue
+        kind = item.get("input_kind")
+        if kind in {"gdelt_gkg", "psx_announcement_evidence"}:
+            permission = item.get("permission_policy_reference")
+            if isinstance(permission, Mapping):
+                policy_id = permission.get("policy_id")
+                if isinstance(policy_id, str) and policy_id:
+                    target = (
+                        "gdelt_metadata"
+                        if kind == "gdelt_gkg"
+                        else "exchange_announcement"
+                    )
+                    result[target].add(policy_id)
+        elif kind == "publisher_news":
+            runs = item.get("run_references")
+            if isinstance(runs, list):
+                for run in runs:
+                    if not isinstance(run, Mapping):
+                        continue
+                    decision = run.get("source_permission_decision")
+                    if isinstance(decision, Mapping):
+                        decision_id = decision.get("decision_id")
+                        if isinstance(decision_id, str) and decision_id:
+                            result["publisher_news"].add(decision_id)
+    return result
+
+
+def _verify_record_sources(
+    records: Sequence[EvidenceRecord], inputs: Mapping[str, Any]
+) -> None:
+    expected_counts = _referenced_population_counts(inputs)
+    observed_counts = {
+        evidence_type: sum(
+            record.evidence_type == evidence_type for record in records
+        )
+        for evidence_type in EVIDENCE_TYPES
+    }
+    if observed_counts != expected_counts:
+        raise EvidenceCoverageVerificationError(
+            "Coverage normalized evidence populations disagree with source references"
+        )
+    allowed_permissions = _permission_ids_by_evidence_type(inputs)
+    for record in records:
+        permitted = allowed_permissions[record.evidence_type]
+        if not permitted or record.permission_policy_id not in permitted:
+            raise EvidenceCoverageVerificationError(
+                "Coverage normalized evidence permission identity is unbound"
+            )
+
+
 def _validate_stock_reference(value: Mapping[str, Any]) -> None:
     if value.get("symbol") != "OGDC" or value.get("is_real_data") is not True:
         raise _reference_error("stock reference must identify real OGDC evidence")
@@ -742,6 +950,36 @@ def _validate_stock_reference(value: Mapping[str, Any]) -> None:
         previous_end = end
     if total > price_count:
         raise _reference_error("stock split counts exceed price sessions")
+
+
+def _verify_stock_calendar_reference(
+    stock: StockEvidence, reference: Mapping[str, Any]
+) -> None:
+    if stock.symbol != reference.get("symbol"):
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar symbol disagrees with its reference"
+        )
+    observed_range = {
+        "start": stock.trading_dates[0].isoformat(),
+        "end": stock.trading_dates[-1].isoformat(),
+    }
+    if (
+        reference.get("price_trading_day_count") != len(stock.trading_dates)
+        or reference.get("price_date_range") != observed_range
+        or reference.get("split_counts")
+        != {split: len(stock.split_dates[split]) for split in MODEL_SPLITS}
+        or reference.get("split_ranges")
+        != {
+            split: {
+                "start": stock.split_dates[split][0].isoformat(),
+                "end": stock.split_dates[split][-1].isoformat(),
+            }
+            for split in MODEL_SPLITS
+        }
+    ):
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar disagrees with its immutable stock reference"
+        )
 
 
 def _normalize_input_references(
@@ -879,6 +1117,118 @@ def _read_csv(
         ) from exc
 
 
+def _read_evidence_records(root: Path) -> tuple[EvidenceRecord, ...]:
+    path = root / "normalized_evidence.jsonl"
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceCoverageVerificationError(
+            "Missing regular coverage artifact: normalized_evidence.jsonl"
+        )
+    try:
+        payload = path.read_bytes()
+        if payload and (not payload.endswith(b"\n") or b"\0" in payload):
+            raise EvidenceCoverageVerificationError(
+                "Coverage normalized evidence framing is invalid"
+            )
+        records: list[EvidenceRecord] = []
+        for line_number, raw_line in enumerate(payload.splitlines(), start=1):
+            try:
+                decoded = raw_line.decode("utf-8")
+                value = json.loads(decoded)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise EvidenceCoverageVerificationError(
+                    "Coverage normalized evidence is invalid"
+                ) from exc
+            if not isinstance(value, Mapping) or _canonical_bytes(value) != raw_line:
+                raise EvidenceCoverageVerificationError(
+                    "Coverage normalized evidence is not canonical"
+                )
+            try:
+                records.append(EvidenceRecord.from_dict(value))
+            except (TypeError, ValueError) as exc:
+                raise EvidenceCoverageVerificationError(
+                    f"Coverage normalized evidence contract failed at line {line_number}"
+                ) from exc
+    except OSError as exc:
+        raise EvidenceCoverageVerificationError(
+            "Coverage normalized evidence could not be read"
+        ) from exc
+    identifiers = [record.evidence_id for record in records]
+    if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
+        raise EvidenceCoverageVerificationError(
+            "Coverage normalized evidence identities are not canonical and unique"
+        )
+    return tuple(records)
+
+
+def _read_stock_calendar(
+    root: Path,
+) -> tuple[StockEvidence, CoverageConfig]:
+    value = _read_json(root / "stock_calendar.json")
+    expected_keys = {
+        "schema_version",
+        "symbol",
+        "market_timezone",
+        "decision_cutoff",
+        "trading_dates",
+        "split_dates",
+    }
+    if set(value) != expected_keys or value.get("schema_version") != "1.0":
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar schema is invalid"
+        )
+    raw_dates = value.get("trading_dates")
+    raw_splits = value.get("split_dates")
+    if (
+        not isinstance(raw_dates, list)
+        or not raw_dates
+        or not isinstance(raw_splits, Mapping)
+        or set(raw_splits) != set(MODEL_SPLITS)
+        or any(not isinstance(item, str) for item in raw_dates)
+        or any(
+            not isinstance(raw_splits[split], list)
+            or not raw_splits[split]
+            or any(not isinstance(item, str) for item in raw_splits[split])
+            for split in MODEL_SPLITS
+        )
+    ):
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar dates are invalid"
+        )
+    try:
+        trading_dates = tuple(
+            _iso_date(item, field="stock trading date") for item in raw_dates
+        )
+        split_dates = {
+            split: tuple(
+                _iso_date(item, field=f"stock {split} date")
+                for item in raw_splits[split]
+            )
+            for split in MODEL_SPLITS
+        }
+        config = CoverageConfig(
+            market_timezone=str(value.get("market_timezone") or ""),
+            decision_cutoff=parse_cutoff(str(value.get("decision_cutoff") or "")),
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar configuration is invalid"
+        ) from exc
+    symbol = value.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise EvidenceCoverageVerificationError(
+            "Coverage stock calendar symbol is invalid"
+        )
+    return (
+        StockEvidence(
+            symbol=symbol,
+            trading_dates=trading_dates,
+            split_dates=split_dates,
+            reference={},
+        ),
+        config,
+    )
+
+
 def _normalize_inventory(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise EvidenceCoverageVerificationError(
@@ -970,9 +1320,11 @@ def _iso_date(value: str, *, field: str) -> date:
     return parsed
 
 
-def _timestamp(value: str, *, field: str, optional: bool = True) -> None:
+def _timestamp(
+    value: str, *, field: str, optional: bool = True
+) -> datetime | None:
     if value == "" and optional:
-        return
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -983,6 +1335,7 @@ def _timestamp(value: str, *, field: str, optional: bool = True) -> None:
         raise EvidenceCoverageVerificationError(
             f"Coverage {field} must be timezone-aware"
         )
+    return parsed.astimezone(timezone.utc)
 
 
 def _typed_mappings(rows: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:
@@ -1021,9 +1374,9 @@ def _typed_mappings(rows: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:
             _iso_date(
                 row["source_published_date"], field="source_published_date"
             )
-        _timestamp(row["available_at"], field="available_at")
+        available_at = _timestamp(row["available_at"], field="available_at")
         _timestamp(row["fetched_at"], field="fetched_at", optional=False)
-        _timestamp(
+        decision_cutoff = _timestamp(
             row["decision_cutoff_utc"], field="decision_cutoff_utc"
         )
         if row["cutoff_eligible"] not in {"true", "false"}:
@@ -1052,6 +1405,23 @@ def _typed_mappings(rows: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:
         ):
             raise EvidenceCoverageVerificationError(
                 "Date-only coverage mapping invents or omits time evidence"
+            )
+        if row["time_precision"] == "minute" and (
+            available_at is None
+            or available_at.second != 0
+            or available_at.microsecond != 0
+        ):
+            raise EvidenceCoverageVerificationError(
+                "Minute-precision coverage mapping invents seconds"
+            )
+        if (
+            eligible
+            and available_at is not None
+            and decision_cutoff is not None
+            and available_at > decision_cutoff
+        ):
+            raise EvidenceCoverageVerificationError(
+                "Coverage occurrence is later than its claimed cutoff"
             )
         typed.append(
             {
@@ -1421,6 +1791,53 @@ def _criteria_from_summary(summary: Mapping[str, Any]) -> EvidenceReadinessCrite
     return criteria
 
 
+def _verify_portable_recomputation(
+    root: Path,
+    *,
+    summary: Mapping[str, Any],
+    inputs: Mapping[str, Any],
+    stock_reference: Mapping[str, Any],
+    mapping_rows: Sequence[Mapping[str, str]],
+    split_rows: Sequence[Mapping[str, str]],
+    monthly_rows: Sequence[Mapping[str, str]],
+    missing_rows: Sequence[Mapping[str, str]],
+) -> EvidenceCoverageComputation:
+    records = _read_evidence_records(root)
+    stock, config = _read_stock_calendar(root)
+    _verify_record_sources(records, inputs)
+    _verify_stock_calendar_reference(stock, stock_reference)
+    criteria = _criteria_from_summary(summary)
+    try:
+        recomputed = compute_evidence_coverage(
+            records,
+            stock,
+            config,
+            criteria=criteria,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvidenceCoverageVerificationError(
+            "Coverage records and calendar cannot be recomputed safely"
+        ) from exc
+    expected = _sorted_computation_tables(recomputed)
+    contracts = (
+        (mapping_rows, expected[0], _MAPPING_FIELDS, "session mappings"),
+        (split_rows, expected[1], _SPLIT_FIELDS, "split coverage"),
+        (monthly_rows, expected[2], _MONTHLY_FIELDS, "monthly coverage"),
+        (missing_rows, expected[3], _MISSING_FIELDS, "missing intervals"),
+    )
+    for observed, expected_rows, fields, label in contracts:
+        if list(observed) != _csv_formatted_rows(expected_rows, fields):
+            raise EvidenceCoverageVerificationError(
+                f"Coverage {label} differ from portable record/calendar recomputation"
+            )
+    for field, expected_value in recomputed.summary.items():
+        if summary.get(field) != expected_value:
+            raise EvidenceCoverageVerificationError(
+                "Coverage final summary differs from portable recomputation"
+            )
+    return recomputed
+
+
 def _verify_semantics(
     root: Path,
     *,
@@ -1428,11 +1845,23 @@ def _verify_semantics(
     completion: Mapping[str, Any],
     summary: Mapping[str, Any],
     quality: Mapping[str, Any],
+    inputs: Mapping[str, Any],
+    stock_reference: Mapping[str, Any],
 ) -> tuple[int, dict[str, str]]:
     mapping_rows = _read_csv(root, "evidence_session_mappings.csv", _MAPPING_FIELDS)
     split_rows = _read_csv(root, "split_coverage.csv", _SPLIT_FIELDS)
     monthly_rows = _read_csv(root, "monthly_coverage.csv", _MONTHLY_FIELDS)
     missing_rows = _read_csv(root, "missing_intervals.csv", _MISSING_FIELDS)
+    _verify_portable_recomputation(
+        root,
+        summary=summary,
+        inputs=inputs,
+        stock_reference=stock_reference,
+        mapping_rows=mapping_rows,
+        split_rows=split_rows,
+        monthly_rows=monthly_rows,
+        missing_rows=missing_rows,
+    )
     mappings = _typed_mappings(mapping_rows)
     splits = _typed_split_rows(split_rows, mappings)
     _verify_monthly_rows(monthly_rows, mappings, splits)
@@ -1461,6 +1890,14 @@ def _verify_semantics(
         "monthly_rows": len(monthly_rows),
         "missing_interval_rows": len(missing_rows),
     }
+    expected_quality_checks = {
+        "separate_evidence_populations": True,
+        "conservative_date_only_mapping": True,
+        "precision_aware_interval_mapping": True,
+        "portable_record_calendar_recomputation": True,
+        "split_specific_coverage": True,
+        "announcement_only_ready_guard": True,
+    }
     if (
         summary.get("schema_version") != EVIDENCE_COVERAGE_SCHEMA_VERSION
         or summary.get("algorithm_version")
@@ -1488,6 +1925,7 @@ def _verify_semantics(
         or quality.get("table_counts") != table_counts
         or quality.get("profile_input_counts") != profile_counts
         or quality.get("readiness") != recalculated
+        or quality.get("checks") != expected_quality_checks
         or quality.get("academic_disclaimer") != ACADEMIC_DISCLAIMER
     ):
         raise EvidenceCoverageVerificationError(
@@ -1506,31 +1944,13 @@ def _verify_semantics(
 
 
 def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVerification:
-    try:
-        root_status = root.lstat()
-    except OSError as exc:
-        raise EvidenceCoverageVerificationError(
-            "Evidence-coverage run root is missing"
-        ) from exc
-    if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
-        raise EvidenceCoverageVerificationError(
-            "Evidence-coverage run root must be a real directory"
-        )
-    if root_status.st_mode & 0o077:
-        raise EvidenceCoverageVerificationError(
-            "Evidence-coverage run root permissions are not private"
-        )
+    verify_pack_modes(
+        root,
+        error_type=EvidenceCoverageVerificationError,
+        label="Evidence-coverage",
+    )
     names: list[str] = []
     for item in root.iterdir():
-        mode = item.lstat().st_mode
-        if not stat.S_ISREG(mode):
-            raise EvidenceCoverageVerificationError(
-                "Evidence-coverage packs may contain only regular files"
-            )
-        if mode & 0o077:
-            raise EvidenceCoverageVerificationError(
-                "Evidence-coverage artifact permissions are not private"
-            )
         names.append(item.name)
     if set(names) != set(_ALL_FILES) or len(names) != len(_ALL_FILES):
         raise EvidenceCoverageVerificationError(
@@ -1651,15 +2071,21 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         )
     input_sha = sha256_file(root / "input_evidence_reference.json")
     stock_sha = sha256_file(root / "stock_artifact_reference.json")
+    records_sha = sha256_file(root / "normalized_evidence.jsonl")
+    calendar_sha = sha256_file(root / "stock_calendar.json")
     fingerprint = _sha256_bytes(
         _canonical_bytes({"input_references": inputs, "stock_reference": stock})
     )
     if (
         manifest.get("input_evidence_reference_sha256") != input_sha
         or manifest.get("stock_artifact_reference_sha256") != stock_sha
+        or manifest.get("normalized_evidence_sha256") != records_sha
+        or manifest.get("stock_calendar_sha256") != calendar_sha
         or manifest.get("input_fingerprint_sha256") != fingerprint
         or summary.get("input_evidence_reference_sha256") != input_sha
         or summary.get("stock_artifact_reference_sha256") != stock_sha
+        or summary.get("normalized_evidence_sha256") != records_sha
+        or summary.get("stock_calendar_sha256") != calendar_sha
     ):
         raise EvidenceCoverageVerificationError(
             "Evidence-coverage input references differ from their seals"
@@ -1670,6 +2096,8 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         completion=completion,
         summary=summary,
         quality=quality,
+        inputs=inputs,
+        stock_reference=stock,
     )
     return EvidenceCoverageRunVerification(
         run_id=run_id,
@@ -1685,7 +2113,11 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
 def verify_evidence_coverage_pack(
     run_directory: str | Path,
 ) -> EvidenceCoverageRunVerification:
-    candidate = Path(run_directory)
+    candidate = reject_symlink_components(
+        run_directory,
+        error_type=EvidenceCoverageVerificationError,
+        label="Evidence-coverage run path",
+    )
     try:
         metadata = candidate.lstat()
     except OSError as exc:
@@ -1723,12 +2155,12 @@ def publish_evidence_coverage_run(
     selected_id = validate_evidence_coverage_run_id(
         run_id or make_evidence_coverage_run_id(instant)
     )
-    root_candidate = Path(output_root)
-    if root_candidate.is_symlink():
-        raise ValueError("Coverage output root cannot be a symlink")
-    root_candidate.mkdir(parents=True, exist_ok=True)
-    root = root_candidate.resolve(strict=True)
-    _require_ignored_if_inside_repository(root, Path(repository_root))
+    root = prepare_output_root(
+        output_root,
+        repository_root=repository_root,
+        error_type=ValueError,
+        label="Coverage output root",
+    )
     destination = root / selected_id
     if os.path.lexists(destination):
         raise EvidenceCoverageRunCollisionError(
@@ -1748,39 +2180,21 @@ def publish_evidence_coverage_run(
             raise EvidenceCoverageVerificationError(
                 "Coverage source-reference counts contradict the computation"
             )
+        _verify_record_sources(computation.source_records, normalized_inputs)
+        record_payloads = [record.to_dict() for record in computation.source_records]
+        _assert_hygiene(record_payloads)
         _write_json(staging / "input_evidence_reference.json", normalized_inputs)
         _write_json(staging / "stock_artifact_reference.json", normalized_stock)
+        _write_evidence_jsonl(
+            staging / "normalized_evidence.jsonl",
+            computation.source_records,
+        )
+        calendar = _stock_calendar_document(computation)
+        _assert_hygiene(calendar)
+        _write_json(staging / "stock_calendar.json", calendar)
 
-        profile_order = {
-            name: index for index, name in enumerate(EVIDENCE_COVERAGE_PROFILES)
-        }
-        period_order = {name: index for index, name in enumerate(AUDIT_PERIODS)}
-        mappings = sorted(
-            (item.to_dict() for item in computation.mapping_rows),
-            key=lambda item: str(item["evidence_id"]),
-        )
-        split_rows = sorted(
-            (item.to_dict() for item in computation.split_rows),
-            key=lambda item: (
-                profile_order.get(str(item["profile"]), 999),
-                period_order.get(str(item["split"]), 999),
-            ),
-        )
-        monthly_rows = sorted(
-            (item.to_dict() for item in computation.monthly_rows),
-            key=lambda item: (
-                profile_order.get(str(item["profile"]), 999),
-                period_order.get(str(item["split"]), 999),
-                str(item["month"]),
-            ),
-        )
-        missing_rows = sorted(
-            (item.to_dict() for item in computation.missing_intervals),
-            key=lambda item: (
-                profile_order.get(str(item["profile"]), 999),
-                period_order.get(str(item["split"]), 999),
-                str(item["start_date"]),
-            ),
+        mappings, split_rows, monthly_rows, missing_rows = (
+            _sorted_computation_tables(computation)
         )
         for value in (mappings, split_rows, monthly_rows, missing_rows):
             _assert_hygiene(value)
@@ -1825,6 +2239,8 @@ def publish_evidence_coverage_run(
             "checks": {
                 "separate_evidence_populations": True,
                 "conservative_date_only_mapping": True,
+                "precision_aware_interval_mapping": True,
+                "portable_record_calendar_recomputation": True,
                 "split_specific_coverage": True,
                 "announcement_only_ready_guard": True,
             },
@@ -1834,6 +2250,8 @@ def publish_evidence_coverage_run(
 
         input_sha = sha256_file(staging / "input_evidence_reference.json")
         stock_sha = sha256_file(staging / "stock_artifact_reference.json")
+        records_sha = sha256_file(staging / "normalized_evidence.jsonl")
+        calendar_sha = sha256_file(staging / "stock_calendar.json")
         final_summary = dict(_sanitize(dict(computation.summary)))
         final_summary.update(
             {
@@ -1848,6 +2266,8 @@ def publish_evidence_coverage_run(
                 "table_counts": table_counts,
                 "input_evidence_reference_sha256": input_sha,
                 "stock_artifact_reference_sha256": stock_sha,
+                "normalized_evidence_sha256": records_sha,
+                "stock_calendar_sha256": calendar_sha,
             }
         )
         _assert_hygiene(final_summary)
@@ -1871,6 +2291,8 @@ def publish_evidence_coverage_run(
             "readiness_status_by_profile": statuses,
             "input_evidence_reference_sha256": input_sha,
             "stock_artifact_reference_sha256": stock_sha,
+            "normalized_evidence_sha256": records_sha,
+            "stock_calendar_sha256": calendar_sha,
             "input_fingerprint_sha256": _sha256_bytes(
                 _canonical_bytes(
                     {
@@ -1910,6 +2332,11 @@ def publish_evidence_coverage_run(
         }
         # This non-circular completion marker is intentionally written last.
         _write_json(staging / "completion.json", completion)
+        make_pack_private(
+            staging,
+            error_type=EvidenceCoverageVerificationError,
+            label="Evidence-coverage",
+        )
         _verify_root(staging, expected_run_id=selected_id)
         publication_inventory = artifact_inventory(
             staging, expected_files=sorted(_ALL_FILES)
@@ -1925,14 +2352,10 @@ def publish_evidence_coverage_run(
                 f"Evidence-coverage run already exists: {selected_id}"
             ) from exc
         published = True
-        os.chmod(destination, 0o700)
-        for artifact in destination.iterdir():
-            os.chmod(artifact, 0o600)
-        verify_evidence_coverage_pack(destination)
         return destination
     finally:
-        if not published and staging.exists():
-            shutil.rmtree(staging)
+        if not published:
+            remove_staging_tree(staging, output_root=root)
 
 
 __all__ = [

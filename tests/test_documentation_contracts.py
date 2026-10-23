@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
+
+import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +32,14 @@ CONTINUATION_DOCUMENTS = (
     "docs/FREE_PLAN_WORKFLOW.md",
     "docs/CODEX_PROMPT_LIBRARY.md",
 )
+CONTINUATION_LINK_DOCUMENTS = ("README.md", *CONTINUATION_DOCUMENTS)
+CERTIFIED_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-02"
+HISTORICAL_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-01"
+ALLOWED_ACTIONS = {
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": 3,
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": 2,
+    "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1": 1,
+}
 
 
 def _read(relative_path: str) -> str:
@@ -36,6 +48,241 @@ def _read(relative_path: str) -> str:
 
 def _normalized(value: str) -> str:
     return re.sub(r"[\s>]+", " ", value).strip().lower()
+
+
+def _markdown_section(document: str, heading: str) -> str:
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*$\n(?P<body>.*?)(?=^## |\Z)",
+        document,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"missing Markdown section: {heading}"
+    return match.group("body")
+
+
+def _markdown_prose(document: str) -> str:
+    """Return Markdown with fenced code blocks and HTML comments removed."""
+    prose: list[str] = []
+    fence: tuple[str, int] | None = None
+    in_comment = False
+    for raw_line in document.splitlines():
+        if fence is not None:
+            closing = re.match(r"^\s*(`{3,}|~{3,})\s*$", raw_line)
+            if (
+                closing
+                and closing.group(1)[0] == fence[0]
+                and len(closing.group(1)) >= fence[1]
+            ):
+                fence = None
+            continue
+
+        line = ""
+        remainder = raw_line
+        while remainder:
+            if in_comment:
+                comment_end = remainder.find("-->")
+                if comment_end < 0:
+                    remainder = ""
+                    break
+                remainder = remainder[comment_end + 3 :]
+                in_comment = False
+                continue
+            comment_start = remainder.find("<!--")
+            if comment_start < 0:
+                line += remainder
+                break
+            line += remainder[:comment_start]
+            remainder = remainder[comment_start + 4 :]
+            in_comment = True
+
+        opening = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if opening:
+            token = opening.group(1)
+            fence = (token[0], len(token))
+            continue
+        if fence is None:
+            prose.append(line)
+    return "\n".join(prose)
+
+
+def _github_heading_anchors(document: str) -> set[str]:
+    anchors: set[str] = set()
+    occurrences: dict[str, int] = {}
+    prose = _markdown_prose(document)
+    for match in re.finditer(r"^#{1,6}\s+(.+?)\s*#*\s*$", prose, re.MULTILINE):
+        title = re.sub(r"<[^>]+>", "", match.group(1))
+        title = re.sub(r"[`*_~]", "", title).lower()
+        base = re.sub(r"[^\w\s-]", "", title)
+        base = re.sub(r"\s+", "-", base.strip())
+        suffix = occurrences.get(base, 0)
+        occurrences[base] = suffix + 1
+        anchors.add(base if suffix == 0 else f"{base}-{suffix}")
+    return anchors
+
+
+def _local_markdown_targets(relative_path: str) -> tuple[tuple[Path, str], ...]:
+    source = REPOSITORY_ROOT / relative_path
+    targets: list[tuple[Path, str]] = []
+    pattern = re.compile(
+        r"(?<!!)\[[^\]]+\]\("
+        r"(?P<target><[^>]+>|[^\s)]+)"
+        r"(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)"
+    )
+    document = _markdown_prose(source.read_text(encoding="utf-8"))
+    for match in pattern.finditer(document):
+        destination = match.group("target").strip("<>")
+        if destination.startswith(("http://", "https://", "mailto:", "tel:")):
+            continue
+        path_text, separator, fragment = destination.partition("#")
+        if not path_text:
+            target = source.resolve()
+        else:
+            decoded = unquote(path_text)
+            assert not Path(decoded).is_absolute(), (
+                f"{relative_path} uses an absolute local link: {destination}"
+            )
+            target = (source.parent / decoded).resolve()
+        try:
+            target.relative_to(REPOSITORY_ROOT.resolve())
+        except ValueError as error:
+            raise AssertionError(
+                f"{relative_path} link escapes the repository: {destination}"
+            ) from error
+        targets.append((target, unquote(fragment) if separator else ""))
+    return tuple(targets)
+
+
+def _has_prohibited_git_directive(document: str) -> bool:
+    patterns = (
+        r"\b(?:work|edit|commit|push)\s+(?:directly\s+)?(?:on|to)\s+`?main`?\b",
+        r"\b(?:work|edit|commit|push)\s+`?main`?\s+directly\b",
+        r"\bautomatically\s+merge(?:\s+(?:it|the\s+pr|this\s+pr))?\b",
+        r"\bmerge(?:\s+(?:it|the\s+pr|this\s+pr))?\s+automatically\b",
+        r"\benable\s+auto-merge\b",
+        r"\bgit\s+(?:switch|checkout)\b[^\n.;]*\bmain\b",
+        r"\bgit\s+push\b[^\n.;]*\bmain\b",
+        r"\bgh\s+pr\s+merge\b",
+    )
+    safe_qualifiers = ("do not", "never", "must not")
+    # Prompt-library instructions intentionally live in fenced text blocks, so
+    # scan the complete document rather than the prose-only link surface.
+    normalized = _normalized(document).replace("*", "")
+    clauses = re.split(
+        r"(?<=[.!?;])\s+|\s*[;,]\s*(?:but|however)\s+|\s+but\s+|"
+        r"\s*,?\s+(?:and\s+)?then\s+|\s+yet\s+",
+        normalized,
+    )
+    for clause in clauses:
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause):
+                prefix = clause[: match.start()]
+                if not any(qualifier in prefix for qualifier in safe_qualifiers):
+                    return True
+    return False
+
+
+def _has_unsafe_authority_claim(document: str, artifact_id: str) -> bool:
+    normalized = _normalized(_markdown_prose(document)).replace("`", "").replace("*", "")
+    escaped_id = re.escape(artifact_id.lower())
+    patterns = (
+        rf"{escaped_id}(?:\s+(?:run|result|artifact))?\s+"
+        rf"(?:is|remains|became|becomes)\s+(?:now\s+)?(?:the\s+)?"
+        rf"(?:authoritative|certified|current)\b",
+        rf"\b(?:authoritative|certified|current)(?:\s+(?:run|result|artifact))?"
+        rf"\s*(?::|=|-|\bis\b)\s*{escaped_id}\b",
+        rf"{escaped_id}[^.!?]*[.!?]\s*"
+        rf"(?:it|this|that)(?:\s+(?:run|result|artifact))?\s+"
+        rf"(?:is|remains|became|becomes)\s+(?:now\s+)?(?:the\s+)?"
+        rf"(?:authoritative|certified|current)\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in patterns):
+        return True
+
+    # Also reject looser claims later in the same sentence, such as
+    # "..., but is also authoritative". A locally negated classification
+    # ("not the certified result") remains valid historical wording.
+    for artifact_match in re.finditer(escaped_id, normalized):
+        sentence_tail = re.split(r"[.!?]", normalized[artifact_match.end() :], maxsplit=1)[0]
+        for classification in re.finditer(
+            r"\b(?:authoritative|certified|current)\b", sentence_tail
+        ):
+            prefix = sentence_tail[: classification.start()]
+            locally_negated = re.search(
+                r"\b(?:not|never)\s+(?:(?:the|a|an)\s+)?$", prefix
+            )
+            if locally_negated is None:
+                return True
+    return False
+
+
+def _contains_secret_interpolation(value: str) -> bool:
+    return (
+        re.search(
+            r"\$\{\{[^}]*\b(?:secrets\s*(?:\.|\[)|"
+            r"github\s*(?:\.token\b|\[\s*['\"]token['\"]\s*\]))",
+            value,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _has_prohibited_safety_claim(document: str) -> bool:
+    normalized = _normalized(document).replace("*", "")
+    patterns = (
+        r"\b(?:is|are|constitutes?|provides?)\s+"
+        r"(?:personalized\s+|professional\s+)?financial advice\b",
+        r"\b(?:may|can|should|must)\s+(?:safely\s+)?"
+        r"(?:overwrite|reuse)\b[^.;]*\b(?:existing\s+)?(?:artifact|run)\s+ids?\b",
+        r"\b(?:existing\s+)?(?:artifact|run)\s+ids?\s+"
+        r"(?:may|can|should|must)\s+be\s+(?:overwritten|reused)\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            prefix = normalized[: match.start()]
+            if re.search(r"\b(?:not|never)\s+$", prefix):
+                continue
+            return True
+    return False
+
+
+def _workflow_run_lines(job: dict[str, object]) -> set[str]:
+    commands: set[str] = set()
+    for step in job.get("steps", []):
+        if not isinstance(step, dict) or "run" not in step:
+            continue
+        commands.update(
+            line.strip()
+            for line in str(step["run"]).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return commands
+
+
+def _nested_yaml_keys(value: object) -> tuple[str, ...]:
+    keys: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            keys.append(str(key))
+            keys.extend(_nested_yaml_keys(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            keys.extend(_nested_yaml_keys(nested))
+    return tuple(keys)
+
+
+def _nested_yaml_strings(value: object) -> tuple[str, ...]:
+    strings: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            strings.append(str(key))
+            strings.extend(_nested_yaml_strings(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            strings.extend(_nested_yaml_strings(nested))
+    elif value is not None:
+        strings.append(str(value))
+    return tuple(strings)
 
 
 def _artifact_gate() -> str:
@@ -663,6 +910,195 @@ def test_continuation_documents_are_discoverable_and_cover_the_handoff() -> None
     assert "`PAISA-RM-013` only when `G3-NEWS-OVERLAP` opens" in final_report
 
 
+def test_continuation_markdown_links_and_fragments_resolve() -> None:
+    checked_targets = 0
+    checked_fragments = 0
+    for relative_path in CONTINUATION_LINK_DOCUMENTS:
+        targets = _local_markdown_targets(relative_path)
+        for target, fragment in targets:
+            checked_targets += 1
+            assert target.exists(), f"{relative_path} links to missing {target}"
+            if fragment:
+                checked_fragments += 1
+                assert target.is_file(), (
+                    f"{relative_path} fragment target is not a file: {target}"
+                )
+                anchors = _github_heading_anchors(target.read_text(encoding="utf-8"))
+                assert fragment.lower() in anchors, (
+                    f"{relative_path} links to missing fragment #{fragment} in {target}"
+                )
+
+    assert checked_targets >= 10
+    assert checked_fragments >= 1
+    assert _github_heading_anchors(
+        "```bash\n# fake anchor\n```\n<!-- ## hidden anchor -->\n## Real anchor\n"
+    ) == {"real-anchor"}
+    assert _github_heading_anchors(
+        "````text\n# fake anchor\n```\n## still fake\n````\n## Real anchor\n"
+    ) == {"real-anchor"}
+    assert _github_heading_anchors(
+        "~~~~text\n# fake anchor\n~~~\n## still fake\n~~~~\n## Real anchor\n"
+    ) == {"real-anchor"}
+    assert _github_heading_anchors(
+        "```html\n<!--\n```\n## Live heading\n-->\n"
+    ) == {"live-heading"}
+
+
+def test_project_state_preserves_canonical_research_boundaries() -> None:
+    raw_state = _read("docs/PROJECT_STATE_2026-10-24.md")
+    state = _normalized(raw_state)
+    merged = _normalized(_markdown_section(raw_state, "Merged milestone pull requests"))
+    active = _normalized(_markdown_section(raw_state, "Active and open work"))
+
+    assert CERTIFIED_LSTM_RUN_ID.lower() in state
+    assert "certified `pass` result" in state
+    assert state.count(HISTORICAL_LSTM_RUN_ID.lower()) == 1
+    assert "immutable pre-hardening history, not the certified result" in state
+    assert not _has_unsafe_authority_claim(raw_state, HISTORICAL_LSTM_RUN_ID)
+    assert _has_unsafe_authority_claim(
+        f"`{HISTORICAL_LSTM_RUN_ID}` run is authoritative.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+    assert _has_unsafe_authority_claim(
+        f"Authoritative result: `{HISTORICAL_LSTM_RUN_ID}`.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+    assert _has_unsafe_authority_claim(
+        f"The authoritative result is `{HISTORICAL_LSTM_RUN_ID}`.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+    assert _has_unsafe_authority_claim(
+        f"`{HISTORICAL_LSTM_RUN_ID}` remains immutable pre-hardening history, "
+        "not the certified result, but is also authoritative.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+    assert _has_unsafe_authority_claim(
+        f"`{HISTORICAL_LSTM_RUN_ID}` is immutable history, "
+        "not certified and authoritative.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+    assert _has_unsafe_authority_claim(
+        f"`{HISTORICAL_LSTM_RUN_ID}` is historical. It is now authoritative.",
+        HISTORICAL_LSTM_RUN_ID,
+    )
+
+    assert "common 184-date test intersection" in state
+    assert "shared project holdout, not a globally untouched test" in state
+    assert "globally untouched 184-date test" not in state
+
+    assert (
+        "| ogdc vertical slice | `vsl-20261020-ogdc-main-02` | completed `pass`"
+        in state
+    )
+    assert "vsl-20261020-ogdc-main-01" not in state
+
+    assert "| #15 | `cf897e1` | contemporaneous historical evidence |" in merged
+    assert (
+        "| #16 | `d7015cb` | price-only lstm experiments and certified evidence |"
+        in merged
+    )
+    assert "pr #15" not in active
+    assert "pr #16 is merged" in active
+    assert "pr #16 is open" not in active
+    assert "pr #16" not in active.replace("pr #16 is merged", "")
+
+    assert "no model portfolio beats buy-and-hold" in state
+    assert "neither beats `m-002` or buy-and-hold" in state
+    for contradiction in (
+        "m-002 beats buy-and-hold",
+        "m-005 beats buy-and-hold",
+        "m-006 beats buy-and-hold",
+        "model portfolios outperform buy-and-hold",
+    ):
+        assert contradiction not in state
+
+    assert "every canonical evidence-coverage profile reports zero eligible sessions" in state
+    assert "article sentiment therefore cannot yet be joined" in state
+    assert "daily aggregation and price-plus-sentiment work must stay blocked" in state
+    assert "daily sentiment aggregation is unblocked" not in state
+    assert "price-plus-sentiment work is ready" not in state
+    assert "historical coverage-v2 packs passed the verifier at their producing revision" in state
+    assert "current schema-`1.1` / coverage-v3 code intentionally does not certify them" in state
+    assert "coverage-v2 packs are current-verifier passes" not in state
+    for historical_coverage_id in (
+        "COVERAGE-20261023-120000-real0002",
+        "COVERAGE-20261023-130000-gdelt0001",
+    ):
+        assert not _has_unsafe_authority_claim(raw_state, historical_coverage_id)
+        expected_historical_row = (
+            f"`{historical_coverage_id}` | immutable coverage-v2 `no_overlap`; "
+            "passed only at its producing revision."
+        ).lower()
+        assert expected_historical_row in raw_state.lower()
+
+    assert "a read-only `/api/v1` validates immutable vertical-slice artifacts" in state
+    assert "the react/typescript/plotly dashboard presents history" in state
+    assert "the certified lstm run remains separate from the" in state
+    assert "there is no fixture-backed read-only lstm" in state
+    assert "api currently serves the certified lstm run" not in state
+    assert "dashboard currently presents the unified six-model" not in state
+
+
+def test_continuation_docs_preserve_immutability_and_safe_git_instructions() -> None:
+    for relative_path in CONTINUATION_DOCUMENTS:
+        document = _read(relative_path)
+        normalized = _normalized(document)
+        assert "not financial advice" in normalized, relative_path
+        assert "immutable" in normalized, relative_path
+        assert not _has_prohibited_git_directive(document), relative_path
+        assert not _has_prohibited_safety_claim(document), relative_path
+
+    prompts = _normalized(_read("docs/CODEX_PROMPT_LIBRARY.md"))
+    limited_workflow = _normalized(_read("docs/FREE_PLAN_WORKFLOW.md"))
+    reproduction = _normalized(_read("docs/REPRODUCTION_COMMANDS.md"))
+    assert "never edit or commit on main" in prompts
+    assert "do not merge automatically" in prompts
+    assert "never work directly on `main`" in limited_workflow
+    assert "merge manually after checks and review" in limited_workflow
+    assert "a collision must fail; do not delete, overwrite, reseal, or relabel" in reproduction
+
+    assert _has_prohibited_git_directive("Work directly on main.")
+    assert _has_prohibited_git_directive("Merge automatically.")
+    assert _has_prohibited_git_directive(
+        "Never work directly on main. Work directly on main."
+    )
+    assert _has_prohibited_git_directive(
+        "Never work directly on main, but work directly on main."
+    )
+    assert _has_prohibited_git_directive("Edit main directly.")
+    assert _has_prohibited_git_directive("Automatically merge the PR.")
+    assert _has_prohibited_git_directive("git switch main")
+    assert _has_prohibited_git_directive("git push origin main")
+    assert _has_prohibited_git_directive("gh pr merge --auto")
+    assert _has_prohibited_git_directive(
+        "```text\nEdit main directly.\ngh pr merge --auto\n```"
+    )
+    assert _has_prohibited_git_directive(
+        "Never work directly on main and then git switch main."
+    )
+    assert _has_prohibited_git_directive(
+        "Do not merge automatically and then gh pr merge --auto."
+    )
+    assert _has_prohibited_git_directive(
+        "Complete the manual checklist and then gh pr merge --auto."
+    )
+    assert not _has_prohibited_git_directive(
+        "Never edit or commit on main. Do not merge automatically."
+    )
+    assert _has_prohibited_git_directive(
+        "Do not merge automatically. Merge automatically."
+    )
+    assert _has_prohibited_safety_claim("PAISA results are financial advice.")
+    assert _has_prohibited_safety_claim(
+        "Existing artifact IDs may be overwritten."
+    )
+    assert _has_prohibited_safety_claim("You can reuse existing run IDs.")
+    assert not _has_prohibited_safety_claim(
+        "PAISA results are not financial advice. Do not provide financial advice. "
+        "Never overwrite or reuse existing artifact IDs."
+    )
+
+
 def test_prompt_library_and_limited_usage_workflow_cover_every_stage() -> None:
     prompts = _normalized(_read("docs/CODEX_PROMPT_LIBRARY.md"))
     for heading in (
@@ -728,27 +1164,123 @@ def test_reproduction_runbook_covers_required_commands_and_parses_as_shell() -> 
 
 
 def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
-    workflow = _read(".github/workflows/ci.yml")
-    action_references = re.findall(r"uses:\s+([^\s#]+)", workflow)
+    workflow_text = _read(".github/workflows/ci.yml")
+    workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+    assert isinstance(workflow, dict)
 
-    assert action_references
-    assert all(re.search(r"@[0-9a-f]{40}$", value) for value in action_references)
-    assert "cache: pip" in workflow
-    assert "cache: npm" in workflow
-    assert "python -m pip check" in workflow
-    assert "python -m compileall -q src scripts tests" in workflow
-    assert "python -m pytest --ignore=tests/test_documentation_contracts.py" in workflow
-    assert "python -m pytest tests/test_documentation_contracts.py" in workflow
-    assert "npm ci" in workflow
-    assert "npm run test" in workflow
-    assert "npm run lint" in workflow
-    assert "npm run build" in workflow
-    assert 'HF_HUB_OFFLINE: "1"' in workflow
-    assert 'TRANSFORMERS_OFFLINE: "1"' in workflow
-    assert "MPLCONFIGDIR: /tmp/paisa-matplotlib" in workflow
-    assert "${{ runner.temp }}" not in workflow
-    assert "git diff --check" in workflow
-    assert "git diff --exit-code" in workflow
+    triggers = workflow["on"]
+    assert isinstance(triggers, dict)
+    assert set(triggers) == {"pull_request", "push", "workflow_dispatch"}
+    assert triggers["pull_request"] == ""
+    assert triggers["workflow_dispatch"] == ""
+    assert triggers["push"] == {"branches": ["main"]}
+    assert "pull_request_target" not in triggers
+
+    assert workflow["permissions"] == {"contents": "read"}
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    assert set(jobs) == {"python", "documentation-contracts", "frontend"}
+    assert all("permissions" not in job for job in jobs.values())
+
+    action_references = Counter(
+        step["uses"]
+        for job in jobs.values()
+        for step in job["steps"]
+        if "uses" in step
+    )
+    assert action_references == Counter(ALLOWED_ACTIONS)
+
+    checkout_reference = next(
+        action for action in ALLOWED_ACTIONS if action.startswith("actions/checkout@")
+    )
+    for job_name, job in jobs.items():
+        checkout_steps = [
+            step
+            for step in job["steps"]
+            if step.get("uses") == checkout_reference
+        ]
+        assert len(checkout_steps) == 1, f"{job_name} must have exactly one checkout"
+        assert checkout_steps[0].get("with") == {"persist-credentials": "false"}
+
+    python_job = jobs["python"]
+    docs_job = jobs["documentation-contracts"]
+    frontend_job = jobs["frontend"]
+    assert python_job["env"]["HF_HUB_OFFLINE"] == "1"
+    assert python_job["env"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert python_job["env"]["MPLCONFIGDIR"] == "/tmp/paisa-matplotlib"
+    assert docs_job["env"]["HF_HUB_OFFLINE"] == "1"
+    assert docs_job["env"]["TRANSFORMERS_OFFLINE"] == "1"
+
+    python_setup = next(
+        step
+        for step in python_job["steps"]
+        if step.get("uses", "").startswith("actions/setup-python@")
+    )
+    docs_setup = next(
+        step
+        for step in docs_job["steps"]
+        if step.get("uses", "").startswith("actions/setup-python@")
+    )
+    node_setup = next(
+        step
+        for step in frontend_job["steps"]
+        if step.get("uses", "").startswith("actions/setup-node@")
+    )
+    assert python_setup["with"]["cache"] == "pip"
+    assert docs_setup["with"]["cache"] == "pip"
+    assert node_setup["with"]["cache"] == "npm"
+
+    required_commands = {
+        "python": {
+            "python -m pip install --upgrade pip",
+            "python -m pip install -r requirements.txt",
+            "python -m pip install --no-deps -e .",
+            "python -m pip check",
+            "python -m compileall -q src scripts tests",
+            "python -m pytest --ignore=tests/test_documentation_contracts.py",
+            "git diff --check",
+            "git diff --exit-code",
+        },
+        "documentation-contracts": {
+            "python -m pip install -r requirements-dev.txt",
+            "python -m pytest tests/test_documentation_contracts.py",
+            "git diff --check",
+            "git diff --exit-code",
+        },
+        "frontend": {
+            "npm ci",
+            "npm run test",
+            "npm run lint",
+            "npm run build",
+            "git diff --check",
+            "git diff --exit-code",
+        },
+    }
+    all_commands: set[str] = set()
+    for job_name, expected in required_commands.items():
+        actual = _workflow_run_lines(jobs[job_name])
+        assert actual == expected, (
+            f"{job_name} command drift: missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+        all_commands.update(actual)
+
+    nested_keys = _nested_yaml_keys(workflow)
+    nested_strings = _nested_yaml_strings(workflow)
+    assert "continue-on-error" not in nested_keys
+    assert "if" not in nested_keys
+    assert "shell" not in nested_keys
+    assert "pull_request_target" not in nested_keys
+    assert not any(_contains_secret_interpolation(value) for value in nested_strings)
+    assert _contains_secret_interpolation("${{secrets.PRIVATE_TOKEN}}")
+    assert _contains_secret_interpolation("${{ secrets.PRIVATE_TOKEN }}")
+    assert _contains_secret_interpolation("${{ secrets['PRIVATE_TOKEN'] }}")
+    assert _contains_secret_interpolation("${{ github.token }}")
+    assert _contains_secret_interpolation("${{ github['token'] }}")
+    assert not any(
+        value.lower() in {"write", "write-all"} for value in nested_strings
+    )
+    assert "${{ runner.temp }}" not in nested_strings
 
     for forbidden in (
         "requirements-lstm.txt",
@@ -759,4 +1291,4 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
         "run_ogdc_vertical_slice.py",
         "run_lstm_price_only_experiments.py",
     ):
-        assert forbidden not in workflow
+        assert not any(forbidden in command for command in all_commands)

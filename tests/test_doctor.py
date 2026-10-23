@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts import doctor
+
+
+def _package_spec(package_root: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        origin=str(package_root / "__init__.py"),
+        submodule_search_locations=[str(package_root)],
+    )
 
 
 def test_node_version_contract_matches_frontend_engine_range() -> None:
@@ -55,7 +63,7 @@ def test_dependency_check_inspects_specs_without_importing_optional_modules(
 
     def finder(module: str) -> object | None:
         requested_modules.append(module)
-        return object() if module == "paisa" else None
+        return _package_spec(tmp_path / "src" / "paisa") if module == "paisa" else None
 
     def runner(
         command: tuple[str, ...], cwd: Path
@@ -83,6 +91,60 @@ def test_dependency_check_inspects_specs_without_importing_optional_modules(
         for item in diagnostics
         if item.subject == "optional workflow: FinBERT sentiment inference"
     ).level == "WARN"
+
+
+def test_dependency_check_accepts_paisa_from_the_inspected_checkout(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "src" / "paisa"
+
+    diagnostics = doctor.check_python_dependencies(
+        tmp_path,
+        runner=lambda command, _cwd: subprocess.CompletedProcess(
+            command,
+            0,
+            "No broken requirements found.\n",
+            "",
+        ),
+        finder=lambda module: _package_spec(package_root) if module == "paisa" else None,
+        version_reader=lambda _distribution: "0.1.0",
+    )
+
+    paisa = next(
+        item for item in diagnostics if item.subject == "Python module: paisa"
+    )
+    assert paisa.level == "OK"
+    assert paisa.detail == "installed (0.1.0)"
+
+
+def test_dependency_check_rejects_paisa_from_a_different_checkout(
+    tmp_path: Path,
+) -> None:
+    inspected_checkout = tmp_path / "inspected"
+    foreign_package_root = tmp_path / "other-checkout" / "src" / "paisa"
+
+    diagnostics = doctor.check_python_dependencies(
+        inspected_checkout,
+        runner=lambda command, _cwd: subprocess.CompletedProcess(
+            command,
+            0,
+            "No broken requirements found.\n",
+            "",
+        ),
+        finder=lambda module: (
+            _package_spec(foreign_package_root) if module == "paisa" else None
+        ),
+        version_reader=lambda _distribution: "0.1.0",
+    )
+
+    paisa = next(
+        item for item in diagnostics if item.subject == "Python module: paisa"
+    )
+    assert paisa.level == "FAIL"
+    assert "resolved outside inspected checkout" in paisa.detail
+    assert str(foreign_package_root) in paisa.detail
+    assert str(inspected_checkout / "src" / "paisa") in paisa.detail
+    assert "python -m pip install --no-deps -e ." in doctor.next_commands(diagnostics)
 
 
 def test_requirement_constraints_reject_an_installed_version_outside_bounds(

@@ -263,6 +263,65 @@ def _distribution_version(distribution: str, reader: VersionReader) -> str:
         return "version metadata unavailable"
 
 
+def _resolved_spec_paths(spec: object, repository_root: Path) -> tuple[Path, ...]:
+    """Return the local paths that define an import spec without importing it."""
+
+    raw_paths: list[str] = []
+    origin = getattr(spec, "origin", None)
+    if isinstance(origin, str) and origin not in {"built-in", "frozen"}:
+        raw_paths.append(origin)
+
+    search_locations = getattr(spec, "submodule_search_locations", None)
+    if search_locations is not None:
+        try:
+            raw_paths.extend(
+                str(location) for location in search_locations if location is not None
+            )
+        except TypeError:
+            # A malformed or synthetic spec should fail the origin check below rather
+            # than make the read-only diagnostic crash.
+            pass
+
+    resolved_paths: list[Path] = []
+    for raw_path in raw_paths:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = repository_root / candidate
+        resolved = candidate.resolve()
+        if resolved not in resolved_paths:
+            resolved_paths.append(resolved)
+    return tuple(resolved_paths)
+
+
+def _paisa_checkout_resolution(
+    spec: object,
+    repository_root: Path,
+) -> tuple[bool, str]:
+    """Verify that ``paisa`` resolves from the checkout being diagnosed."""
+
+    expected_package_root = (repository_root / "src" / "paisa").resolve()
+    resolved_paths = _resolved_spec_paths(spec, repository_root)
+    if not resolved_paths:
+        return (
+            False,
+            f"import location unavailable; expected under {expected_package_root}",
+        )
+
+    foreign_paths = tuple(
+        path for path in resolved_paths if not path.is_relative_to(expected_package_root)
+    )
+    if foreign_paths:
+        locations = ", ".join(str(path) for path in foreign_paths)
+        return (
+            False,
+            f"resolved outside inspected checkout: {locations}; "
+            f"expected under {expected_package_root}",
+        )
+
+    locations = ", ".join(str(path) for path in resolved_paths)
+    return True, f"resolved from inspected checkout: {locations}"
+
+
 def _requirement_lines(path: Path, seen: set[Path] | None = None) -> list[str]:
     resolved = path.resolve()
     visited = seen if seen is not None else set()
@@ -393,14 +452,24 @@ def check_python_dependencies(
         )
 
     for module, distribution in REQUIRED_MODULES:
-        available = finder(module) is not None
+        spec = finder(module)
+        available = spec is not None
         detail = (
             f"installed ({_distribution_version(distribution, version_reader)})"
             if available
             else "missing"
         )
+        level = "OK" if available else "FAIL"
+        if module == "paisa" and spec is not None:
+            belongs_to_checkout, resolution_detail = _paisa_checkout_resolution(
+                spec,
+                repository_root,
+            )
+            if not belongs_to_checkout:
+                level = "FAIL"
+                detail = f"{detail}; {resolution_detail}"
         diagnostics.append(
-            Diagnostic("OK" if available else "FAIL", f"Python module: {module}", detail)
+            Diagnostic(level, f"Python module: {module}", detail)
         )
 
     optional_presence: dict[str, bool] = {}

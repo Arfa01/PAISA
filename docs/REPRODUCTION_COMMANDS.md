@@ -31,7 +31,9 @@ fail; do not delete, overwrite, reseal, or relabel an earlier run.
 
 The default environment contains the backend, baseline/boosted model stack,
 backtesting, and test dependencies. It intentionally excludes TensorFlow,
-FinBERT, and the optional `pypsx-toolkit` provider.
+FinBERT, and the optional `pypsx-toolkit` provider. The development-only
+PyYAML dependency supports structural GitHub Actions policy tests; it is not a
+runtime dependency of the PAISA API or research pipelines.
 
 ```bash
 python3 -m venv .venv

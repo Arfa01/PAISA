@@ -218,31 +218,36 @@ Acceptance gate: one comparison report records the ordered feature sets and
 proves matched dates and assumptions; inconclusive or negative results are
 reported without promotion language.
 
-### 6. Execute and certify the price-only LSTM comparison
+### 6. Preserve and interpret the certified price-only LSTM comparison
 
-**Experiment framework implemented; real-run evidence pending.** The controlled
-workflow freezes two price-only variants: `M-005` is a 20-session, 64-unit LSTM
-with dropout `0.20`; `M-006` keeps that sequence length and hidden width while
-using stronger dropout and recurrent regularization. Both consume the same
-frozen daily OGDC source and target-date split evidence. Learned preprocessing
-is fit on training data only. Historical rows from immediately before a split
-may supply context, but validation/test targets never train or select model
-parameters.
+**Completed and certified.** Run `LSTM-20261024-OGDC-price-only-01` executed on
+CPU from clean source commit `eb28ea53ffd69032f4b1109be127e23f1ddcc140`
+with Python 3.13 and TensorFlow 2.21. It reproduced the canonical 834/182/184
+train/validation/test sequence counts. Both variants trained for 7 epochs and
+recorded best validation epoch 1.
 
-The canonical sequence contract expects 834/182/184
-train/validation/test examples. Validation evidence selects and reports the
-preferred variant; test evidence is produced only after that choice is frozen.
-The shared backtest comparison must preserve the same target dates, policy,
-execution rules, fees, initial cash, and independent portfolio ledgers. Follow
+Validation preferred `M-005` (`0.479280` balanced accuracy) over `M-006`
+(`0.474931`). After that choice was frozen, the common 184-date test reported
+`M-005` at `0.520087` and `M-006` at `0.544251`. `M-006` exceeded the best
+`M-001`–`M-004` baseline test balanced accuracy, `M-002` at `0.524459`, but
+that post-freeze evidence must not be used to relabel it as the selected
+variant or to tune another configuration.
+
+The model portfolios ended at PKR 96,359.29 (-3.64071%) for `M-005` and PKR
+96,110.91 (-3.88909%) for `M-006`. Neither beat buy-and-hold at PKR 106,247.89
+(+6.24789%) or the best baseline model portfolio, `M-002`, at PKR 105,987.04
+(+5.98704%). The acceptance checks passed, including 1,014 backend tests, 57
+frontend tests, frontend lint/build, dependency, bytecode-compilation, and diff
+checks. The checksum-inventoried artifacts remain local and ignored by Git;
+their generated `final_summary.json` is authoritative. These results are an
+academic simulation, not financial advice. Follow
 [`LSTM_SEQUENCE_CONTRACT.md`](LSTM_SEQUENCE_CONTRACT.md) and
 [`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md).
 
-Acceptance gate: run TensorFlow on CPU or Colab GPU (with Apple Metal optional),
-retain one immutable M-005/M-006 experiment, and pass checksum,
-prediction-schema, leakage, common-date, and backtest validation. Cross-device
-results are not required to be bit-identical. Do not record a run ID, preferred
-variant, metric, or return in planning prose; the generated
-`final_summary.json` is authoritative after execution.
+Future reruns must use a new immutable run ID and preserve the same leakage,
+selection, common-date, policy, fee, and independent-ledger contracts. A new
+device or seed is a new experiment; cross-device results are not expected to be
+bit-identical.
 
 ### 7. SHAP explanations
 

@@ -131,6 +131,23 @@ experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
 
+The accepted local LSTM run is `LSTM-20261024-OGDC-price-only-01`. It was
+executed on CPU from clean source commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140` with Python 3.13 and TensorFlow
+2.21 and produced 834/182/184 train/validation/test sequences. Both variants
+trained for 7 epochs and recorded best validation epoch 1. Validation preferred
+`M-005` at `0.479280` balanced accuracy over `M-006` at `0.474931`. On the
+post-freeze common 184-date test, `M-005` scored `0.520087` and `M-006` scored
+`0.544251`; the latter exceeded all four baseline test balanced accuracies
+(best: `M-002`, `0.524459`) but is not the validation-selected variant.
+
+The `M-005` and `M-006` portfolios ended at PKR 96,359.29 (-3.64071%) and PKR
+96,110.91 (-3.88909%), respectively. Neither beat buy-and-hold at PKR
+106,247.89 (+6.24789%) or the best baseline model portfolio, `M-002`, at PKR
+105,987.04 (+5.98704%). The run's generated checksum-inventoried artifacts are
+local and ignored by Git; `final_summary.json` remains authoritative. These
+results are an academic simulation, not financial advice.
+
 The accepted local RSS run `NEWS-20261022-131242-5ddffd2d` is final
 non-fixture evidence for this foundation: one source, `30` raw and `30`
 normalized occurrences, `29` cross-run duplicates, `1` OGDC-linked
@@ -965,11 +982,11 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    `available_at <= decision_cutoff`.
 2. Keep the current price-only feature set as the control; prepare paired
    price-only and price-plus-sentiment configurations with identical splits.
-3. Execute and certify the frozen price-only M-005/M-006 comparison first. Use
-   validation evidence to select/report the preferred variant and evaluate test
-   evidence only post-freeze. After the sentiment coverage gate passes, train
-   paired price-only and price-plus-sentiment experiments without using test
-   results for selection.
+3. Preserve the certified `LSTM-20261024-OGDC-price-only-01` evidence and its
+   validation-only selection decision. Do not promote `M-006` from its stronger
+   post-freeze test balanced accuracy. After the sentiment coverage gate passes,
+   train paired price-only and price-plus-sentiment experiments without using
+   test results for selection.
 4. Add SHAP result views only after Waqas exposes a validated artifact/API
    schema; explain model behavior, not causality.
 5. Extend dashboard components and client schemas without recalculating backend
@@ -989,8 +1006,9 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    the retained real-run artifacts and audit sample before implementing
    leakage-safe daily aggregation with the
    `available_at <= decision_cutoff` rule.
-4. Review and operate the price-only M-005/M-006 workflow behind the current
-   prediction and artifact contracts; develop the separate
+4. Review the certified local M-005/M-006 run against the current prediction
+   and artifact contracts, and operate future runs only under new immutable
+   IDs; develop the separate
    relationship/knowledge-graph component only after its contract is written.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
    and `src/paisa/api/router_v1.py` additively for news, sentiment,
@@ -1093,8 +1111,10 @@ python scripts/train_ogdc_models.py \
   --prices artifacts/vertical_slice/VSL-20261020-OGDC-main-02/input_snapshot/psx_prices.csv \
   --run-id "$PAISA_NEW_TRAINING_RUN_ID"
 
-# Optional TensorFlow price-only comparison. M-005 and M-006 both use the
-# frozen OGDC evidence; validation selects/reports and test is post-freeze.
+# Optional TensorFlow price-only comparison. The accepted run is
+# LSTM-20261024-OGDC-price-only-01; the command below is for a new run ID only.
+# M-005 and M-006 both use the frozen OGDC evidence; validation selects/reports
+# and test is post-freeze.
 # CPU and Colab GPU are supported, Apple Metal is optional, and results are not
 # promised to be bit-identical across devices.
 python -m pip install -r requirements-lstm.txt
@@ -1153,6 +1173,13 @@ That review also reported frontend `57 passed`, passing lint/build,
 `pip check`, `compileall`, and `git diff --check origin/main...HEAD`. Do not
 present those counts as validation of later changes; report the exact results
 from the checkout actually tested.
+
+The later certified LSTM source commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140` completed with `1014 passed` in
+the backend, `57 passed` in the frontend, and passing frontend lint/build,
+`pip check`, bytecode compilation, and diff checks. Those are the accepted
+counts for that clean source commit; future changes require their own exact
+verification.
 
 Report the exact pass/fail/skip counts and warnings, branch and commit, generated
 artifact IDs, assumptions, known limitations, and any contract changes. Keep

@@ -548,6 +548,22 @@ On the canonical frozen split, the sequence contract produces 834 training,
 182 validation, and 184 test examples. Validation results select and report the
 preferred variant; the test set is evaluated only after that choice is frozen.
 
+The certified CPU run `LSTM-20261024-OGDC-price-only-01`, executed from clean
+source commit `eb28ea53ffd69032f4b1109be127e23f1ddcc140` with Python 3.13 and
+TensorFlow 2.21, reproduced those 834/182/184 counts. Both variants trained for
+7 epochs and recorded best validation epoch 1. Validation therefore preferred
+`M-005` (`0.479280` balanced accuracy) over `M-006` (`0.474931`). On the
+post-freeze, common 184-date test set, `M-005` scored `0.520087` and `M-006`
+scored `0.544251`; `M-006` exceeded all `M-001`–`M-004` test balanced
+accuracies (the best baseline was `M-002` at `0.524459`), but that post-freeze
+result does not make it the validation-selected variant.
+
+The corresponding model portfolios ended at PKR 96,359.29 for `M-005`
+(-3.64071%) and PKR 96,110.91 for `M-006` (-3.88909%). Neither beat the
+buy-and-hold result of PKR 106,247.89 (+6.24789%) or the best baseline model
+portfolio, `M-002`, at PKR 105,987.04 (+5.98704%). These are academic
+simulation results, not financial advice.
+
 Install the default dependencies and run the unified command:
 
 ```bash
@@ -594,8 +610,11 @@ python scripts/run_lstm_price_only_experiments.py \
 
 CPU and Colab GPU execution are supported; Apple Metal is optional. Fixed
 seeds and recorded runtime metadata improve reproducibility, but bit-identical
-results are not promised across devices. Generated `final_summary.json` is the
-authoritative source for the completed run ID and real metrics. See the
+results are not promised across devices. The certified run's generated,
+Git-ignored directory remains local; its `final_summary.json` is the
+authoritative source for its metrics. Post-run verification reported 1,014
+passing backend tests, 57 passing frontend tests, passing frontend lint/build,
+and passing dependency, bytecode-compilation, and diff checks. See the
 [LSTM runbook](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md), [sequence
 contract](docs/LSTM_SEQUENCE_CONTRACT.md), and [training-stage
 documentation](docs/model_training_stage.md).
@@ -989,9 +1008,11 @@ v0 is considered successful when:
 The price-only OGDC vertical slice, dashboard, additive news ingestion,
 deterministic OGDC linking, article-level FinBERT inference, historical archive
 adapter, reproducible coverage audit, and price-only M-005/M-006 LSTM experiment
-workflow are implemented. The LSTM runbook deliberately does not claim a real
-run ID or metrics before execution; use its generated `final_summary.json` as
-the source of record. Current retained news has no price-period overlap, and
+workflow are implemented. The certified local run
+`LSTM-20261024-OGDC-price-only-01` completed from clean commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140`; its generated, Git-ignored
+`final_summary.json` is the source of record. Current retained news has no
+price-period overlap, and
 the permitted archive cannot retroactively prove historical cutoff
 availability. A licensed overlapping corpus with defensible timing remains the
 gate before daily aggregation or controlled price-plus-sentiment experiments.

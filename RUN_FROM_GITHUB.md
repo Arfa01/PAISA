@@ -492,6 +492,12 @@ production build, `pip check`, `compileall`, and
 `git diff --check origin/main...HEAD`. Always report the counts from the
 checkout actually tested rather than copying these historical numbers.
 
+The later certified LSTM run used clean source commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140`. Its completed checkout validation
+reported `1014 passed` for the backend and `57 passed` for the frontend, with
+frontend lint/build, `pip check`, bytecode compilation, and diff checks also
+passing.
+
 ## 6. Start the API
 
 Activate the environment and set the v1 artifact roots before starting the
@@ -821,9 +827,24 @@ Validation chooses the reported preferred variant, and the test set is
 evaluated only after that choice is frozen.
 
 The workflow supports CPU and Colab GPU. Apple Metal is optional, and no
-bit-identical cross-device result is promised. Read the completed run ID and
-real metrics from the generated `final_summary.json`, not from a documentation
-example. See the [LSTM experiment runbook](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md),
+bit-identical cross-device result is promised. The certified CPU execution is
+`LSTM-20261024-OGDC-price-only-01`, run from clean commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140` with Python 3.13 and TensorFlow
+2.21. It produced 834/182/184 train/validation/test sequences; both variants
+ran for 7 epochs and recorded best validation epoch 1. Validation preferred
+`M-005` at `0.479280` balanced accuracy over `M-006` at `0.474931`.
+
+After that choice was frozen, the common 184-date test scored `M-005` at
+`0.520087` and `M-006` at `0.544251`. `M-006` exceeded all four baseline test
+balanced accuracies (the best was `M-002` at `0.524459`), but it is not the
+validation-selected variant. The `M-005` and `M-006` portfolios ended at PKR
+96,359.29 (-3.64071%) and PKR 96,110.91 (-3.88909%), respectively, below both
+buy-and-hold at PKR 106,247.89 (+6.24789%) and the best baseline model
+portfolio, `M-002`, at PKR 105,987.04 (+5.98704%).
+
+The run directory is generated locally and ignored by Git. Read its
+`final_summary.json` as the authoritative record rather than treating this
+summary as a substitute artifact. See the [LSTM experiment runbook](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md),
 [sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md), and
 [`docs/model_training_stage.md`](docs/model_training_stage.md) for the full
 contract and artifact layout. All outputs are an academic simulation and not

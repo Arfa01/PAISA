@@ -230,10 +230,19 @@ Each execution creates an immutable directory below
 the frozen checksum-verified OGDC input, preprocessing evidence, separate
 M-005/M-006 models and predictions, training history, validation/test
 leaderboards, comparison outputs, checksummed manifest, and
-`final_summary.json`. The generated summary is the authoritative source for the
-real run ID and metrics; this document does not pre-fill them. Saved test
-predictions use the shared record contract and remain direct backtesting inputs,
-with independent portfolio state per model.
+`final_summary.json`. Saved test predictions use the shared record contract and
+remain direct backtesting inputs, with independent portfolio state per model.
+
+The certified local execution is
+`LSTM-20261024-OGDC-price-only-01`, produced on CPU from clean commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140`. Both variants stopped after 7
+epochs; validation selected M-005. On all 184 common untouched-test dates,
+M-005/M-006 balanced accuracy is `0.520087`/`0.544251`. Their fixed-policy
+portfolio returns are `-3.64071%`/`-3.88909%`, versus `+6.24789%` for
+buy-and-hold. M-006 exceeds M-001 through M-004 on fair-date test balanced
+accuracy, but neither LSTM beats buy-and-hold or the best baseline-model
+portfolio. Keep `final_summary.json` as the authoritative full-precision source;
+generated artifacts are local and intentionally ignored by Git.
 
 CPU and Colab GPU are supported. Apple Metal is optional. Seeds, dependencies,
 device, and determinism status are recorded, but bit-identical results are not

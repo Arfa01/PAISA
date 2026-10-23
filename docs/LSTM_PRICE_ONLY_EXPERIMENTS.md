@@ -172,19 +172,81 @@ configuration/architecture, parameter count, training history, predictions,
 metrics, confusion matrix, environment/source provenance, and checksums. The
 run-level manifest binds those files and rejects collisions or later mutation.
 
-## Interpretation and real-run status
+## Certified real run
 
-Report accuracy, balanced accuracy, precision, recall, F1, Matthews correlation
-coefficient, ROC-AUC, Brier score, confusion matrix, and calibration evidence.
-Report portfolio ending value, total return, maximum drawdown, volatility,
-Sharpe ratio, trades, fees, and result versus buy-and-hold separately. Any
-comparison with `M-001` through `M-004` must use persisted identical common
-target dates.
+The retained local run `LSTM-20261024-OGDC-price-only-01` completed with status
+`PASS`. It was produced from clean source commit
+`eb28ea53ffd69032f4b1109be127e23f1ddcc140` on CPU with Python `3.13.7`,
+TensorFlow `2.21.0`, NumPy `2.3.5`, and seed `42`. Generated run artifacts and
+the ZIP are intentionally ignored by Git; the checksum-sealed local directory
+and its `final_summary.json` are the result source of record.
 
-`REAL_RUN_RESULTS_PENDING`: replace this marker only after a completed immutable
-run has passed artifact, prediction-schema, sequence-leakage, save/load, and
-backtester validation. At that point quote the generated `final_summary.json`
-run ID and results; do not infer or pre-fill metrics here.
+The frozen input contains 1,239 OGDC daily sessions from 2021-09-16 through
+2026-09-15 and produces 1,219 labeled technical-feature rows with 19 ordered
+features. Target-date membership is 853/182/184 for
+train/validation/test. The 20-session window retains 834/182/184 sequences:
+the first 19 training targets are reported as dropped, while all validation and
+test targets remain. The retained target ranges are 2021-11-11 through
+2025-03-21, 2025-03-24 through 2025-12-15, and 2025-12-16 through 2026-09-15.
+
+Both one-layer models have 64 recurrent units, a sigmoid output, 21,569
+parameters, Adam at `0.001`, batch size 32, and 50 requested epochs. `M-005`
+uses dropout `0.20`; `M-006` uses dropout `0.40`, recurrent dropout `0.10`, and
+kernel/recurrent L2 `0.0001`. Early stopping completed both fits after 7 epochs,
+with epoch 1 as the best validation checkpoint. Training durations were 2.298
+seconds for M-005 and 3.957 seconds for M-006 on this host. The registered IDs
+are:
+
+- `M-005-1fee47047b61cc43-7a681372-6a908832-a39f-4087-abd8-d70b4d0ebe50`
+- `M-006-67bcc0f398cc963a-7a681372-6a908832-a39f-4087-abd8-d70b4d0ebe50`
+
+### Validation-only selection metrics
+
+The declared validation rule prefers `M-005`. Test and portfolio evidence did
+not change that label.
+
+| Variant | Accuracy | Balanced accuracy | Precision | Recall | F1 | MCC | ROC-AUC | Brier | ECE | Confusion matrix `[[TN, FP], [FN, TP]]` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| M-005 | 0.472527 | 0.479280 | 0.476190 | 0.786517 | 0.593220 | -0.052561 | 0.453425 | 0.262189 | 0.092499 | `[[16, 77], [19, 70]]` |
+| M-006 | 0.472527 | 0.474931 | 0.468468 | 0.584270 | 0.520000 | -0.051383 | 0.446176 | 0.260540 | 0.082305 | `[[34, 59], [37, 52]]` |
+
+### Untouched-test metrics
+
+Each frozen model made one test prediction pass after validation selection was
+recorded.
+
+| Variant | Accuracy | Balanced accuracy | Precision | Recall | F1 | MCC | ROC-AUC | Brier | ECE | Confusion matrix `[[TN, FP], [FN, TP]]` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| M-005 | 0.516304 | 0.520087 | 0.506410 | 0.868132 | 0.639676 | 0.055921 | 0.562094 | 0.250776 | 0.054840 | `[[16, 77], [12, 79]]` |
+| M-006 | 0.543478 | 0.544251 | 0.533333 | 0.615385 | 0.571429 | 0.089395 | 0.557249 | 0.249100 | 0.070173 | `[[44, 49], [35, 56]]` |
+
+All six models share the same 184 test target dates; no model loses a date in
+the fair intersection. On that exact set, balanced accuracy ranks M-006
+`0.544251`, M-002 `0.524459`, M-005 `0.520087`, M-001 `0.512289`, M-003
+`0.506794`, and M-004 `0.492910`. Thus M-006 exceeds every M-001 through M-004
+baseline on this one predefined test metric. This does not replace the
+validation-selected M-005, establish general superiority, or imply that the
+LSTM portfolio performs better.
+
+### Fixed-policy portfolio results
+
+| Variant/reference | Ending value (PKR) | Total return | Max drawdown | Volatility | Sharpe | Trades | Fees (PKR) | Difference vs buy-and-hold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| M-005 | 96,359.29 | -3.64071% | 14.65748% | 12.53449% | -0.342422 | 3 | 146.08 | -9.88860 percentage points |
+| M-006 | 96,110.91 | -3.88909% | 15.46586% | 12.43528% | -0.374556 | 3 | 146.72 | -10.13698 percentage points |
+| Buy-and-hold | 106,247.89 | 6.24789% | — | — | — | — | — | 0 |
+
+Neither LSTM beats buy-and-hold or the best model portfolio. On the same dates
+and rules, M-002 is the best model portfolio at PKR 105,987.04 and 5.98704%,
+still below buy-and-hold by 0.26085 percentage points.
+
+The run-level validator accepted 147 checksum-inventoried payload files. Both
+184-row prediction files use the exact nine-column backtester schema, contain
+finite complementary probabilities, and cover 2025-12-16 through 2026-09-15.
+Reloading each saved bundle reproduced all 182 validation probabilities exactly
+without a second test inference. The complete ZIP passed integrity testing and
+has SHA-256
+`1ad1f9f536c5c40d5c1ef4ca9643644edde4fe8a127fa4152e44c4652e218968`.
 
 One stock, one period, and one trading policy cannot establish general market
 superiority or future performance. Unknown corporate-action adjustment,
@@ -209,5 +271,6 @@ npm run build
 ```
 
 The default test suite must remain offline. TensorFlow smoke training is bounded
-to a tiny fixture and skips only when the optional dependency is absent; a real
-completion claim requires running it in a TensorFlow-enabled environment.
+to a tiny fixture and skips only when the optional dependency is absent. For
+the certified run above, the TensorFlow-enabled full suite completed with 1,014
+passing backend tests; the frontend completed 57 tests plus lint and build.

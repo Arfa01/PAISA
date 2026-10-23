@@ -745,6 +745,8 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
     assert "npm run build" in workflow
     assert 'HF_HUB_OFFLINE: "1"' in workflow
     assert 'TRANSFORMERS_OFFLINE: "1"' in workflow
+    assert "MPLCONFIGDIR: /tmp/paisa-matplotlib" in workflow
+    assert "${{ runner.temp }}" not in workflow
     assert "git diff --check" in workflow
     assert "git diff --exit-code" in workflow
 

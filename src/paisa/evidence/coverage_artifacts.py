@@ -402,12 +402,6 @@ def _csv_formatted_rows(
 def _sanitize_text(value: str) -> str:
     text = _JWT.sub("[REDACTED_JWT]", value)
     text = _FILE_URI.sub("[REDACTED_FILE_URI]", text)
-    text = _EMBEDDED_POSIX_NETWORK_ABSOLUTE.sub(
-        "[REDACTED_ABSOLUTE_PATH]", text
-    )
-    text = _EMBEDDED_POSIX_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
-    text = _EMBEDDED_WINDOWS_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
-    text = _EMBEDDED_WINDOWS_UNC.sub("[REDACTED_ABSOLUTE_PATH]", text)
     parsed = urlsplit(text)
     if parsed.scheme in {"http", "https"} and parsed.hostname:
         host = parsed.hostname
@@ -434,6 +428,12 @@ def _sanitize_text(value: str) -> str:
         return urlunsplit(
             (parsed.scheme, host, parsed.path, query, parsed.fragment)
         )
+    text = _EMBEDDED_POSIX_NETWORK_ABSOLUTE.sub(
+        "[REDACTED_ABSOLUTE_PATH]", text
+    )
+    text = _EMBEDDED_POSIX_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_UNC.sub("[REDACTED_ABSOLUTE_PATH]", text)
     if (
         text.startswith("/")
         or _WINDOWS_ABSOLUTE.match(text)
@@ -483,15 +483,6 @@ def _assert_hygiene(value: Any, *, key: str = "") -> None:
         raise EvidenceCoverageVerificationError(
             "Coverage references contain an absolute file URI"
         )
-    if (
-        _EMBEDDED_POSIX_NETWORK_ABSOLUTE.search(value)
-        or _EMBEDDED_POSIX_ABSOLUTE.search(value)
-        or _EMBEDDED_WINDOWS_ABSOLUTE.search(value)
-        or _EMBEDDED_WINDOWS_UNC.search(value)
-    ):
-        raise EvidenceCoverageVerificationError(
-            "Coverage references contain an embedded absolute host path"
-        )
     parsed = urlsplit(value)
     if parsed.scheme in {"http", "https"}:
         if parsed.username is not None or parsed.password is not None:
@@ -509,6 +500,15 @@ def _assert_hygiene(value: Any, *, key: str = "") -> None:
                     "Coverage references contain a credential query value"
                 )
         return
+    if (
+        _EMBEDDED_POSIX_NETWORK_ABSOLUTE.search(value)
+        or _EMBEDDED_POSIX_ABSOLUTE.search(value)
+        or _EMBEDDED_WINDOWS_ABSOLUTE.search(value)
+        or _EMBEDDED_WINDOWS_UNC.search(value)
+    ):
+        raise EvidenceCoverageVerificationError(
+            "Coverage references contain an embedded absolute host path"
+        )
     if (
         value.startswith("/")
         or _WINDOWS_ABSOLUTE.match(value)

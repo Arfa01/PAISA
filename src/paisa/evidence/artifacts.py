@@ -195,18 +195,6 @@ def _write_json(path: Path, value: Any) -> None:
 def _sanitize_text(value: str) -> str:
     text = _JWT.sub("[REDACTED_JWT]", value)
     text = _FILE_URI.sub("[REDACTED_FILE_URI]", text)
-    text = _EMBEDDED_POSIX_NETWORK_ABSOLUTE.sub(
-        "[REDACTED_ABSOLUTE_PATH]", text
-    )
-    text = _EMBEDDED_POSIX_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
-    text = _EMBEDDED_WINDOWS_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
-    text = _EMBEDDED_WINDOWS_UNC.sub("[REDACTED_ABSOLUTE_PATH]", text)
-    if (
-        text.startswith("/")
-        or _WINDOWS_ABSOLUTE.match(text)
-        or _WINDOWS_UNC.match(text)
-    ):
-        return "[REDACTED_ABSOLUTE_PATH]"
     parsed = urlsplit(text)
     if parsed.scheme in {"http", "https"} and parsed.hostname:
         host = parsed.hostname
@@ -225,6 +213,18 @@ def _sanitize_text(value: str) -> str:
             doseq=True,
         )
         return urlunsplit((parsed.scheme, host, parsed.path, query, parsed.fragment))
+    text = _EMBEDDED_POSIX_NETWORK_ABSOLUTE.sub(
+        "[REDACTED_ABSOLUTE_PATH]", text
+    )
+    text = _EMBEDDED_POSIX_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_ABSOLUTE.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    text = _EMBEDDED_WINDOWS_UNC.sub("[REDACTED_ABSOLUTE_PATH]", text)
+    if (
+        text.startswith("/")
+        or _WINDOWS_ABSOLUTE.match(text)
+        or _WINDOWS_UNC.match(text)
+    ):
+        return "[REDACTED_ABSOLUTE_PATH]"
     return text
 
 

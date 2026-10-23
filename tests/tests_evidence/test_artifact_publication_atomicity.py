@@ -106,6 +106,10 @@ def _manual_result(
             "failed file://server/private/network.csv",
             "failed //server/share/private.csv",
             r"failed \\server\share\private.csv",
+            (
+                "https://www.investegate.co.uk/announcement/rns/"
+                "orcadian-energy--orca/-500-000-equity-financing-tvr-/7947964"
+            ),
         ),
     )
     if duplicate:
@@ -198,6 +202,7 @@ def test_duplicate_id_failure_is_unpublished_and_run_id_is_reusable(
     assert b"file:" not in retained
     assert b"//server/share" not in retained
     assert b"\\\\server\\share" not in retained
+    assert b"equity-financing-tvr-/7947964" in retained
 
 
 def test_copied_evidence_pack_with_public_modes_is_rejected(tmp_path: Path) -> None:

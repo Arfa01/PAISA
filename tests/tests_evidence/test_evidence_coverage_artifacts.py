@@ -142,6 +142,10 @@ def _input_references(
                 "network_file_uri": "file://server/private/evidence.jsonl",
                 "posix_network_path": "//server/share/evidence.jsonl",
                 "unc_path": r"\\server\share\evidence.jsonl",
+                "safe_path_url": (
+                    "https://www.investegate.co.uk/announcement/rns/"
+                    "orcadian-energy--orca/-500-000-equity-financing-tvr-/7947964"
+                ),
                 "source_url": (
                     "https://example.com/archive?token=secret-value&part=1"
                 ),
@@ -331,6 +335,9 @@ def test_publish_verify_private_flat_pack_and_redact_references(
         "[REDACTED_ABSOLUTE_PATH]"
     )
     assert references["inputs"][0]["unc_path"] == "[REDACTED_ABSOLUTE_PATH]"
+    assert references["inputs"][0]["safe_path_url"].endswith(
+        "equity-financing-tvr-/7947964"
+    )
     assert references["inputs"][0]["api_key"] == "[REDACTED]"
 
     with (pack / "evidence_session_mappings.csv").open(

@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "provider": "gdelt-doc",
+  "endpoint": "https://api.gdeltproject.org/api/v2/doc/doc",
+  "query": "(OGDC OR OGDCL OR \"Oil and Gas Development Company\") sourcelang:english",
+  "source_name": "GDELT DOC 2.0",
+  "permission_basis": "Public GDELT DOC 2.0 API metadata access for an academic coverage audit; re-check the current provider terms before every real acquisition.",
+  "licensing_usage_note": "GDELT-released metadata is available for unrestricted use with GDELT citation; linked publisher bodies and images are not fetched or stored.",
+  "attribution_text": "Data source: GDELT Project (https://www.gdeltproject.org/).",
+  "coverage_semantics": "GDELT DOC ArticleList is non-exhaustive, has no pagination, caps responses at maxrecords, and considers at most the last three months of each request; PAISA treats configured bounds as inclusive, expands the API's exclusive bounds by one second, overlaps tiles and splits, deduplicates boundary records, and bisects saturated tiles.",
+  "max_records_per_window": 250,
+  "connect_timeout_seconds": 10,
+  "read_timeout_seconds": 30,
+  "soft_total_timeout_seconds": 45,
+  "max_compressed_bytes": 2097152,
+  "max_decoded_bytes": 8388608,
+  "max_field_characters": 100000,
+  "minimum_interval_seconds": 1,
+  "minimum_window_seconds": 60,
+  "max_split_depth": 20,
+  "max_retries": 2,
+  "max_requests_per_run": 512,
+  "backoff_initial_seconds": 1,
+  "backoff_max_seconds": 30,
+  "user_agent": "PAISA academic historical-news audit/0.1 (+https://github.com/Arfa01/PAISA)",
+  "windows": [
+    {
+      "window_id": "ogdc-full-price-history-2021-09-16-to-2026-09-15",
+      "start_datetime": "2021-09-16T00:00:00Z",
+      "end_datetime": "2026-09-15T23:59:59Z",
+      "enabled": true
+    }
+  ]
+}

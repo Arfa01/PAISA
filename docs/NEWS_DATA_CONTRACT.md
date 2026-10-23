@@ -11,9 +11,9 @@ not contain sentiment, predictions, signals, trades, or financial advice.
 |---|---|---|
 | `schema_version` | string | Exactly `1.0` for this implementation. |
 | `article_id` | string | Immutable occurrence identity derived from the run, provider, and raw evidence identity. |
-| `provider` | string | Adapter identifier such as `rss` or `manual-csv`. |
+| `provider` | string | Adapter identifier such as `rss`, `gdelt-doc`, or `manual-csv`. |
 | `source_name` | string | Publisher/source display name supplied by configuration or input. |
-| `source_type` | string | Source class such as `rss`, `atom`, or `manual_csv`. |
+| `source_type` | string | Source class such as `rss`, `atom`, `gdelt_doc_archive`, or `manual_csv`. |
 | `source_url` | string or null | Provider-extracted URL after surrounding whitespace is removed. RSS/Atom entry links may be relative and are resolved against the configured feed URL. Persisted RSS URL identities redact every query value. |
 | `canonical_url` | string or null | Conservative HTTP(S) canonical form used for deduplication. Invalid or absent URLs remain null and are reported; the source evidence is retained. |
 | `title` | string or null | Unicode- and whitespace-normalized plain text. A missing title is not invented. |
@@ -43,11 +43,23 @@ Every provider result records the provider ID, configured source, acquisition
 time, HTTP status when applicable, response content type, response SHA-256,
 warnings/errors, and data class. Response bytes or imported CSV bytes are
 retained below the immutable run's `raw/` directory. Each extracted row also
-has a JSON evidence file; normalization never replaces that evidence.
+has a JSON evidence file; normalization never replaces that evidence. The raw
+directory is owner-only (`0700`) and every retained capture/index/record file
+is owner-readable and owner-writable only (`0600`); checksums bind content,
+while these filesystem modes limit accidental local disclosure.
 
-`real` means bytes obtained from a configured publisher feed during that run.
-`imported` means PAISA read a user-supplied permitted dataset. `fixture` is
-reserved for deterministic automated tests and is not accepted by the CLI.
+Historical API/manual-import raw evidence also carries the reviewed provider
+subtype and licensing/usage note. GDELT evidence carries the permission basis,
+required attribution, exact bounded query/window, and its original `seendate`;
+manual rows carry the CLI-supplied import note. These fields document the
+reviewed use and provenance but do not grant rights beyond the underlying
+provider or publisher terms.
+
+`real` means bytes obtained from a configured network provider during that run,
+including publisher RSS/Atom feeds and the metadata-only GDELT API. It describes
+the acquisition path, not a licence finding. `imported` means PAISA read a
+user-supplied permitted dataset. `fixture` is reserved for deterministic
+automated tests and is not accepted by the CLI.
 
 ## Canonical URL and content identity
 
@@ -102,6 +114,13 @@ boundary-aware, searches title, summary, then body, and records the alias,
 method (`exact` or `normalized_exact`), location, and confidence. It does not
 perform NER, fuzzy matching, or forced linking.
 
+Each deterministic relationship is persisted in checksum-bound
+`article_entity_links.csv`. Coverage consumers reconcile every normalized
+article's `mentioned_tickers` exactly against those rows, reject incomplete,
+duplicate, or unknown-article link evidence, and retain the exact link rows in
+their OGDC-specific audit output rather than reconstructing an explanation
+from the normalized ticker alone.
+
 ## SQLite persistence
 
 The development database is configurable and defaults to
@@ -117,7 +136,7 @@ does not erase evidence or weaken canonical URL uniqueness. It stores:
 - provider errors; and
 - quality reports.
 
-Schema version 4 is advanced one version at a time in transactions. Every open
+Schema version 6 is advanced one version at a time in transactions. Every open
 verifies `user_version`, the ordered migration ledger, and the expected table,
 index, and trigger definitions; malformed, unversioned nonempty, or newer
 databases are refused rather than stamped as current. Only one `RUNNING` run is

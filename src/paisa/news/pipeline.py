@@ -41,20 +41,35 @@ _SAFE_RUN_ID = re.compile(
     r"^NEWS-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
 _SENSITIVE_CONFIG_KEY = re.compile(
-    r"(?:secret|token|password|credential|api[_-]?key|authorization|cookie)",
+    r"(?:^|[_-])(?:api[_-]?key|access[_-]?(?:key|token)|token|secret|password|"
+    r"credential|authorization|auth|signature|signed|session|cookie|jwt)(?:$|[_-])",
     re.IGNORECASE,
 )
 _URL_USERINFO = re.compile(r"(?i)(https?://)[^/@\s]+@")
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9_-])((?=[A-Za-z0-9_-]*"
-    r"(?:api[-_]?key|access[-_]?key|secret|token|password|credential|"
-    r"authorization|cookie)[A-Za-z0-9_-]*\s*[:=])[A-Za-z][A-Za-z0-9_-]*)"
-    r"(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^&,;]+)"
+    r"(?i)(?<![A-Za-z0-9_-])((?:[A-Za-z0-9]+[-_])*"
+    r"(?:api[-_]?key|access[-_]?(?:key|token)|secret|token|password|credential|"
+    r"authorization|auth|signature|signed|session|cookie|jwt)"
+    r"(?:[-_][A-Za-z0-9]+)*)"
+    r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^&,;]+)"
 )
 _AUTH_TOKEN = re.compile(
     r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+(?:\s+[A-Za-z0-9._~+/=-]+)*"
 )
 _EMBEDDED_HTTP_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_SENSITIVE_QUERY_KEY = re.compile(
+    r"(?:^|[_-])(?:api[_-]?key|access[_-]?(?:key|token)|token|secret|password|"
+    r"credential|authorization|auth|signature|signed|session|cookie|jwt)(?:$|[_-])",
+    re.IGNORECASE,
+)
+_TRACKING_QUERY_KEYS = {
+    "dclid",
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+}
 _NORMALIZED_FIELDS = (
     "schema_version",
     "article_id",
@@ -216,6 +231,29 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_bytes(_json_bytes(value))
 
 
+def _write_private_bytes(path: Path, value: bytes) -> None:
+    """Write restricted raw evidence without depending on the process umask."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # ``mode`` passed to ``os.open`` is still filtered through the process
+        # umask.  Set the descriptor mode explicitly before writing so the
+        # promised private mode is exact even under an unusually strict umask.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(value)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_private_json(path: Path, value: Any) -> None:
+    _write_private_bytes(path, _json_bytes(value))
+
+
 def _atomic_write_json(path: Path, value: Any) -> None:
     """Replace a JSON marker atomically within its existing directory."""
 
@@ -323,16 +361,18 @@ def _redact_sensitive_text(value: str) -> str:
             # The generic secret patterns below still fail closed for
             # malformed URL-shaped text.
             return candidate
-        if not parsed.query:
+        if not parsed.query and not parsed.fragment:
             return candidate
         query = urlencode(
-            [(key, "[REDACTED]") for key, _item in parse_qsl(
-                parsed.query, keep_blank_values=True
-            )]
+            [
+                (key, item)
+                for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+                if not _SENSITIVE_QUERY_KEY.search(key)
+                and not key.casefold().startswith("utm_")
+                and key.casefold() not in _TRACKING_QUERY_KEYS
+            ]
         )
-        return urlunsplit(
-            (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
-        )
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
     redacted = _EMBEDDED_HTTP_URL.sub(redact_query_values, value)
     redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", redacted)
@@ -1513,7 +1553,7 @@ def run_news_pipeline(
             },
         )
         staging = Path(tempfile.mkdtemp(prefix=".pending-", dir=destination))
-        (staging / "raw").mkdir()
+        (staging / "raw").mkdir(mode=0o700)
     except BaseException:
         # Reservation setup happens before the main run cleanup block.  Keep
         # it failure-atomic as well so an I/O error or interruption cannot
@@ -1586,7 +1626,7 @@ def run_news_pipeline(
         for index, capture in enumerate(result.captures, start=1):
             filename = _safe_filename(capture.filename, f"capture-{index}.bin")
             relative = Path("raw") / f"capture-{index:04d}-{filename}"
-            (staging / relative).write_bytes(capture.content)
+            _write_private_bytes(staging / relative, capture.content)
             metadata = capture.metadata_dict()
             metadata["artifact_reference"] = relative.as_posix()
             metadata["observed_sha256"] = _sha256_bytes(capture.content)
@@ -1606,7 +1646,7 @@ def run_news_pipeline(
             relative = Path("raw") / f"record-{index:06d}.json"
             raw_payload = original.metadata_dict()
             raw_payload["storage_raw_record_id"] = storage_raw_id
-            _write_json(staging / relative, raw_payload)
+            _write_private_json(staging / relative, raw_payload)
             raw_index.append(
                 {
                     "raw_record_id": storage_raw_id,
@@ -1628,7 +1668,7 @@ def run_news_pipeline(
                     {"raw_record_id": storage_raw_id, "reason": str(exc)}
                 )
 
-        _write_json(
+        _write_private_json(
             staging / "raw" / "index.json",
             {
                 "schema_version": NEWS_SCHEMA_VERSION,
@@ -1756,8 +1796,9 @@ def run_news_pipeline(
         limitations = (
             "This ingestion output contains no sentiment scores, model predictions, "
             "trading decisions, or financial advice.",
-            "RSS coverage is limited to fields supplied by configured feeds; manual "
-            "CSV rows are imported evidence and are not live acquisitions.",
+            "Coverage is limited to fields supplied by the configured provider; "
+            "GDELT acquisition is metadata-only and manual CSV rows are imported "
+            "evidence rather than live acquisitions.",
         )
         summary = PipelineSummary(
             schema_version=NEWS_SCHEMA_VERSION,

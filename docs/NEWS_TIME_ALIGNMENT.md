@@ -39,6 +39,10 @@ it is not copied into `published_at`.
   source-availability evidence only; it is never copied into `published_at`
   when `<published>` is absent. That case records the warning
   `atom_published_missing_used_updated_as_availability`.
+- For GDELT DOC 2.0, `seendate` is the time GDELT observed the document. It is
+  retained as source-availability evidence and never copied into
+  `published_at`. A later PAISA archive fetch still controls normalized
+  availability through the conservative maximum rule.
 - The raw string and original timezone evidence remain in the raw artifact.
 
 ## Feature-cutoff rule
@@ -63,6 +67,7 @@ Examples:
 | Publication missing, fetched 12:00 UTC | 12:00 | `published_at` null, `available_at` 12:00, missing-time warning. |
 | Source says 23 Oct 09:00 UTC but fetched 22 Oct 12:00 UTC | 22 Oct 12:00 | `available_at` 23 Oct 09:00; it cannot enter a 22 Oct feature. |
 | Date only (`2026-10-22`) | 22 Oct 12:00 | publication time remains null; PAISA does not invent midnight. |
+| GDELT saw an item in 2025; PAISA fetched it in 2026 | 2026 fetch time | `published_at` remains null unless independent source evidence exists; `available_at` is the 2026 fetch time, not the 2025 `seendate`. |
 
 Automated tests cover timezone conversion, missing and naive timestamps,
 future-dated publication evidence, and the inclusive cutoff boundary.

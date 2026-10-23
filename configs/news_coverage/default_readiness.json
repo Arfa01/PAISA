@@ -1,0 +1,12 @@
+{
+  "partial_minimum_all_news_coverage_percent_each_split": 5.0,
+  "partial_minimum_ogdc_coverage_percent_each_split": 1.0,
+  "purpose": "Engineering and data-coverage gates only; not a statistical-power or predictive-value claim.",
+  "ready_maximum_all_news_missing_gap_sessions": 10,
+  "ready_minimum_all_news_coverage_percent_each_split": 80.0,
+  "ready_minimum_available_at_completeness_percent": 100.0,
+  "ready_minimum_distinct_sources": 2,
+  "ready_minimum_ogdc_coverage_percent_each_split": 20.0,
+  "ready_minimum_publication_time_completeness_percent": 95.0,
+  "schema_version": "1.0"
+}

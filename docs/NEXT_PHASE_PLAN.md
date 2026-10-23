@@ -8,15 +8,77 @@ outputs remain academic simulations and are not financial advice.
 
 ### 1. Financial-news ingestion
 
-**Foundation implemented.** PAISA now has explicit RSS/Atom and manual-CSV
-adapters, raw response/import evidence, a versioned normalized record, distinct
-publication/fetch/availability time, deterministic deduplication, local SQLite,
-immutable run packs, and data-quality reports. Network/provider checks remain
-outside the default offline suite and bulk article data remains outside Git.
+**Foundation and historical-coverage audit implemented.** PAISA now has
+explicit RSS/Atom and manual-CSV adapters, raw response/import evidence, a
+versioned normalized record, distinct publication/fetch/availability time,
+deterministic deduplication, local SQLite, immutable run packs, and data-quality
+reports. The reviewed historical path adds a bounded GDELT DOC 2.0 adapter that
+stores returned metadata and source URLs only; it never follows publisher links
+or stores publisher bodies. A manual CSV remains acceptable only when its
+provider, provenance, field-level storage permissions, academic-use basis,
+attribution, and retention/redistribution limits are documented. Network checks
+remain outside the default offline suite and bulk article data remains outside
+Git.
 
-Remaining work is reviewed source expansion, bounded historical provider
-semantics where feeds support them, scheduling, retention/backup policy, and
-production operations. An explicit run is not a continuously updating service.
+The permission decision and candidates are recorded in
+`docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md` and executed through the
+checksum-bound `configs/news/historical_source_permissions.json`. The reusable
+audit in `src/paisa/news/coverage.py` and
+`scripts/audit_news_price_overlap.py` follows
+`docs/NEWS_PRICE_OVERLAP_CONTRACT.md`, uses the immutable stock and split
+manifests, applies `configs/news_coverage/default_readiness.json`, maps only
+`available_at` evidence through the configured session cutoff, and publishes
+collision-refusing `COVERAGE-...` packs. Its readiness labels are engineering
+and data-coverage gates, not evidence of statistical sufficiency or predictive
+value.
+
+The existing `news-price-coverage-v2` preflight at
+`artifacts/news_coverage/COVERAGE-20261023-100000-preflight003/` covers the five
+retained legacy `PASS` Dawn Business ingestion packs: `150` occurrences
+representing `31` canonical articles and `119` duplicate occurrences. It
+contains `1` OGDC-linked canonical article represented by `5` occurrences, and
+no deterministic sector evidence, so energy-sector coverage is explicitly
+unsupported. All records are from Dawn; publication evidence spans 2026-10-19
+through 2026-10-22 and availability is on 2026-10-22. The immutable OGDC price
+evidence contains `1,239` observed sessions from 2021-09-16 through 2026-09-15,
+with exact split counts of `853` train, `182` validation, and `184` test
+sessions. Publication overlap and cutoff-eligible availability overlap are both
+zero, and the readiness status is `NO_OVERLAP`. This preflight predates the
+current coverage completion seal. The planned official RSS artifact is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/` and has not yet been
+published.
+
+The later live metadata-only acquisition
+`NEWS-20261023-060000-gdelt-ogdc2` is a separate sealed `PARTIAL/WARN` pack that
+verifies `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It retained `656` raw and `656`
+normalized unique canonicals, including `42` exact OGDC-linked canonicals across
+`93` returned source domains, with zero rejected records. Every canonical keeps
+`published_at` missing. Its raw GDELT `seendate` range is
+`2023-06-18T12:15:00Z`--`2024-06-14T15:00:00Z`, but conservative `available_at`
+is `2026-10-23T06:26:32.440746Z`--`2026-10-23T06:29:25.858147Z`. The pack is
+partial because it preserves `22` provider errors (`15` `ReadTimeout` failures, `4`
+out-of-window quarantines, and `3` exhausted HTTP 429 responses).
+
+Its `news-price-coverage-v2` preflight
+`COVERAGE-20261023-110000-gdeltpre1` passes source permission and database
+provenance, fails ingestion completeness, reports `null` publication and availability
+calendar-overlap ranges and `0%` coverage for every split/population, and returns
+`NO_OVERLAP`. The planned final artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; it is distinct
+from the planned RSS final
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`.
+
+Remaining work is to publish the two planned official audits without
+overwriting the existing preflights, then obtain permitted, complete,
+sufficiently covered evidence whose availability overlaps the immutable
+price/split period. The current policy permits only the exact retained GDELT run
+`NEWS-20261023-060000-gdelt-ogdc2` under its permission-relevant controls; it is
+incomplete and cannot be backdated for model features, and a future acquisition
+requires a new review and allowlist update. A historical CSV imported now has
+the same timing constraint because the contract uses the later
+acquisition/import time in `available_at`. Scheduling,
+retention/backup policy, and production operations also remain. An explicit run
+is not a continuously updating service.
 
 ### 2. Company and entity linking
 
@@ -70,8 +132,12 @@ output remains a feature source, not a trading signal or an accuracy claim.
 
 ### 4. Daily sentiment aggregation
 
-**Not implemented.** Begin only after the article-level real run and audit
-sample have been reviewed.
+**Not implemented and currently blocked by coverage.** The retained RSS audit
+and the live-GDELT preflight are both `NO_OVERLAP`; the GDELT input also fails
+the ingestion-completeness prerequisite. Do not begin aggregation merely
+because article-level FinBERT output exists. First obtain permitted overlapping
+evidence and pass the configured engineering/data-coverage gates; even
+`READY_FOR_AGGREGATION` would not prove statistical sufficiency.
 
 Aggregate article-level scores by ticker and trading date using only information
 available by the declared feature cutoff. Define after-close and non-trading-day
@@ -149,6 +215,9 @@ the feature date, and tested for ambiguous, conflicting, and expired evidence.
   overwrite `VSL-20261020-OGDC-main-02` or its referenced artifacts.
 - Preserve sentiment model/output identities; never replace results created by
   a different model/tokenizer revision or text-policy configuration.
+- Preserve source-permission evidence and the immutable news-coverage audit;
+  metadata access never grants publisher-body reuse rights, and an import is
+  never relabelled as live acquisition.
 - Keep models, policies, portfolios, APIs, and dashboard presentation separate.
 - Keep bulk data, fitted binaries, secrets, and run outputs out of Git.
 - Document missing data, negative findings, and provider failures explicitly.

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 
 import pytest
 
@@ -40,6 +41,21 @@ def _trusted_storage_root_is_each_test_workspace(tmp_path, monkeypatch):
     """Keep implicit storage-root cases inside their isolated workspace."""
 
     monkeypatch.chdir(tmp_path)
+
+
+def test_private_raw_write_enforces_exact_modes_under_restrictive_umask(
+    tmp_path,
+):
+    target = tmp_path / "raw" / "capture.bin"
+    previous_umask = os.umask(0o777)
+    try:
+        news_pipeline._write_private_bytes(target, CAPTURE_BYTES)
+    finally:
+        os.umask(previous_umask)
+
+    assert target.read_bytes() == CAPTURE_BYTES
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
 class StaticRealProvider:
@@ -235,6 +251,7 @@ class SecretMetadataProvider(StaticRealProvider):
         "nested": {
             "DB_PASSWORD": "db-config-value",
             "MY_ACCESS_TOKEN": "token-config-value",
+            "jwt": "jwt-config-value",
         },
     }
 
@@ -243,7 +260,8 @@ class SecretMetadataProvider(StaticRealProvider):
         secret_source_name = (
             "Publisher X-Api-Key: SOURCESECRET; "
             "DB_PASSWORD=db-metadata-value; "
-            "MY_ACCESS_TOKEN=token-metadata-value"
+            "MY_ACCESS_TOKEN=token-metadata-value; "
+            "jwt=jwt-metadata-value"
         )
         return replace(
             result,
@@ -261,6 +279,7 @@ class SecretMetadataProvider(StaticRealProvider):
                     raw_payload={
                         "password": "PAYLOADSECRET",
                         "AWS_SECRET_ACCESS_KEY": "aws-payload-value",
+                        "jwt": "jwt-payload-value",
                     },
                 ),
             ),
@@ -271,7 +290,9 @@ class QueryValueMetadataProvider(StaticRealProvider):
     def __init__(self) -> None:
         super().__init__()
         self.secret_url = (
-            "https://publisher.example/feed.xml?session=UNNAMEDSECRET&view=full"
+            "https://publisher.example/feed.xml?session=UNNAMEDSECRET&jwt=JWTSECRET"
+            "&view=full"
+            "#access_token=FRAGMENTSECRET"
         )
         self.configured_sources = (
             {
@@ -412,6 +433,13 @@ def test_complete_artifact_tree_inventory_and_raw_preservation(tmp_path):
     captures = list((run_dir / "raw").glob("capture-*-feed.xml"))
     assert len(captures) == 1
     assert captures[0].read_bytes() == CAPTURE_BYTES
+    assert stat.S_IMODE((run_dir / "raw").stat().st_mode) == 0o700
+    assert stat.S_IMODE(captures[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE((run_dir / "raw" / "index.json").stat().st_mode) == 0o600
+    assert (
+        stat.S_IMODE((run_dir / "raw" / "record-000001.json").stat().st_mode)
+        == 0o600
+    )
     raw_record = _read_json(run_dir / "raw" / "record-000001.json")
     assert raw_record["raw_record_id"] == "provider-record-1"
     assert raw_record["raw_payload"]["guid"] == "publisher-guid-1"
@@ -657,16 +685,19 @@ def test_credentials_in_success_metadata_are_redacted_everywhere(tmp_path):
         "aws-config-value",
         "db-config-value",
         "token-config-value",
+        "jwt-config-value",
         "db-metadata-value",
         "token-metadata-value",
+        "jwt-metadata-value",
         "news-record-value",
         "aws-payload-value",
+        "jwt-payload-value",
     ):
         assert secret not in combined
     assert "[REDACTED]" in combined
 
 
-def test_all_url_query_values_are_redacted_from_artifacts_and_database(tmp_path):
+def test_sensitive_url_query_values_are_removed_but_identity_values_remain(tmp_path):
     output = tmp_path / "artifacts"
     database = tmp_path / "news.sqlite3"
     run_id = "NEWS-20261022-100000-query-value-redaction"
@@ -689,10 +720,13 @@ def test_all_url_query_values_are_redacted_from_artifacts_and_database(tmp_path)
         database_text = "\n".join(connection.iterdump())
     combined = artifact_text + database_text
     assert "UNNAMEDSECRET" not in combined
-    assert "view=full" not in combined
+    assert "JWTSECRET" not in combined
+    assert "FRAGMENTSECRET" not in combined
+    assert "view=full" in combined
     assert "publisher.example/feed.xml" in combined
-    assert "session=%5BREDACTED%5D" in combined
-    assert "view=%5BREDACTED%5D" in combined
+    assert "session=" not in combined
+    assert "jwt=" not in combined
+    assert "#access_token=" not in combined
 
 
 @pytest.mark.parametrize(
@@ -737,6 +771,8 @@ def test_cli_reports_controlled_provider_failure_as_nonzero(tmp_path, monkeypatc
             "manual-csv",
             "--input",
             "unused.csv",
+            "--licensing-usage-note",
+            "Licensed academic import for controlled provider-failure test.",
             "--output-dir",
             str(tmp_path / "artifacts"),
             "--database",

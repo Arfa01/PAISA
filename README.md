@@ -28,6 +28,9 @@ proposal and early-v0 context.
 | [News ingestion runbook](docs/NEWS_INGESTION.md) | RSS/manual acquisition, immutable artifacts, quality policy, and reproduction commands. |
 | [News data contract](docs/NEWS_DATA_CONTRACT.md) | Versioned normalized record, provider evidence, deduplication, entity-link, and SQLite semantics. |
 | [News time alignment](docs/NEWS_TIME_ALIGNMENT.md) | Publication/acquisition/availability rules and the future-feature cutoff boundary. |
+| [Historical news source assessment](docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md) | Dated access, permission, storage, attribution, cost, and coverage assessment for candidate archives and import sources. |
+| [Historical news coverage runbook](docs/HISTORICAL_NEWS_COVERAGE.md) | Permitted acquisition/import paths and the reproducible price-overlap audit workflow. |
+| [News-price overlap contract](docs/NEWS_PRICE_OVERLAP_CONTRACT.md) | Checksum validation, cutoff mapping, population/counting rules, artifacts, and configurable readiness states. |
 | [FinBERT sentiment runbook](docs/FINBERT_SENTIMENT.md) | Pinned model/license, deterministic text policy, resource controls, artifacts, and execution commands. |
 | [Sentiment data contract](docs/SENTIMENT_DATA_CONTRACT.md) | Article-level probabilities, model/input identity, immutable artifacts, and SQLite semantics. |
 | [Sentiment time alignment](docs/SENTIMENT_TIME_ALIGNMENT.md) | Inherited news time, decision-cutoff filtering, and future aggregation boundary. |
@@ -46,9 +49,13 @@ proposal and early-v0 context.
 - Baseline RandomForest model.
 - FastAPI endpoints for prices, features, dataset, metrics, and prediction.
 - Pytest tests for pipeline, preprocessing, and API.
-- Separate RSS/Atom and manual-CSV news adapters with immutable raw evidence.
+- Separate RSS/Atom, metadata-only GDELT DOC 2.0, and licensed manual-CSV
+  news adapters with immutable raw evidence and explicit usage notes.
 - Versioned normalized news records, deterministic deduplication, first-stage
   OGDC alias linking, SQLite persistence, and quality/coverage reports.
+- A checksum-validated, immutable news-versus-price coverage audit that maps
+  conservative `available_at` evidence to configurable market cutoffs and
+  reports all-news, OGDC-linked, and supported sector populations separately.
 - Reproducible article-level FinBERT inference with immutable model/tokenizer
   revisions, explicit class mapping, bounded batching, SQLite persistence, and
   leakage-safe availability filtering.
@@ -162,10 +169,48 @@ A permitted local dataset can instead be imported and is always labelled
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /absolute/path/to/news.csv \
+  --licensing-usage-note "Dataset licence and permitted stored fields reviewed on YYYY-MM-DD" \
   --storage-root . \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 ```
+
+The selected automated archive path is the public GDELT DOC 2.0 API in
+metadata-only mode. The example intentionally queries only OGDC. Before any new
+acquisition, review and update the dated source assessment and its companion
+policy, including the assessment checksum and exact run allowlist; then review
+the bounded query windows. The adapter never follows publisher links or stores
+publisher bodies:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --storage-root . \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+GDELT `seendate` is source-observation evidence, not a publisher publication
+time. PAISA still calculates normalized eligibility as the maximum of fetch,
+valid publication, and valid source-availability time. A historical archive
+query made today therefore cannot be backdated into an earlier model cutoff.
+
+The completed live metadata-only acquisition
+`NEWS-20261023-060000-gdelt-ogdc2` is retained separately from the RSS evidence.
+It is a sealed `PARTIAL` run with `WARN` quality and verifies `PASS` with
+`DATABASE_AND_ARTIFACT_BOUND` authority. It preserves `656` raw records and
+`656` normalized, unique canonical records, including `42` exact OGDC-linked
+canonicals across `93` returned source domains, with no duplicates or rejected
+records. All `656` records keep `published_at` missing. Raw GDELT `seendate`
+evidence spans `2023-06-18T12:15:00Z` through `2024-06-14T15:00:00Z`, while
+conservative `available_at` spans `2026-10-23T06:26:32.440746Z` through
+`2026-10-23T06:29:25.858147Z`. The run remains `PARTIAL` because it records
+`22` provider errors: `15` `ReadTimeout` failures, `4` quarantined out-of-window
+responses, and `3` exhausted HTTP 429 responses.
+The permission policy permits this exact run under the reviewed,
+permission-relevant metadata-only controls. It does not grant permission to a
+future run automatically.
 
 After valid argument parsing, the command prints one structured summary and
 creates a collision-refusing `artifacts/news_ingestion/<run_id>/` evidence
@@ -184,12 +229,80 @@ python scripts/verify_news_run.py \
 ```
 
 Omit `--database` only for artifact-only offline replay; that mode verifies the
-retained evidence but is not authoritative proof of committed completion.
+retained evidence but is not authoritative proof of committed completion. The
+coverage audit reports that distinction in `database_provenance`, and a missing
+database fingerprint or a selected legacy pack without a current database-bound
+completion seal prevents an otherwise-ready result from becoming
+`READY_FOR_AGGREGATION`.
 
 See the
 [news runbook](docs/NEWS_INGESTION.md),
 [record contract](docs/NEWS_DATA_CONTRACT.md), and
 [time-alignment contract](docs/NEWS_TIME_ALIGNMENT.md).
+
+## Historical news-price coverage audit
+
+The coverage audit consumes immutable news packs plus the retained OGDC price
+and exact target-split manifests. It does not run sentiment, build a stock
+feature, retrain a model, change a policy/portfolio, or update the dashboard.
+Real mode rejects fixture, mock, test, generated, or synthetic inputs and
+validates declared checksums before calculating coverage. The machine-readable
+permission policy checksum-binds the reviewed assessment, permission-relevant
+provider controls, and any exact allowlisted run identities; unresolved
+decisions cannot support readiness:
+
+```bash
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120012-31d811b1 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120133-43a51981 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-130023-470cb7a7 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-131242-5ddffd2d \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --readiness-config configs/news_coverage/default_readiness.json \
+  --market-timezone Asia/Karachi \
+  --decision-cutoff 15:30:00 \
+  --real-mode \
+  --allow-legacy-unsealed \
+  --output-dir artifacts/news_coverage
+```
+
+The retained five-pack RSS evidence from October 2026 is later than the frozen
+price series, which ends on 2026-09-15. The existing
+`news-price-coverage-v2` preflight
+`COVERAGE-20261023-100000-preflight003` therefore reports `NO_OVERLAP`; fixture
+results never replace that finding. The explicit legacy flag is required
+because these five retained packs predate completion seals. It validates their
+full declared checksum inventories but neither upgrades them to the current
+contract nor resolves source-permission review. The current policy marks RSS
+evidence `REVIEW_REQUIRED`, and the legacy packs remain non-authoritative even
+when the SQLite file is fingerprinted because they lack current database-bound
+completion seals. For current packs, the audit verifies every seal against one
+immutable SQLite online-backup image and fingerprints those same bytes. The
+preflight's checksum-bound `article_session_mappings.csv` carries the exhaustive
+occurrence/population and canonical session assignments needed by a later
+aggregation component. The planned official RSS artifact is reserved as
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it has not yet been
+published. See the [coverage
+runbook](docs/HISTORICAL_NEWS_COVERAGE.md) and
+[overlap contract](docs/NEWS_PRICE_OVERLAP_CONTRACT.md) for the exact session
+mapping, population, artifact, and readiness rules.
+
+The live GDELT pack has a separate `news-price-coverage-v2` preflight,
+`COVERAGE-20261023-110000-gdeltpre1`. Source permission and database provenance
+pass, but ingestion completeness fails because the selected run is `PARTIAL`
+and contains `22` provider errors. Publication and
+availability calendar-overlap ranges are both `null`, every all-news,
+OGDC-linked, and energy population reports `0%` train/validation/test coverage,
+and readiness is `NO_OVERLAP`. The preflight is not the planned final audit:
+the intended final artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. The separate
+planned RSS final is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Neither preflight
+nor either planned final authorizes daily sentiment aggregation.
 
 ## Article-level FinBERT sentiment foundation
 
@@ -645,6 +758,7 @@ PAISA/
 │   ├── news/         # generated local news SQLite database
 │   └── metadata/     # stock universe
 ├── configs/news/     # versioned news-provider examples
+├── configs/news_coverage/ # versioned engineering/readiness thresholds
 ├── docs/
 ├── frontend/         # React + TypeScript read-only results dashboard
 ├── models/           # generated model artifacts
@@ -677,9 +791,12 @@ v0 is considered successful when:
 
 ## Current roadmap
 
-The price-only OGDC vertical slice and dashboard are complete. The additive
-news-ingestion and deterministic OGDC-linking foundation is now implemented;
-FinBERT, daily sentiment aggregation, controlled price-only versus
-price-plus-sentiment experiments, SHAP, and relationship graphs remain future
-work. See [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the current
+The price-only OGDC vertical slice, dashboard, additive news ingestion,
+deterministic OGDC linking, article-level FinBERT inference, historical archive
+adapter, and reproducible coverage audit are implemented. Current retained
+news has no price-period overlap, and the permitted archive cannot retroactively
+prove historical cutoff availability. A licensed overlapping corpus with
+defensible timing remains the gate before daily aggregation or controlled
+price-plus-sentiment experiments. SHAP and relationship graphs also remain
+future work. See [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the
 dependency order.

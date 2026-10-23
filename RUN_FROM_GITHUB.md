@@ -89,9 +89,45 @@ Or import a permitted local dataset, which will be labelled `imported`:
 python scripts/run_news_pipeline.py \
   --provider manual-csv \
   --input /absolute/path/to/news.csv \
+  --licensing-usage-note "Dataset licence and permitted stored fields reviewed on YYYY-MM-DD" \
   --output-dir artifacts/news_ingestion \
   --database data/news/paisa_news.sqlite3
 ```
+
+For bounded historical discovery, PAISA also provides a metadata-only GDELT
+DOC 2.0 adapter. The example intentionally queries only OGDC. Before a future
+acquisition, review and update the dated source assessment and companion policy,
+including the assessment checksum and exact run allowlist, and then review the
+example's query windows:
+
+```bash
+python scripts/run_news_pipeline.py \
+  --provider gdelt-doc \
+  --config configs/news/gdelt_ogdc_history.example.json \
+  --output-dir artifacts/news_ingestion \
+  --database data/news/paisa_news.sqlite3
+```
+
+The adapter uses the fixed official endpoint, rejects redirects, applies
+bounded responses and rate-limit backoff, and never fetches publisher pages.
+It stores metadata only. GDELT observation time is source-availability input,
+not an invented publisher publication time; normalized `available_at` remains
+the latest of fetch, valid publication, and valid source-availability evidence.
+
+The completed live run `NEWS-20261023-060000-gdelt-ogdc2` is sealed
+`PARTIAL/WARN` and verifies `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It contains
+`656` raw and `656` normalized unique canonicals, `42` exact OGDC-linked
+canonicals, `93` returned source domains, zero duplicates, and zero rejected
+records. All `656` records have missing `published_at`. Raw source `seendate`
+evidence spans `2023-06-18T12:15:00Z`--`2024-06-14T15:00:00Z`, but conservative
+`available_at` is the later acquisition-time range
+`2026-10-23T06:26:32.440746Z`--`2026-10-23T06:29:25.858147Z`. Its `PARTIAL`
+status preserves `22` provider errors: `15` `ReadTimeout` failures, `4` quarantined
+out-of-window responses, and `3` exhausted HTTP 429 responses.
+The source-permission policy allowlists this exact run under its reviewed,
+permission-relevant metadata-only controls. A future GDELT acquisition requires
+a new review and explicit allowlist update; the existing decision is not a
+provider-wide permission grant.
 
 After valid argument parsing, one structured result prints the immutable run ID
 and locations. `FAIL` exits non-zero. Existing run IDs are never overwritten,
@@ -99,7 +135,91 @@ provider failures never fall back to fixtures, and generated
 databases/artifacts remain outside Git. See
 [`docs/NEWS_INGESTION.md`](docs/NEWS_INGESTION.md) before configuring a source.
 
-## 4b. Run article-level FinBERT sentiment inference
+## 4b. Audit historical news versus the immutable OGDC price period
+
+The audit validates selected immutable news packs and the retained stock/model
+manifests, reads exact split membership from `split_manifest.json`, and maps
+canonical article availability to the configurable daily decision cutoff. It
+does not aggregate sentiment or change any price/model/portfolio result:
+
+```bash
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120012-31d811b1 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-120133-43a51981 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-130023-470cb7a7 \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261022-131242-5ddffd2d \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --readiness-config configs/news_coverage/default_readiness.json \
+  --market-timezone Asia/Karachi \
+  --decision-cutoff 15:30:00 \
+  --real-mode \
+  --allow-legacy-unsealed \
+  --output-dir artifacts/news_coverage
+```
+
+Real mode is the default and rejects fixture, mock, generated, synthetic, or
+test inputs.
+The explicit legacy flag is needed only for these five pre-completion-seal RSS
+packs; it checks their complete manifest inventories without upgrading their
+contract status or resolving source permission.
+Use a unique `--run-id` when a reproducible external identity is needed; an
+existing directory is never overwritten. The existing RSS preflight
+`COVERAGE-20261023-100000-preflight003` reports `NO_OVERLAP` because the retained
+October 2026 snapshot is later than prices ending on 2026-09-15. The planned
+official RSS artifact is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it has not yet been
+published. This is an engineering/data-coverage determination, not a
+statistical or financial claim.
+The default `--news-database` is fingerprinted, but authority additionally
+requires every selected pack's current completion/database seal. Passing an
+empty value creates artifact-only replay, and the five legacy unsealed packs
+remain non-authoritative even with the database present; either condition
+hard-blocks an otherwise-ready result from `READY_FOR_AGGREGATION`. When a
+database is supplied, one consistent SQLite online-backup image is used for
+every seal check and for the published fingerprint. The resulting
+`article_session_mappings.csv` exhaustively maps every selected occurrence and
+population-specific canonical representative for later aggregation.
+See [`docs/HISTORICAL_NEWS_COVERAGE.md`](docs/HISTORICAL_NEWS_COVERAGE.md),
+[`docs/NEWS_PRICE_OVERLAP_CONTRACT.md`](docs/NEWS_PRICE_OVERLAP_CONTRACT.md),
+and the
+[`source assessment`](docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md).
+
+The completed GDELT acquisition has a separate `news-price-coverage-v2`
+preflight, `COVERAGE-20261023-110000-gdeltpre1`. It passes source permission and
+database provenance, fails ingestion completeness
+because the pack is `PARTIAL` with `22` provider errors, has `null` publication
+and availability calendar-overlap ranges, and reports `0%` coverage for every
+split and population. Its readiness is `NO_OVERLAP`. That preflight is not the
+planned final audit. If the target directory does not already exist, publish
+the final immutable GDELT audit with:
+
+```bash
+python scripts/audit_news_price_overlap.py \
+  --news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json \
+  --readiness-config configs/news_coverage/default_readiness.json \
+  --market-timezone Asia/Karachi \
+  --decision-cutoff 15:30:00 \
+  --real-mode \
+  --output-dir artifacts/news_coverage \
+  --run-id COVERAGE-20261023-130000-gdelt0001
+```
+
+The intended artifact is
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; the distinct
+planned RSS final is
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. Neither planned
+artifact exists yet. Aggregation remains blocked unless a later immutable audit
+satisfies every permission, completeness, provenance, and overlap prerequisite.
+
+## 4c. Run article-level FinBERT sentiment inference
 
 This stage reads canonical normalized articles from one completed news run. It
 does not fetch publishers, aggregate daily sentiment, join stock prices,
@@ -203,7 +323,10 @@ This short snapshot is insufficient for stock-model integration. See
 python -m pytest
 ```
 
-Expected: all collected tests pass. The count will grow as components are added.
+Current validated result: `606 passed, 1 skipped`. The skip is the documented
+retained-artifact integration check that a clean checkout cannot run. The
+frontend separately has `57` passing tests plus passing lint and production
+build; `pip check`, `compileall`, and `git diff --check` also pass.
 
 ## 6. Start the API
 

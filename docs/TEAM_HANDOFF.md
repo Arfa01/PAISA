@@ -83,6 +83,7 @@ python -m pip install -r requirements-sentiment.txt
 | Legacy-cache migration | `src/paisa/legacy_cache.py`, `scripts/migrate_legacy_psx_cache.py` |
 | News acquisition and evidence | `src/paisa/news/`, `scripts/run_news_pipeline.py`, `configs/news/`, `docs/NEWS_*.md` |
 | Historical source and coverage audit | `src/paisa/news/coverage.py`, `src/paisa/news/providers/gdelt_doc.py`, `scripts/audit_news_price_overlap.py`, `configs/news/gdelt_ogdc_history.example.json`, `configs/news/historical_source_permissions.json`, `configs/news_coverage/`, `docs/HISTORICAL_NEWS_*.md`, `docs/NEWS_PRICE_OVERLAP_CONTRACT.md` |
+| Contemporaneous GKG/PSX evidence | `src/paisa/evidence/`, `scripts/run_gdelt_gkg_evidence.py`, `scripts/import_psx_announcements.py`, `scripts/audit_contemporaneous_evidence.py`, `configs/evidence/`, `docs/GDELT_GKG_HISTORICAL_EVIDENCE.md`, `docs/PSX_ANNOUNCEMENT_*.md`, `docs/CONTEMPORANEOUS_EVIDENCE_TIME_POLICY.md` |
 | Article-level sentiment | `src/paisa/sentiment/`, `scripts/run_sentiment_inference.py`, `docs/FINBERT_SENTIMENT.md`, `docs/SENTIMENT_*.md` |
 | FastAPI | `src/paisa/api/main.py`, `src/paisa/api/router_v1.py`, `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py` |
 | React dashboard | `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/api/client.ts`, `frontend/src/api/schemas.ts` |
@@ -121,7 +122,10 @@ Other generated roots are `runs/<experiment_id>/` for standalone backtests,
 `artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
 news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
 audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
-evidence. Never overwrite an existing model, experiment, portfolio, or run ID.
+evidence. Contemporaneous source packs use
+`artifacts/contemporaneous_evidence/<run_id>/`, while four-profile audits use
+`artifacts/evidence_coverage/<run_id>/`. Never overwrite an existing model,
+experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
 
@@ -315,6 +319,344 @@ and an `ok` integrity check. Preserve it and the historical ingestion artifact
 pack, and never describe database compatibility as retroactive artifact
 validation.
 
+### Contemporaneous evidence handoff
+
+This path is separate from GDELT DOC ingestion. GKG uses official raw GKG 2.1
+archives, accepts only `WEB=1`, assigns availability from the batch timestamp
+encoded in `GKGRECORDID`, retains `V2.1DATE` as publication time, verifies
+bounded archives, and never dereferences publisher URLs. The canonical
+post-fix execution covered the official `2026-09-04 09:00`, `09:15`, and
+`09:30` UTC 15-minute partitions inside the requested
+`2025-12-16`--`2026-09-15` interval. This is only three adjacent partitions,
+or 45 minutes, not the full test period. Its three captures contain `2,957`
+scanned and timestamp-valid rows, `0` rejected, `2,957` unmatched, `0` matched,
+and `0` duplicates. Do not describe this check as full historical coverage.
+
+The PSX path is an offline exact-`OGDC` import only. Timed announcements retain
+their official offset-aware posting time. Date-only announcements retain null
+timestamps and are eligible only on the next observed trading session. The
+current reviewed status is `REVIEW_REQUIRED`, no authorized input was supplied,
+and its count remains `0`; do not automate the public pages or weaken the two
+authorization-hash checks.
+
+The evidence types are `gdelt_metadata`, `exchange_announcement`, and
+`publisher_news`. Their separate/combined profiles are `gdelt_gkg_ogdc`,
+`psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+`general_financial_news`. The restored publisher-news run contributes `656`
+general records and `42` exact OGDC-linked combined records, but every profile
+has `0 / 853` train, `0 / 182` validation, and `0 / 184` test overlap. All four
+readiness results are `NO_OVERLAP`; aggregation and downstream model work stay
+blocked. Readiness expresses caller-defined gate satisfaction only, not
+statistical sufficiency, predictive value, or financial merit. These are
+academic simulation results and are not financial advice.
+
+#### Canonical contemporaneous evidence pair
+
+The canonical post-fix pair was produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`. Its private pack directories are
+mode `0700` and files are mode `0600`:
+
+| Pack | Manifest SHA-256 | Payload-inventory SHA-256 | Verification basis |
+|---|---|---|---|
+| `EVID-20261023-175847-822c5685` | `15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4` | `636b096f9bedaed73756c7175b35676555049251c6a3b14f8ed609e960c50888` | `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY` |
+| `ECOV-20261023-175904-be50a499` | `6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250` | `baf14a5d30f60fd7c5fad2d1daa75322007b43e2257e0a1a1ecf498efc23b826` | `PORTABLE_RECORD_CALENDAR_RECOMPUTATION` |
+
+The coverage pack has `656` mapping rows and all four profiles are
+`NO_OVERLAP`. Portable record/calendar recomputation rechecks the sealed
+normalized evidence and stock calendar; it remains explicitly not
+source-archive-bound.
+
+Retain the previous pair as superseded audit evidence; do not modify or delete
+it:
+
+| Superseded pack | Manifest SHA-256 | Payload-inventory SHA-256 |
+|---|---|---|
+| `EVID-20261023-163905-gkgfinal` | `a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e` | `1675a8902f4c0175972392d04a207f09157d034ec1b118eb4c449e2ac9d77e7e` |
+| `ECOV-20261023-164000-final001` | `d4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c` | `e01f33b278bc780d02e74fa5dc88abbba803f12ffc8e90b95562ffb272010e4d` |
+
+The local attempts `EVID-20261023-163553-gkgfinal`,
+`EVID-20261023-213000-gkgraw01`, `EVID-20261023-213500-gkgraw02`, and the
+post-review pre-final `EVID-20261023-175415-5c1b0c48` are also
+noncanonical/superseded. Preserve them in place; never present them as the
+canonical pair.
+
+Before export and again after restore, run this schema-neutral integrity check
+from the repository root. It verifies each known manifest and completion
+identity, the exact private flat-pack file set and modes, the canonical digest
+of the embedded payload inventory, and every inventoried payload size and
+SHA-256 without trying to reinterpret a legacy contract:
+
+```bash
+.venv/bin/python - <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import stat
+from pathlib import Path
+
+expected = {
+    Path("artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685"): (
+        "15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4",
+        "636b096f9bedaed73756c7175b35676555049251c6a3b14f8ed609e960c50888",
+        "7c7c58a7d97e278dbf7ec3411818301ad49509b8ebb48fbdda17c1c769982515",
+    ),
+    Path("artifacts/evidence_coverage/ECOV-20261023-175904-be50a499"): (
+        "6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250",
+        "baf14a5d30f60fd7c5fad2d1daa75322007b43e2257e0a1a1ecf498efc23b826",
+        "d3a98c57d33c36c1d0fa1a41bedfef13b3c5fa32dcfcdae2bb25bccf9991e265",
+    ),
+    Path("artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal"): (
+        "a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e",
+        "1675a8902f4c0175972392d04a207f09157d034ec1b118eb4c449e2ac9d77e7e",
+        "ba95e027fde05175d189e243268360487295ae01d8d0e3309084ae2feed1d742",
+    ),
+    Path("artifacts/evidence_coverage/ECOV-20261023-164000-final001"): (
+        "d4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c",
+        "e01f33b278bc780d02e74fa5dc88abbba803f12ffc8e90b95562ffb272010e4d",
+        "7a7bcdafe3887b712dd468abd0868c7b1836d2ea92bdc2352fd30e4488f98641",
+    ),
+}
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(f"FAIL: {message}")
+
+
+for root, (manifest_sha, inventory_sha, completion_sha) in expected.items():
+    root_stat = root.lstat()
+    require(stat.S_ISDIR(root_stat.st_mode), f"not a real directory: {root}")
+    require(stat.S_IMODE(root_stat.st_mode) == 0o700, f"wrong mode: {root}")
+    observed_names = set()
+    for child in root.iterdir():
+        child_stat = child.lstat()
+        require(stat.S_ISREG(child_stat.st_mode), f"not a regular file: {child}")
+        require(stat.S_IMODE(child_stat.st_mode) == 0o600, f"wrong mode: {child}")
+        observed_names.add(child.name)
+    raw_manifest = (root / "run_manifest.json").read_bytes()
+    require(
+        hashlib.sha256(raw_manifest).hexdigest() == manifest_sha,
+        f"manifest identity differs: {root}",
+    )
+    manifest = json.loads(raw_manifest)
+    inventory = manifest["payload_artifact_inventory"]
+    inventory_paths = [item["path"] for item in inventory]
+    require(
+        all(Path(path).name == path for path in inventory_paths),
+        f"non-flat inventory path: {root}",
+    )
+    require(
+        len(set(inventory_paths)) == len(inventory_paths),
+        f"duplicate inventory path: {root}",
+    )
+    require(
+        manifest["inventory_excludes"] == ["completion.json", "run_manifest.json"],
+        f"unexpected inventory exclusions: {root}",
+    )
+    require(
+        observed_names == set(inventory_paths) | {"completion.json", "run_manifest.json"},
+        f"file set differs: {root}",
+    )
+    canonical_inventory = json.dumps(
+        inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    require(
+        hashlib.sha256(canonical_inventory).hexdigest() == inventory_sha,
+        f"inventory identity differs: {root}",
+    )
+    require(
+        manifest["payload_artifact_inventory_sha256"] == inventory_sha,
+        f"manifest inventory seal differs: {root}",
+    )
+    raw_completion = (root / "completion.json").read_bytes()
+    require(
+        hashlib.sha256(raw_completion).hexdigest() == completion_sha,
+        f"completion identity differs: {root}",
+    )
+    for item in inventory:
+        payload_path = root / item["path"]
+        payload = payload_path.read_bytes()
+        require(len(payload) == item["size_bytes"], f"size differs: {payload_path}")
+        require(
+            hashlib.sha256(payload).hexdigest() == item["sha256"],
+            f"payload identity differs: {payload_path}",
+        )
+    print(f"PASS {root}")
+PY
+```
+
+Use fresh immutable IDs and `--no-resume` for each new GKG acquisition. Never
+reuse an existing pack ID:
+
+```bash
+.venv/bin/python scripts/run_gdelt_gkg_evidence.py \
+  --config configs/evidence/gdelt_gkg_test_subset.json \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence \
+  --run-id "EVID-<UTC-timestamp>-<unique-suffix>" \
+  --no-resume
+
+.venv/bin/python scripts/verify_evidence_run.py \
+  --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
+
+# This fails closed while the policy remains REVIEW_REQUIRED. Run it only after
+# reviewed policy bytes bind both supplied authorization values by SHA-256.
+.venv/bin/python scripts/import_psx_announcements.py \
+  --input /absolute/path/to/authorized-ogdc-announcements.csv \
+  --authorization-attestation-file /absolute/path/to/attestation.txt \
+  --authorization-reference-file /absolute/path/to/authorization-reference.txt \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+
+.venv/bin/python scripts/audit_contemporaneous_evidence.py \
+  --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
+  --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --output-dir artifacts/evidence_coverage \
+  --run-id "ECOV-<UTC-timestamp>-<unique-suffix>"
+
+.venv/bin/python scripts/verify_evidence_coverage.py \
+  --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
+```
+
+The GKG verifier replays the retained raw ZIP members and their semantics. The
+coverage verifier recomputes mappings from the sealed normalized records and
+stock calendar, but it is not source-archive-bound; retain the checksum-bound
+input references with the pack.
+
+Preserve the canonical and retained superseded pairs together. Run the portable
+four-pack integrity check above first. Create the tar only in approved storage
+outside the repository, refuse to replace an existing archive, verify the four
+known manifests before export, and create the checksum sidecar from inside the
+transfer directory so it remains portable:
+
+```bash
+set -euo pipefail
+umask 077
+PAISA_EVIDENCE_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+PAIR_ARCHIVE_NAME="PAISA-contemporaneous-evidence-20261023.tar.gz"
+PAIR_ARCHIVE="$PAISA_EVIDENCE_TRANSFER_DIR/$PAIR_ARCHIVE_NAME"
+
+if test -L "$PAISA_EVIDENCE_TRANSFER_DIR"; then
+  printf 'ERROR: transfer directory cannot be a symlink: %s\n' \
+    "$PAISA_EVIDENCE_TRANSFER_DIR" >&2
+  exit 1
+fi
+mkdir -p "$PAISA_EVIDENCE_TRANSFER_DIR"
+chmod 700 "$PAISA_EVIDENCE_TRANSFER_DIR"
+test ! -e "$PAIR_ARCHIVE" && test ! -L "$PAIR_ARCHIVE"
+test ! -e "$PAIR_ARCHIVE.sha256" && test ! -L "$PAIR_ARCHIVE.sha256"
+
+printf '%s  %s\n' \
+  '15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4' \
+  'artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685/run_manifest.json' \
+  '6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250' \
+  'artifacts/evidence_coverage/ECOV-20261023-175904-be50a499/run_manifest.json' \
+  'a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e' \
+  'artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal/run_manifest.json' \
+  'd4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c' \
+  'artifacts/evidence_coverage/ECOV-20261023-164000-final001/run_manifest.json' \
+  | shasum -a 256 -c -
+
+COPYFILE_DISABLE=1 tar -czf "$PAIR_ARCHIVE" \
+  artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685 \
+  artifacts/evidence_coverage/ECOV-20261023-175904-be50a499 \
+  artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal \
+  artifacts/evidence_coverage/ECOV-20261023-164000-final001
+chmod 600 "$PAIR_ARCHIVE"
+
+(
+  cd "$PAISA_EVIDENCE_TRANSFER_DIR"
+  shasum -a 256 "$PAIR_ARCHIVE_NAME" > "$PAIR_ARCHIVE_NAME.sha256"
+)
+chmod 600 "$PAIR_ARCHIVE.sha256"
+```
+
+Restore only into a checkout where all four exact target directories are
+absent. Never merge an archive into an existing pack. Verify the transferred
+archive checksum, then use the committed restore helper. The helper accepts
+only the exact four checksum-bound pack manifests and their sealed inventory,
+rejects every duplicate, unexpected, traversal, absolute, link, and special
+member, extracts regular files into private staging, verifies the staged
+canonical packs, and atomically publishes each expected root without
+replacement. It never extracts an untrusted tar directly into the checkout.
+Afterward, run the current semantic verifiers against the canonical pair:
+
+Publication is an explicit sequence of four atomic no-replace renames because
+portable filesystems do not offer one atomic multi-directory transaction. The
+helper preflights every destination again immediately before publication. If a
+concurrent process creates a later destination, the helper preserves any
+earlier verified pack already committed, refuses to replace the collision, and
+reports failure; inspect the reported repository state before retrying.
+
+```bash
+set -euo pipefail
+umask 077
+PAISA_EVIDENCE_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"
+PAIR_ARCHIVE_NAME="PAISA-contemporaneous-evidence-20261023.tar.gz"
+PAIR_ARCHIVE="$PAISA_EVIDENCE_TRANSFER_DIR/$PAIR_ARCHIVE_NAME"
+
+if test -L "$PAISA_EVIDENCE_TRANSFER_DIR" \
+  || ! test -d "$PAISA_EVIDENCE_TRANSFER_DIR" \
+  || test -L "$PAIR_ARCHIVE" \
+  || ! test -f "$PAIR_ARCHIVE" \
+  || test -L "$PAIR_ARCHIVE.sha256" \
+  || ! test -f "$PAIR_ARCHIVE.sha256"; then
+  printf 'ERROR: transfer inputs must be regular files in a real directory\n' >&2
+  exit 1
+fi
+
+(
+  cd "$PAISA_EVIDENCE_TRANSFER_DIR"
+  shasum -a 256 -c "$PAIR_ARCHIVE_NAME.sha256"
+)
+
+for target in \
+  artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685 \
+  artifacts/evidence_coverage/ECOV-20261023-175904-be50a499 \
+  artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal \
+  artifacts/evidence_coverage/ECOV-20261023-164000-final001
+do
+  if test -e "$target" || test -L "$target"; then
+    printf 'ERROR: refusing to overwrite existing evidence pack: %s\n' "$target" >&2
+    exit 1
+  fi
+done
+
+.venv/bin/python scripts/restore_evidence_bundle.py \
+  --archive "$PAIR_ARCHIVE" \
+  --destination-root .
+
+printf '%s  %s\n' \
+  '15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4' \
+  'artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685/run_manifest.json' \
+  '6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250' \
+  'artifacts/evidence_coverage/ECOV-20261023-175904-be50a499/run_manifest.json' \
+  'a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e' \
+  'artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal/run_manifest.json' \
+  'd4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c' \
+  'artifacts/evidence_coverage/ECOV-20261023-164000-final001/run_manifest.json' \
+  | shasum -a 256 -c -
+
+.venv/bin/python scripts/verify_evidence_run.py \
+  --run-dir artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685
+.venv/bin/python scripts/verify_evidence_coverage.py \
+  --run-dir artifacts/evidence_coverage/ECOV-20261023-175904-be50a499
+```
+
+After extraction, also rerun the schema-neutral four-pack integrity block above.
+It is the legacy-compatible payload verification step; the two current CLIs
+then add full semantic verification for the canonical pair.
+
+The current verifiers intentionally reject the superseded pair's older sealed
+contracts. Preserve and identify that pair through its known manifest and
+payload-inventory hashes; do not rewrite it to make a current verifier pass.
+
 ### Restore the exact supervisor demo pair
 
 The authoritative source for the exact historical demo is the project
@@ -348,7 +690,7 @@ test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
 test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
 
-tar -czf "$DEMO_ARCHIVE" \
+COPYFILE_DISABLE=1 tar -czf "$DEMO_ARCHIVE" \
   artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   artifacts/model_training/TRN-20261020-191815-624662-nogit
 (
@@ -362,7 +704,10 @@ Transfer both `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz` and
 `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz.sha256`. From the receiving
 repository root, refuse to overwrite any existing run, verify the archive, and
 then restore it. Point `PAISA_DEMO_TRANSFER_DIR` at the approved storage
-location containing the received files.
+location containing the received files. The restore helper rejects traversal,
+absolute paths, links, special files, duplicates, and every member outside the
+two named roots before extracting regular files into private staging. It then
+publishes each root atomically without replacement.
 
 <!-- BEGIN DEMO_ARTIFACT_RESTORE -->
 ```bash
@@ -385,7 +730,11 @@ require_absent_restore_target artifacts/model_training/TRN-20261020-191815-62466
   cd "$PAISA_DEMO_TRANSFER_DIR"
   shasum -a 256 -c "$DEMO_ARCHIVE_NAME.sha256"
 )
-tar -xzf "$DEMO_ARCHIVE" -C .
+.venv/bin/python scripts/restore_artifact_bundle.py \
+  --archive "$DEMO_ARCHIVE" \
+  --destination-root . \
+  --allow-directory artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --allow-directory artifacts/model_training/TRN-20261020-191815-624662-nogit
 
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
@@ -439,7 +788,7 @@ if [ -e "$NEWS_ARCHIVE" ] || [ -L "$NEWS_ARCHIVE" ] || \
   exit 1
 fi
 
-tar -czf "$NEWS_ARCHIVE" \
+COPYFILE_DISABLE=1 tar -czf "$NEWS_ARCHIVE" \
   artifacts/news_ingestion \
   artifacts/news_coverage \
   data/news/paisa_news.sqlite3
@@ -452,7 +801,9 @@ tar -czf "$NEWS_ARCHIVE" \
 
 Transfer both archive and sidecar. Restore only into a checkout where the
 generated targets are absent; never merge the archive into another working
-database or artifact root:
+database or artifact root. The allowlisted helper performs the same private
+staging and unsafe-member rejection used for the demo pair; the explicit file
+and directory roots are the complete permitted extraction surface:
 
 <!-- BEGIN NEWS_ARTIFACT_RESTORE -->
 ```bash
@@ -476,7 +827,12 @@ done
   cd "$PAISA_NEWS_TRANSFER_DIR"
   shasum -a 256 -c "$NEWS_ARCHIVE_NAME.sha256"
 )
-tar -xzf "$NEWS_ARCHIVE" -C .
+.venv/bin/python scripts/restore_artifact_bundle.py \
+  --archive "$NEWS_ARCHIVE" \
+  --destination-root . \
+  --allow-directory artifacts/news_ingestion \
+  --allow-directory artifacts/news_coverage \
+  --allow-file data/news/paisa_news.sqlite3
 
 test -f artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2/completion.json
 test -f artifacts/news_coverage/COVERAGE-20261023-120000-real0002/completion.json

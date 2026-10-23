@@ -1,0 +1,43 @@
+{
+  "assessment_references": [
+    {
+      "path": "docs/GDELT_GKG_HISTORICAL_EVIDENCE.md",
+      "sha256": "f70c8866690742684244e11d45e4789dbf1e04b1e8fb5e21676b7583dfd111cd"
+    },
+    {
+      "path": "docs/PSX_ANNOUNCEMENT_SOURCE_ASSESSMENT.md",
+      "sha256": "af474dbc3cf9f9958bf907899a2be1bb487734701bf51f280e758e5537674ebc"
+    }
+  ],
+  "decisions": [
+    {
+      "attribution": "Cite and link the GDELT Project in every use or redistribution.",
+      "automated_access": true,
+      "decision_id": "gdelt-gkg-raw-metadata-v1",
+      "provider_id": "gdelt-gkg-2.1",
+      "provider_mode": "raw_archive",
+      "publisher_page_fetching": false,
+      "scope": "Official GKG 2.1 raw archive metadata only; no publisher bodies, images, or paywalled content.",
+      "status": "PERMITTED"
+    },
+    {
+      "authorization_attestation_required": true,
+      "automated_access": false,
+      "decision_id": "psx-ogdc-authorized-manual-metadata-v1",
+      "provider_id": "psx-announcement",
+      "provider_mode": "manual_import",
+      "scope": "Operator-supplied licensed or written-permission OGDC announcement metadata only; no URL or PDF retrieval.",
+      "status": "REVIEW_REQUIRED"
+    },
+    {
+      "automated_access": false,
+      "decision_id": "psx-public-web-automation-prohibited-v1",
+      "provider_id": "psx-announcement",
+      "provider_mode": "automated_web",
+      "scope": "Public PSX pages and undocumented endpoints without prior written permission.",
+      "status": "PROHIBITED"
+    }
+  ],
+  "policy_id": "contemporaneous-evidence-permissions-v1",
+  "schema_version": "1.0"
+}

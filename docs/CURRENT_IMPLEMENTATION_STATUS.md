@@ -21,6 +21,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
 | News-ingestion foundation | The isolated `paisa.news` package captures configured RSS/Atom responses or permitted manual CSV imports; preserves raw bytes and acquisition metadata; writes normalized schema `1.1` while retaining explicit read compatibility for `1.0`; keeps publication, source observation, fetch, and defensible availability timestamps distinct; applies layered deterministic deduplication; links boundary-safe controlled OGDC aliases; persists canonical and per-ingestion evidence in local SQLite; and publishes immutable quality reports. The ingestion command does not run sentiment or alter the price/model stack. |
 | Historical-news source and coverage audit | The news package now also exposes a bounded metadata-only GDELT DOC 2.0 adapter and a licence-note-gated manual import path. A separate checksum-validating audit consumes immutable news, price, and exact target-split evidence; enforces the checksum-bound source-permission policy; maps each canonical article's conservative `available_at` to a configurable market cutoff; reports occurrence/canonical, all-news/OGDC/sector, split/month/source/language/completeness/gap metrics; and publishes collision-refusing `COVERAGE-...` artifacts under explicit readiness thresholds. It does not aggregate sentiment or alter models, policies, portfolios, APIs, or the dashboard. |
+| Contemporaneous historical evidence | The isolated `paisa.evidence` package adds official GDELT GKG 2.1 raw-archive metadata and an offline PSX OGDC announcement contract. It preserves batch/publication/import timing, separates `gdelt_metadata`, `exchange_announcement`, and `publisher_news`, publishes immutable `EVID-...` packs, and audits four separate/combined profiles into immutable `ECOV-...` packs. Public PSX automation is prohibited and the controlled manual path remains `REVIEW_REQUIRED`. No aggregation or downstream model/API/dashboard integration is included. |
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
@@ -200,6 +201,66 @@ The adapter never fetches linked publisher pages or stores publisher bodies.
 GDELT metadata use remains subject to the reviewed source-permission policy,
 required attribution, service limits, and underlying publisher rights. No
 licensed manual historical dataset was supplied in this task.
+
+### Contemporaneous GKG and PSX evidence status
+
+The new GKG path uses raw GKG 2.1 archives rather than GDELT DOC. It accepts
+only `WEB=1`, treats the batch timestamp in `GKGRECORDID` as the defensible
+historical `available_at`, retains `V2.1DATE` as publication time, verifies
+archive size and checksums, and never follows publisher URLs. The canonical
+post-fix execution `EVID-20261023-175847-822c5685` processed the official
+`2026-09-04 09:00`, `09:15`, and `09:30` UTC 15-minute partitions within the
+requested `2025-12-16`--`2026-09-15` interval. That is only three adjacent
+partitions, or 45 minutes, and is not the full test period. Its three raw
+captures contain `2,957` scanned and timestamp-valid rows, `0` rejected,
+`2,957` unmatched, `0` matched, and `0` duplicate rows. The verifier returned
+`PASS` with basis `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY`; this is bounded
+execution evidence, not full-period completeness.
+
+The PSX path accepts only exact `OGDC` announcement metadata supplied offline.
+Timed rows require the official offset-aware posting time. Date-only rows keep
+timestamps null and become eligible strictly on the next observed trading
+session. The reviewed permission decision is still `REVIEW_REQUIRED`, so no
+authorized input was imported and the count is `0`; public-page automation is
+not used.
+
+The canonical paired coverage run is `ECOV-20261023-175904-be50a499`. Its `656`
+mapping rows are verified by portable sealed-record/stock-calendar
+recomputation with basis `PORTABLE_RECORD_CALENDAR_RECOMPUTATION`; that basis
+is deliberately not source-archive-bound. The four coverage profiles are
+`gdelt_gkg_ogdc`, `psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+`general_financial_news`. The restored publisher-news evidence contributes
+`656` general inputs, including `42` exact OGDC-linked inputs to the combined
+profile. None is cutoff-eligible inside the immutable model period. Every
+profile reports `0 / 853` train, `0 / 182` validation, and `0 / 184` test
+overlap and readiness `NO_OVERLAP`. These labels express caller-defined gate
+satisfaction only, not statistical sufficiency, predictive value, or financial
+merit. These are academic simulation results, not financial advice.
+
+Both canonical packs were produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`; pack directories are mode `0700`
+and files are mode `0600`. Their immutable identities are:
+
+| Pack | Manifest SHA-256 | Payload-inventory SHA-256 |
+|---|---|---|
+| `EVID-20261023-175847-822c5685` | `15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4` | `636b096f9bedaed73756c7175b35676555049251c6a3b14f8ed609e960c50888` |
+| `ECOV-20261023-175904-be50a499` | `6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250` | `baf14a5d30f60fd7c5fad2d1daa75322007b43e2257e0a1a1ecf498efc23b826` |
+
+The earlier retained pair is immutable audit history and is superseded, not
+deleted: `EVID-20261023-163905-gkgfinal` has manifest
+`a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e`
+and payload inventory
+`1675a8902f4c0175972392d04a207f09157d034ec1b118eb4c449e2ac9d77e7e`;
+`ECOV-20261023-164000-final001` has manifest
+`d4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c`
+and payload inventory
+`e01f33b278bc780d02e74fa5dc88abbba803f12ffc8e90b95562ffb272010e4d`.
+The local attempts `EVID-20261023-163553-gkgfinal`,
+`EVID-20261023-213000-gkgraw01`, `EVID-20261023-213500-gkgraw02`, and the
+post-review pre-final `EVID-20261023-175415-5c1b0c48` are likewise
+noncanonical/superseded and must be preserved rather than relabeled. The team
+handoff contains the checksum-bound preservation, absent-target-only restore,
+and current verifier commands.
 
 ### FinBERT article-sentiment implementation
 

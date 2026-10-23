@@ -31,6 +31,10 @@ proposal and early-v0 context.
 | [Historical news source assessment](docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md) | Dated access, permission, storage, attribution, cost, and coverage assessment for candidate archives and import sources. |
 | [Historical news coverage runbook](docs/HISTORICAL_NEWS_COVERAGE.md) | Permitted acquisition/import paths and the reproducible price-overlap audit workflow. |
 | [News-price overlap contract](docs/NEWS_PRICE_OVERLAP_CONTRACT.md) | Checksum validation, cutoff mapping, population/counting rules, artifacts, and configurable readiness states. |
+| [GDELT GKG historical evidence](docs/GDELT_GKG_HISTORICAL_EVIDENCE.md) | Raw GKG 2.1 permission, archive, timestamp, matching, and bounded-execution contract. |
+| [PSX announcement source assessment](docs/PSX_ANNOUNCEMENT_SOURCE_ASSESSMENT.md) | Reviewed automation prohibition and controlled manual-import permission status. |
+| [PSX announcement data contract](docs/PSX_ANNOUNCEMENT_DATA_CONTRACT.md) | Exact-OGDC normalized fields, authorization boundary, timestamp precision, and immutable artifacts. |
+| [Contemporaneous evidence time policy](docs/CONTEMPORANEOUS_EVIDENCE_TIME_POLICY.md) | GKG batch, official-event, date-only, cutoff, profile, and leakage rules. |
 | [FinBERT sentiment runbook](docs/FINBERT_SENTIMENT.md) | Pinned model/license, deterministic text policy, resource controls, artifacts, and execution commands. |
 | [Sentiment data contract](docs/SENTIMENT_DATA_CONTRACT.md) | Article-level probabilities, model/input identity, immutable artifacts, and SQLite semantics. |
 | [Sentiment time alignment](docs/SENTIMENT_TIME_ALIGNMENT.md) | Inherited news time, decision-cutoff filtering, and future aggregation boundary. |
@@ -354,6 +358,112 @@ Strict mode also requires every database, permission-policy, and optional
 energy-sector link contract declared by the sealed references.
 Neither the historical preflights nor the retained official results authorize
 daily sentiment aggregation.
+
+## Contemporaneous historical evidence
+
+PAISA now has a second, separate evidence path for contemporaneous historical
+sources. It uses official GDELT GKG 2.1 raw archives, not the GDELT DOC API,
+and a controlled offline import boundary for official PSX OGDC announcements.
+The normalized evidence types remain distinct: `gdelt_metadata`,
+`exchange_announcement`, and `publisher_news`. Coverage is reported separately
+for `gdelt_gkg_ogdc`, `psx_ogdc_announcements`,
+`combined_ogdc_evidence`, and `general_financial_news`.
+
+GKG records use the archive batch time from `GKGRECORDID` as `available_at`,
+retain `V2.1DATE` as the source publication timestamp, accept only `WEB=1`, and
+never dereference publisher URLs. Official PSX rows require the exact `OGDC`
+ticker. A timed announcement keeps its official offset-aware posting time; a
+date-only announcement keeps both publication and availability timestamps null
+and becomes eligible only on the next observed trading session. No same-day
+time is invented.
+
+The canonical post-fix GKG execution
+`EVID-20261023-175847-822c5685` processed the three official 15-minute
+partitions at `2026-09-04 09:00`, `09:15`, and `09:30` UTC within the requested
+`2025-12-16` through `2026-09-15` interval. This is only three adjacent
+partitions, or 45 minutes, and is not the full test period. Its three raw ZIP
+captures contain `2,957` scanned and timestamp-valid rows, `0` rejected,
+`2,957` unmatched, `0` matched, and `0` duplicate rows. Verification passes
+with basis `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY`. This narrow subset is a
+reproducible acquisition check, not a claim of full-period completeness. PSX
+remains `REVIEW_REQUIRED`; no authorized announcement input was supplied, so
+its retained count is `0` and public-page automation remains blocked. The
+existing publisher-news input adds
+`656` general records, including `42` exact OGDC-linked records in the combined
+profile. Nevertheless, cutoff-eligible overlap is `0 / 853` train,
+`0 / 182` validation, and `0 / 184` test for every profile. All four readiness
+statuses are therefore `NO_OVERLAP`.
+
+The paired canonical coverage pack is `ECOV-20261023-175904-be50a499`. It has
+`656` mapping rows, recomputes the sealed records against the sealed stock
+calendar with basis `PORTABLE_RECORD_CALENDAR_RECOMPUTATION`, and reports
+`NO_OVERLAP` for all four profiles. Its readiness labels mean
+caller-defined gate satisfaction only, not statistical sufficiency or
+predictive value. Both canonical packs were produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`; their directories are mode `0700`
+and payload files are mode `0600`. Exact manifest and payload-inventory hashes,
+the retained superseded pair, and checksum-bound preservation and restoration
+commands are recorded in [the team handoff](docs/TEAM_HANDOFF.md#canonical-contemporaneous-evidence-pair).
+
+Run and verify the bounded GKG path with a fresh immutable ID. `--no-resume`
+forces a new acquisition rather than reusing an earlier checkpoint:
+
+```bash
+.venv/bin/python scripts/run_gdelt_gkg_evidence.py \
+  --config configs/evidence/gdelt_gkg_test_subset.json \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence \
+  --run-id "EVID-<UTC-timestamp>-<unique-suffix>" \
+  --no-resume
+
+.venv/bin/python scripts/verify_evidence_run.py \
+  --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
+```
+
+Resume checkpoints contain raw archive bytes and therefore use the same local
+security boundary as generated evidence. The checkpoint directory must be a
+real, link-free `0700` directory, and its checkpoint and cache files must be
+regular `0600` files. A repository-local `--checkpoint-dir` must also be
+Git-ignored and contain no tracked files. PAISA rejects older checkpoints with
+public modes; secure or remove them before retrying. Verification failures are
+reported as generic structured JSON and do not echo host filesystem paths.
+
+The PSX importer is intentionally unusable under the current
+`REVIEW_REQUIRED` decision. Only after the reviewed policy is updated to bind
+the exact authorization attestation and authorization reference hashes may an
+operator run this offline command:
+
+```bash
+.venv/bin/python scripts/import_psx_announcements.py \
+  --input /absolute/path/to/authorized-ogdc-announcements.csv \
+  --authorization-attestation-file /absolute/path/to/attestation.txt \
+  --authorization-reference-file /absolute/path/to/authorization-reference.txt \
+  --permission-policy configs/evidence/source_permissions.json \
+  --output-dir artifacts/contemporaneous_evidence
+```
+
+Create and verify the immutable four-profile coverage pack after restoring the
+ignored stock, split, publisher-news, and GKG artifacts:
+
+```bash
+.venv/bin/python scripts/audit_contemporaneous_evidence.py \
+  --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
+  --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
+  --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --output-dir artifacts/evidence_coverage \
+  --run-id "ECOV-<UTC-timestamp>-<unique-suffix>"
+
+.venv/bin/python scripts/verify_evidence_coverage.py \
+  --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
+```
+
+The coverage verifier proves the sealed pack's checksums and performs portable
+record/calendar recomputation; it remains explicitly not source-archive-bound.
+These are academic data-engineering results for a simulation, not financial
+advice, and
+they do not authorize aggregation, modeling, signals, trading, portfolio, API,
+or dashboard changes.
 
 ## Article-level FinBERT sentiment foundation
 

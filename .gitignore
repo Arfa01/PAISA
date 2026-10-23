@@ -27,6 +27,8 @@ data/processed/**/*.json
 data/external/verified_legacy_psx_cache/**
 data/news/**
 !data/news/.gitkeep
+data/evidence/**
+!data/evidence/.gitkeep
 models/**/*.joblib
 models/**/*.pkl
 models/**/*.json

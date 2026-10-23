@@ -2,7 +2,7 @@
 
 Status date: 24 October 2026
 
-Feature base: `origin/main` at `cf897e1` after PR #15
+Feature base: `origin/main` at `d7015cb` after PR #16
 
 Retained demonstration run: `VSL-20261020-OGDC-main-02`
 

@@ -17,6 +17,12 @@ proposal and early-v0 context.
 
 | Document | Purpose |
 |---|---|
+| [Project state — 24 October 2026](docs/PROJECT_STATE_2026-10-24.md) | Continuation snapshot: merged milestones, canonical artifact IDs, measured results, blockers, and the exact next safe task. |
+| [Remaining roadmap](docs/REMAINING_ROADMAP.md) | Dependency-ordered, PR-sized continuation tasks with priorities and exit criteria. |
+| [Issue backlog](docs/ISSUE_BACKLOG.md) | Paste-ready GitHub issues for the remaining research, integration, report, and demo work. |
+| [Reproduction commands](docs/REPRODUCTION_COMMANDS.md) | Tested setup, validation, application, artifact, data, sentiment, coverage, and LSTM commands. |
+| [Limited-usage workflow](docs/FREE_PLAN_WORKFLOW.md) | Sequential local/CI/Colab/GitHub workflow for continuing PAISA with limited agent usage. |
+| [Codex prompt library](docs/CODEX_PROMPT_LIBRARY.md) | Reusable implementation, review, repair, acceptance, triage, release, and report prompts. |
 | [Current implementation status](docs/CURRENT_IMPLEMENTATION_STATUS.md) | Canonical status of implemented code, retained evidence, and incomplete scope. |
 | [October 2026 progress report](docs/PROGRESS_REPORT_OCTOBER_2026.md) | Dated delivery summary, verified results, test evidence, and next milestones. |
 | [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
@@ -26,7 +32,7 @@ proposal and early-v0 context.
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
 | [Supervisor demo script](docs/SUPERVISOR_DEMO_SCRIPT.md) | Fail-fast preflight and timed demonstration walkthrough. |
 | [Team handoff](docs/TEAM_HANDOFF.md) | Ownership, exact demo-artifact restore, regeneration, and continuation commands. |
-| [Next-phase plan](docs/NEXT_PHASE_PLAN.md) | Ordered plan for news, sentiment, LSTM, explainability, and expansion. |
+| [Prior next-phase plan](docs/NEXT_PHASE_PLAN.md) | Detailed research background retained from the pre-continuation plan; use the remaining roadmap above for current dependency order. |
 | [News ingestion runbook](docs/NEWS_INGESTION.md) | RSS/manual acquisition, immutable artifacts, quality policy, and reproduction commands. |
 | [News data contract](docs/NEWS_DATA_CONTRACT.md) | Versioned normalized record, provider evidence, deduplication, entity-link, and SQLite semantics. |
 | [News time alignment](docs/NEWS_TIME_ALIGNMENT.md) | Publication/acquisition/availability rules and the future-feature cutoff boundary. |
@@ -1024,4 +1030,6 @@ the permitted archive cannot retroactively prove historical cutoff
 availability. A licensed overlapping corpus with defensible timing remains the
 gate before daily aggregation or controlled price-plus-sentiment experiments.
 SHAP and relationship graphs also remain future work. See
-[`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the dependency order.
+[`docs/REMAINING_ROADMAP.md`](docs/REMAINING_ROADMAP.md) for the current
+dependency order; [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) is
+retained as the earlier detailed research plan.

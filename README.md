@@ -558,6 +558,11 @@ scored `0.544251`; `M-006` exceeded all `M-001`–`M-004` test balanced
 accuracies (the best baseline was `M-002` at `0.524459`), but that post-freeze
 result does not make it the validation-selected variant.
 
+That test window is post-freeze only for the M-005/M-006 selection: the same
+184 dates and M-001–M-004 outcomes had already been exposed by the baseline
+experiment. It is a reused shared project holdout, not a globally untouched
+holdout.
+
 The corresponding model portfolios ended at PKR 96,359.29 for `M-005`
 (-3.64071%) and PKR 96,110.91 for `M-006` (-3.88909%). Neither beat the
 buy-and-hold result of PKR 106,247.89 (+6.24789%) or the best baseline model
@@ -647,9 +652,10 @@ tree. All backtests are academic simulations and are not financial advice.
 
 The vertical-slice runner joins the versioned components into one reproducible
 real-data workflow: fetch and clean daily OGDC data, train `M-001` through
-`M-004`, pass each model's untouched test predictions directly to an isolated
+`M-004`, pass each model's held-out test predictions directly to an isolated
 portfolio backtest, calculate cash-only and buy-and-hold benchmarks, and publish
-one comparison report.
+one comparison report. Those test outcomes were subsequently reused for the
+M-005/M-006 comparison, so that window is no longer globally untouched.
 
 Install the normal, machine-learning, backtesting, and test dependencies from
 the aggregate requirements file, then run:

@@ -106,13 +106,18 @@ The Colab/CPU notebook
 calls this reusable entry point and only displays saved evidence. It does not
 reimplement sequence, model, metric, or portfolio logic.
 
-## Selection and untouched-test policy
+## Selection and post-freeze LSTM test policy
 
 The common target-date split is chronological. Learned preprocessing is fit on
 training rows only. Early stopping, learning-rate decisions, epoch selection,
 checkpoint selection, and variant preference use validation evidence only.
 The test split is evaluated after the controlled configurations are frozen and
 is never used to tune or relabel a champion.
+
+This timing guarantee applies to the M-005/M-006 selection process only. The
+same 184-date holdout, from 2025-12-16 through 2026-09-15, and its M-001 through
+M-004 results had already been exposed by the earlier baseline experiment. It
+is therefore a reused shared project holdout, not a globally untouched holdout.
 
 On the canonical data, the 20-session contract yields 834 training, 182
 validation, and 184 test sequences. All baseline and LSTM validation/test dates
@@ -166,11 +171,32 @@ artifacts/lstm_experiments/<run_id>/
 to their unique immutable `registered_model_id` directory names. Consumers must
 follow that mapping instead of assuming the variant ID is the directory name.
 
+Persisted `final_summary.json` uses schema `1.1`. Its
+`artifact_directory=<run_id>`, optional `zip_path=<run_id>.zip`, and
+`path_base=output_root` fields are portable rather than machine-specific
+absolute paths. It reports LSTM test evidence under
+`lstm_metrics.post_freeze_lstm_test` and
+`post_freeze_lstm_test_ranking`; `shared_test_holdout_context` records the
+prior M-001 through M-004 exposure. The Python runner's returned summary still
+resolves the artifact and ZIP paths for immediate local use and reports
+`path_base=absolute` for those in-memory/CLI values.
+
+When ZIP output is requested, the complete ZIP is published first and the run
+directory rename is the final publication boundary. A failed or interrupted
+final rename can therefore leave a complete orphan ZIP, but it cannot expose a
+public `PASS` run that references a missing ZIP. Collision refusal remains in
+force; an operator must inspect an orphan explicitly and use a new run ID or
+remove it deliberately rather than having failure cleanup risk deleting a
+concurrently replaced file.
+
 Per-model evidence includes the registered model identity, fitted model,
 preprocessing artifacts, ordered features, sequence length, split dates,
 configuration/architecture, parameter count, training history, predictions,
 metrics, confusion matrix, environment/source provenance, and checksums. The
 run-level manifest binds those files and rejects collisions or later mutation.
+Validation also reconciles each advertised preprocessing and best-validation
+checkpoint digest with the corresponding run-inventory entry and actual file;
+resealing cannot legitimize a false nested checksum claim.
 
 ## Certified real run
 
@@ -210,10 +236,12 @@ not change that label.
 | M-005 | 0.472527 | 0.479280 | 0.476190 | 0.786517 | 0.593220 | -0.052561 | 0.453425 | 0.262189 | 0.092499 | `[[16, 77], [19, 70]]` |
 | M-006 | 0.472527 | 0.474931 | 0.468468 | 0.584270 | 0.520000 | -0.051383 | 0.446176 | 0.260540 | 0.082305 | `[[34, 59], [37, 52]]` |
 
-### Untouched-test metrics
+### Post-freeze LSTM test metrics
 
 Each frozen model made one test prediction pass after validation selection was
-recorded.
+recorded. These dates and the M-001 through M-004 outcomes were already known,
+so “post-freeze” describes LSTM evaluation order rather than a globally
+untouched project test set.
 
 | Variant | Accuracy | Balanced accuracy | Precision | Recall | F1 | MCC | ROC-AUC | Brier | ECE | Confusion matrix `[[TN, FP], [FN, TP]]` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|

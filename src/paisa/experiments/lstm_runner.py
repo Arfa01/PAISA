@@ -25,6 +25,11 @@ import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
+from paisa.evidence.artifact_security import (
+    atomic_rename_noreplace,
+    prepare_output_root,
+    reject_symlink_components,
+)
 from paisa.experiments.artifacts import (
     TrainingRunEvidence,
     assert_training_run_artifacts_unchanged,
@@ -376,9 +381,28 @@ def _validate_output_separation(
     training_root: Path,
     vertical_root: Path,
 ) -> None:
+    """Reject output paths physically equal to or nested below a baseline.
+
+    Walking existing ancestors with ``samefile`` keeps the check correct on
+    case-insensitive filesystems even when the caller spells a path using a
+    different case. Nonexistent descendants are still rejected before they
+    can be created inside a retained baseline.
+    """
+
     for baseline in (training_root, vertical_root):
-        if output_root == baseline or baseline in output_root.parents:
-            raise ValueError("output_dir must not be inside a retained baseline directory")
+        candidate = output_root
+        while True:
+            if os.path.lexists(candidate):
+                try:
+                    if os.path.samefile(candidate, baseline):
+                        raise ValueError(
+                            "output_dir must not be inside a retained baseline directory"
+                        )
+                except FileNotFoundError:
+                    pass
+            if candidate.parent == candidate:
+                break
+            candidate = candidate.parent
 
 
 def _baseline_price_checksum(evidence: TrainingRunEvidence) -> str:
@@ -432,12 +456,28 @@ def _freeze_verified_prices(
     return destination
 
 
-def _publish_staged_zip(staged_zip: Path, final_zip: Path) -> None:
-    """Atomically move a complete sibling ZIP to its public path."""
+def _entry_identity(path: Path) -> tuple[int, int, int, int]:
+    metadata = path.lstat()
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_size),
+    )
 
-    if final_zip.exists():
-        raise FileExistsError(f"ZIP already exists; refusing to overwrite: {final_zip}")
-    staged_zip.rename(final_zip)
+
+def _publish_staged_zip(
+    staged_zip: Path, final_zip: Path
+) -> None:
+    """Atomically publish a complete sibling ZIP without replacement."""
+
+    staged_identity = _entry_identity(staged_zip)
+    if not stat.S_ISREG(staged_identity[2]) or staged_zip.is_symlink():
+        raise ValueError("Staged ZIP must be a regular non-symlink file")
+    atomic_rename_noreplace(staged_zip, final_zip)
+    published_identity = _entry_identity(final_zip)
+    if published_identity != staged_identity:
+        raise RuntimeError("Published ZIP identity changed during publication")
 
 
 def _publish_staged_artifacts(
@@ -447,28 +487,30 @@ def _publish_staged_artifacts(
     final_run_dir: Path,
     final_zip: Path | None,
 ) -> None:
-    """Publish a sealed run and ZIP, rolling back the run on ZIP failure."""
+    """Publish ZIP first and use the run directory as the final commit point."""
 
-    if final_run_dir.exists():
+    if os.path.lexists(final_run_dir):
         raise FileExistsError(
             f"Run directory appeared during staging: {final_run_dir}"
         )
-    if final_zip is not None and final_zip.exists():
+    if final_zip is not None and os.path.lexists(final_zip):
         raise FileExistsError(
             f"ZIP appeared during staging; refusing to overwrite: {final_zip}"
         )
-    run_published = False
-    try:
-        stage_dir.rename(final_run_dir)
-        run_published = True
-        if staged_zip is not None:
-            if final_zip is None:
-                raise AssertionError("A staged ZIP requires a final ZIP path")
-            _publish_staged_zip(staged_zip, final_zip)
-    except Exception:
-        if run_published and final_run_dir.is_dir():
-            shutil.rmtree(final_run_dir)
-        raise
+    if (staged_zip is None) != (final_zip is None):
+        raise ValueError("Staged and final ZIP paths must either both be set or omitted")
+    stage_identity = _entry_identity(stage_dir)
+    if not stat.S_ISDIR(stage_identity[2]) or stage_dir.is_symlink():
+        raise ValueError("Staged run must be a real directory")
+
+    if staged_zip is not None:
+        assert final_zip is not None
+        _publish_staged_zip(staged_zip, final_zip)
+    # This is deliberately the last publication operation. A visible run
+    # directory therefore always has its advertised ZIP. If this rename fails
+    # or the process stops first, the complete ZIP is retained as an orphan;
+    # automatic deletion would introduce a check/unlink ownership race.
+    atomic_rename_noreplace(stage_dir, final_run_dir)
 
 
 def _exact_iso_date(value: object, *, field_name: str) -> str:
@@ -1570,7 +1612,12 @@ def _run_fair_comparison(
         kind="mergesort",
     ).reset_index(drop=True)
     portfolio_frame.to_csv(stage_dir / "portfolio_metrics.csv", index=False)
-    combined = metric_frame.merge(portfolio_frame, on="variant_id", how="inner")
+    combined = metric_frame.merge(
+        portfolio_frame,
+        on=["variant_id", "registered_model_id"],
+        how="inner",
+        validate="one_to_one",
+    )
     combined.to_csv(stage_dir / "comparison_leaderboard.csv", index=False)
     _write_comparison_plots(stage_dir, metric_frame, portfolio_frame, backtests)
     return metric_frame, portfolio_frame, backtests, fair_evidence
@@ -1749,12 +1796,13 @@ def _build_final_summary(
     }
     return to_jsonable(
         {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "status": "PASS",
             "run_id": run_id,
             "invocation_id": invocation_id,
-            "artifact_directory": str(final_run_dir),
-            "zip_path": str(zip_path) if zip_path is not None else None,
+            "artifact_directory": final_run_dir.name,
+            "zip_path": zip_path.name if zip_path is not None else None,
+            "path_base": "output_root",
             "symbol": DEFAULT_SYMBOL,
             "model_ids": model_ids,
             "validation_preferred_variant": freeze_decision[
@@ -1763,7 +1811,32 @@ def _build_final_summary(
             "validation_selection": dict(freeze_decision),
             "lstm_metrics": {
                 "validation": _complete_lstm_split_metrics(states, "validation"),
-                "untouched_test": _complete_lstm_split_metrics(states, "test"),
+                "post_freeze_lstm_test": _complete_lstm_split_metrics(
+                    states, "test"
+                ),
+            },
+            "shared_test_holdout_context": {
+                "selection_frozen_before_lstm_test_inference": True,
+                "globally_untouched_project_holdout": False,
+                "previously_exposed_through_variants": [
+                    "M-001",
+                    "M-002",
+                    "M-003",
+                    "M-004",
+                ],
+                "shared_with_variants": [
+                    "M-001",
+                    "M-002",
+                    "M-003",
+                    "M-004",
+                    "M-005",
+                    "M-006",
+                ],
+                "disclosure": (
+                    "The same dated holdout was exposed previously through "
+                    "M-001 through M-004 results. It is a post-freeze LSTM test, "
+                    "not a globally untouched project holdout."
+                ),
             },
             "lstm_portfolio_metrics": _complete_lstm_portfolio_metrics(
                 portfolio_metrics
@@ -1778,7 +1851,7 @@ def _build_final_summary(
                     "accuracy",
                 ),
             ),
-            "untouched_test_lstm_ranking": _rank_records(
+            "post_freeze_lstm_test_ranking": _rank_records(
                 test_leaderboard,
                 (
                     "variant_id",
@@ -1970,6 +2043,7 @@ def run_lstm_price_only_experiments(
     """
 
     resolved_run_id = _safe_run_id(run_id)
+    repo_root = Path(__file__).resolve().parents[3]
     source_candidate = Path(prices_path).expanduser()
     if source_candidate.is_symlink():
         raise ValueError("prices_path must not be a symlink")
@@ -1981,18 +2055,28 @@ def run_lstm_price_only_experiments(
     vertical_evidence = validate_vertical_slice_artifacts(baseline_vertical_slice)
     _validate_baseline_relationship(training_evidence, vertical_evidence)
 
-    output_root = Path(output_dir).expanduser().resolve()
+    output_candidate = reject_symlink_components(
+        Path(output_dir).expanduser(),
+        label="LSTM experiment output root",
+    )
+    _validate_output_separation(
+        output_candidate, training_evidence.run_directory, vertical_evidence.directory
+    )
+    output_root = prepare_output_root(
+        output_candidate,
+        repository_root=repo_root,
+        label="LSTM experiment output root",
+    )
     _validate_output_separation(
         output_root, training_evidence.run_directory, vertical_evidence.directory
     )
-    output_root.mkdir(parents=True, exist_ok=True)
     final_run_dir = output_root / resolved_run_id
     zip_path = output_root / f"{resolved_run_id}.zip" if create_zip else None
-    if final_run_dir.exists():
+    if os.path.lexists(final_run_dir):
         raise FileExistsError(
             f"Run directory already exists; refusing to overwrite: {final_run_dir}"
         )
-    if zip_path is not None and zip_path.exists():
+    if zip_path is not None and os.path.lexists(zip_path):
         raise FileExistsError(f"ZIP already exists; refusing to overwrite: {zip_path}")
 
     stage_parent = Path(
@@ -2003,8 +2087,7 @@ def run_lstm_price_only_experiments(
     staged_zip = (
         stage_parent / f"{resolved_run_id}.zip" if zip_path is not None else None
     )
-    published_run = False
-    published_zip = False
+    committed = False
     events: list[dict[str, Any]] = []
 
     try:
@@ -2023,7 +2106,6 @@ def run_lstm_price_only_experiments(
         tf = _tensorflow_module(tensorflow_module)
         _configure_device(tf, device)
         invocation_id = str(uuid.uuid4())
-        repo_root = Path(__file__).resolve().parents[3]
         states, freeze_decision = _fit_until_validation_freeze(
             prepared=prepared,
             stage_dir=stage_dir,
@@ -2118,20 +2200,15 @@ def run_lstm_price_only_experiments(
             final_run_dir=final_run_dir,
             final_zip=zip_path,
         )
-        published_run = True
-        published_zip = staged_zip is not None
-        validate_training_run_artifacts(
-            final_run_dir,
-            expected_run_id=resolved_run_id,
-            expected_invocation_id=invocation_id,
-        )
-        stage_parent.rmdir()
+        committed = True
+        # Publication has committed. Cleanup must not turn a successful atomic
+        # commit into a reported failure or trigger rollback of public output.
+        try:
+            stage_parent.rmdir()
+        except OSError:
+            pass
     except Exception:
-        if published_zip and zip_path is not None and zip_path.is_file():
-            zip_path.unlink()
-        if published_run and final_run_dir.is_dir():
-            shutil.rmtree(final_run_dir)
-        if stage_parent.exists():
+        if not committed and stage_parent.exists():
             shutil.rmtree(stage_parent)
         assert_training_run_artifacts_unchanged(training_evidence)
         assert_vertical_slice_artifacts_unchanged(vertical_evidence)
@@ -2141,6 +2218,7 @@ def run_lstm_price_only_experiments(
         "run_id": resolved_run_id,
         "artifact_directory": str(final_run_dir),
         "zip_path": str(zip_path) if zip_path is not None else None,
+        "path_base": "absolute",
         "validation_preferred_variant": freeze_decision[
             "validation_preferred_variant"
         ],

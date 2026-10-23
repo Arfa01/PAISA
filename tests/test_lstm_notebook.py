@@ -93,6 +93,17 @@ def test_lstm_experiment_notebook_calls_reusable_runner_and_names_cli() -> None:
     assert "not financial advice" in source.lower()
 
 
+def test_lstm_experiment_notebook_discloses_shared_test_holdout_reuse() -> None:
+    source = _joined_source(_notebook())
+    normalized = source.lower()
+
+    assert "post-freeze lstm test" in normalized
+    assert "shared project holdout" in normalized
+    assert "m-001 through m-004" in normalized
+    assert "not a globally untouched test" in normalized
+    assert "untouched-test" not in normalized
+
+
 def test_lstm_runner_callable_and_cli_contracts_match_the_notebook() -> None:
     signature = inspect.signature(run_lstm_price_only_experiments)
     parameters = signature.parameters

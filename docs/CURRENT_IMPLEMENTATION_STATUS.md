@@ -15,7 +15,7 @@ portfolio curves, and simulated returns are not financial advice.
 |---|---|
 | Stock-data foundation | The legacy v0 path implements PSX acquisition through `psx-dps`, with manual-CSV and offline sample alternatives; cleans the canonical daily schema; creates backward-looking technical features and `target_next_day_up`; trains the compatibility Random Forest; and preserves the original FastAPI routes. The acquisition path is implemented, but the live endpoint returned HTTP 404 during the retained run, so fresh live ingestion is not currently demonstrated. The optional `pypsx` provider remains separate from the default installation. |
 | Leakage-safe experiment data | The versioned path distinguishes `feature_date` and next-session `target_date`, splits chronologically by target date, fits learned transforms on training data only, records feature order and seeds, and preserves immutable input and model evidence. |
-| Versioned model comparison | `M-001`, `M-002`, and `M-003` are Random Forest variants; `M-004` is XGBoost. All four use the same daily OGDC feature set, target, split dates, and untouched test observations. Each has a unique registered model identity and checksum-protected artifacts. |
+| Versioned model comparison | `M-001`, `M-002`, and `M-003` are Random Forest variants; `M-004` is XGBoost. All four use the same daily OGDC feature set, target, split dates, and held-out test observations. Each has a unique registered model identity and checksum-protected artifacts. The later M-005/M-006 comparison reused those 184 dates and the already-exposed baseline outcomes, so this is now a shared project holdout rather than a globally untouched one. |
 | Price-only LSTM comparison | The isolated optional-TensorFlow workflow adds `M-005`, a 20-session/64-unit baseline with dropout `0.20`, and `M-006`, the same sequence length and hidden width with stronger dropout and recurrent regularization. It reuses the frozen OGDC input and split evidence, fits preprocessing on training data only, chooses the preferred variant from validation evidence, evaluates test data post-freeze, and publishes immutable run artifacts. Certified CPU run `LSTM-20261024-OGDC-price-only-01` completed from clean commit `eb28ea53ffd69032f4b1109be127e23f1ddcc140`; its local, Git-ignored `final_summary.json` is authoritative. |
 | Decision and simulation | Predictions pass through a separate threshold policy into separate long-only portfolio ledgers. The retained run uses buy at `probability_up >= 0.60`, sell at `probability_up <= 0.40`, a 50% maximum allocation, whole shares, 10-basis-point execution fees, next-session-open execution, and close valuation. |
 | Independent comparisons | Each model has its own experiment, portfolio, trades, cash, holdings, and snapshots. Cash-only and 50%-allocated buy-and-hold benchmarks use the common test window and cost assumptions. |
@@ -69,6 +69,11 @@ Only after that preference was frozen, the common 184-date test reported
 therefore exceeded all `M-001`–`M-004` test balanced accuracies, whose best was
 `M-002` at `0.524459`; this post-freeze result does not make `M-006` the
 validation-selected variant.
+
+The same date window and the M-001–M-004 outcomes were already exposed before
+the LSTM run. “Post-freeze” therefore describes the M-005/M-006 selection
+order; this is repeated evaluation on a shared project holdout, not a globally
+untouched test.
 
 The `M-005` portfolio ended at PKR 96,359.29 (-3.64071%) and the `M-006`
 portfolio at PKR 96,110.91 (-3.88909%). Neither beat buy-and-hold at PKR

@@ -796,6 +796,7 @@ class TrainingRunEvidence:
 _TRAINING_RUN_MANIFEST = "run_manifest.json"
 _TRAINING_INVENTORY_FIELDS = {"algorithm", "root", "excludes", "files"}
 _TRAINING_INVENTORY_ENTRY_FIELDS = {"path", "sha256"}
+_NESTED_CHECKSUM_FIELDS = {"algorithm", "files"}
 
 
 def _training_run_directory(run_dir: str | Path) -> Path:
@@ -927,6 +928,54 @@ def _parse_training_inventory(manifest: Mapping[str, Any]) -> tuple[tuple[str, s
     return tuple(parsed)
 
 
+def _parse_nested_checksum_inventory(
+    value: Any,
+    *,
+    field_name: str,
+) -> tuple[tuple[str, str], ...]:
+    """Validate one advertised nested SHA-256 inventory.
+
+    The run-level inventory proves the bytes that were published. Nested
+    inventories additionally make semantic claims about those bytes, so their
+    advertised digests must be parsed and reconciled separately rather than
+    trusted merely because the containing JSON file is inventoried.
+    """
+
+    inventory = _require_mapping(value, field_name=field_name)
+    if set(inventory) != _NESTED_CHECKSUM_FIELDS:
+        raise ValueError(f"{field_name} must contain exactly algorithm and files")
+    if inventory["algorithm"] != "sha256":
+        raise ValueError(f"{field_name} must use SHA-256")
+    raw_files = inventory["files"]
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError(f"{field_name}.files must be a non-empty array")
+
+    parsed: list[tuple[str, str]] = []
+    for index, entry in enumerate(raw_files):
+        item = _require_mapping(
+            entry, field_name=f"{field_name}.files[{index}]"
+        )
+        if set(item) != _TRAINING_INVENTORY_ENTRY_FIELDS:
+            raise ValueError(
+                f"Every {field_name} file must contain exactly path and sha256"
+            )
+        relative = _safe_relative_path(
+            item["path"], field_name=f"{field_name}.files[{index}].path"
+        ).as_posix()
+        checksum = str(item["sha256"])
+        if not _SHA256.fullmatch(checksum):
+            raise ValueError(
+                f"{field_name} checksum must be lowercase SHA-256: {relative}"
+            )
+        parsed.append((relative, checksum))
+
+    if parsed != sorted(parsed, key=lambda item: item[0]):
+        raise ValueError(f"{field_name} files must be sorted by path")
+    if len({path for path, _checksum in parsed}) != len(parsed):
+        raise ValueError(f"{field_name} must not contain duplicate paths")
+    return tuple(parsed)
+
+
 def _inventoried_json(
     root: Path,
     relative: str,
@@ -939,6 +988,132 @@ def _inventoried_json(
     if checksum != expected_sha256[relative]:
         raise ValueError(f"Training artifact checksum mismatch: {relative}")
     return value
+
+
+def _validate_model_nested_checksum_claims(
+    *,
+    root: Path,
+    registered_id: str,
+    model_manifest: Mapping[str, Any],
+    expected_sha256: Mapping[str, str],
+) -> None:
+    """Reconcile optional model-level checksum claims with published bytes."""
+
+    model_prefix = PurePosixPath("models", registered_id)
+    if "preprocessing_artifacts" in model_manifest:
+        field_name = f"Model {registered_id} preprocessing_artifacts"
+        advertised = _parse_nested_checksum_inventory(
+            model_manifest["preprocessing_artifacts"], field_name=field_name
+        )
+        checksum_manifest_relative = PurePosixPath(
+            model_prefix, "preprocessing", "checksums.json"
+        ).as_posix()
+        if checksum_manifest_relative not in expected_sha256:
+            raise ValueError(
+                f"{field_name} must have a checksum-inventoried checksums.json"
+            )
+        checksum_manifest = _inventoried_json(
+            root,
+            checksum_manifest_relative,
+            expected_sha256,
+            field_name=f"Preprocessing checksum manifest {registered_id}",
+        )
+        if checksum_manifest != model_manifest["preprocessing_artifacts"]:
+            raise ValueError(
+                f"{field_name} disagrees with preprocessing/checksums.json"
+            )
+
+        preprocessing_prefix = PurePosixPath(model_prefix, "preprocessing")
+        checksum_manifest_path = PurePosixPath(
+            preprocessing_prefix, "checksums.json"
+        )
+        prefix_length = len(model_prefix.parts)
+        inventoried_payloads: set[str] = set()
+        for relative in expected_sha256:
+            path = PurePosixPath(relative)
+            if (
+                path != checksum_manifest_path
+                and path.parts[: len(preprocessing_prefix.parts)]
+                == preprocessing_prefix.parts
+            ):
+                inventoried_payloads.add(
+                    PurePosixPath(*path.parts[prefix_length:]).as_posix()
+                )
+        advertised_paths = {relative for relative, _checksum in advertised}
+        if advertised_paths != inventoried_payloads:
+            missing_claims = sorted(inventoried_payloads - advertised_paths)
+            unexpected_claims = sorted(advertised_paths - inventoried_payloads)
+            raise ValueError(
+                f"{field_name} paths must exactly match the run-inventoried "
+                "preprocessing payload files; "
+                f"missing_claims={missing_claims}, "
+                f"unexpected_claims={unexpected_claims}"
+            )
+
+        for relative, advertised_checksum in advertised:
+            nested_path = PurePosixPath(relative)
+            if (
+                nested_path.parts[0] != "preprocessing"
+                or nested_path == PurePosixPath("preprocessing", "checksums.json")
+            ):
+                raise ValueError(
+                    f"{field_name} paths must identify preprocessing payload files"
+                )
+            run_relative = PurePosixPath(model_prefix, *nested_path.parts).as_posix()
+            if expected_sha256.get(run_relative) != advertised_checksum:
+                raise ValueError(
+                    f"{field_name} checksum disagrees with the run inventory: "
+                    f"{relative}"
+                )
+
+    if "training_metadata" not in model_manifest:
+        return
+    field_name = f"Model {registered_id} training_metadata"
+    training_metadata = _require_mapping(
+        model_manifest["training_metadata"], field_name=field_name
+    )
+    metadata_relative = PurePosixPath(
+        model_prefix, "training_metadata.json"
+    ).as_posix()
+    if metadata_relative not in expected_sha256:
+        raise ValueError(f"{field_name} must have an inventoried training_metadata.json")
+    saved_metadata = _inventoried_json(
+        root,
+        metadata_relative,
+        expected_sha256,
+        field_name=f"Training metadata {registered_id}",
+    )
+    if saved_metadata != training_metadata:
+        raise ValueError(f"{field_name} disagrees with training_metadata.json")
+
+    if "model_checkpoint" not in training_metadata:
+        return
+    checkpoint = _require_mapping(
+        training_metadata["model_checkpoint"],
+        field_name=f"{field_name}.model_checkpoint",
+    )
+    _require_fields(
+        checkpoint,
+        {"path", "sha256"},
+        field_name=f"{field_name}.model_checkpoint",
+    )
+    checkpoint_relative = _safe_relative_path(
+        checkpoint["path"], field_name=f"{field_name}.model_checkpoint.path"
+    ).as_posix()
+    if PurePosixPath(checkpoint_relative).parts[0] != "checkpoints":
+        raise ValueError(
+            f"{field_name}.model_checkpoint.path must identify a checkpoint payload"
+        )
+    checkpoint_sha256 = str(checkpoint["sha256"])
+    if not _SHA256.fullmatch(checkpoint_sha256):
+        raise ValueError(
+            f"{field_name}.model_checkpoint.sha256 must be lowercase SHA-256"
+        )
+    if expected_sha256.get(checkpoint_relative) != checkpoint_sha256:
+        raise ValueError(
+            f"{field_name} checkpoint checksum disagrees with the run inventory: "
+            f"{checkpoint_relative}"
+        )
 
 
 def seal_training_run_artifacts(
@@ -1092,6 +1267,12 @@ def validate_training_run_artifacts(
         ).as_posix()
         if expected_sha256.get(artifact_relative) != model_manifest["artifact_sha256"]:
             raise ValueError("Training model binary is not transitively checksum-bound")
+        _validate_model_nested_checksum_claims(
+            root=root,
+            registered_id=registered_id,
+            model_manifest=model_manifest,
+            expected_sha256=expected_sha256,
+        )
 
     observed_manifest_paths = {
         relative

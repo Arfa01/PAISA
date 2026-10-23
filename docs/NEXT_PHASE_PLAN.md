@@ -211,8 +211,12 @@ fit transforms.
 Freeze paired configurations that differ only by the added sentiment features.
 Use identical target definitions, target-date split boundaries, seeds,
 evaluation rows, decision policy, execution rules, initial cash, and fees.
-Select configurations on validation evidence and evaluate the untouched test
-split once. Report prediction and portfolio metrics separately.
+Select configurations on validation evidence and evaluate a declared
+post-freeze test split once for that comparison. Report prediction and
+portfolio metrics separately. The existing 2025-12-16 through 2026-09-15
+window has already been exposed for M-001 through M-006; any future reuse must
+be disclosed as repeated shared-holdout evaluation rather than described as a
+globally untouched test.
 
 Acceptance gate: one comparison report records the ordered feature sets and
 proves matched dates and assumptions; inconclusive or negative results are

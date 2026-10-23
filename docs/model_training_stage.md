@@ -222,8 +222,10 @@ the canonical frozen split. Learned preprocessing is fit on training rows only.
 Earlier chronological rows may provide context to a validation/test sequence
 without changing its target-date membership, and no row after a prediction's
 `feature_date` may enter that sequence. Validation evidence selects and reports
-the preferred variant; the untouched test split is evaluated only after that
-choice is frozen.
+the preferred variant; the LSTM test split is evaluated only after that choice
+is frozen. This is an LSTM selection-order guarantee, not a claim that the
+project holdout is globally untouched: M-001 through M-004 had already exposed
+the same 184 test dates and their results.
 
 Each execution creates an immutable directory below
 `artifacts/lstm_experiments/<run_id>/` containing the split/source reference,
@@ -236,7 +238,7 @@ remain direct backtesting inputs, with independent portfolio state per model.
 The certified local execution is
 `LSTM-20261024-OGDC-price-only-01`, produced on CPU from clean commit
 `eb28ea53ffd69032f4b1109be127e23f1ddcc140`. Both variants stopped after 7
-epochs; validation selected M-005. On all 184 common untouched-test dates,
+epochs; validation selected M-005. On all 184 common post-freeze LSTM test dates,
 M-005/M-006 balanced accuracy is `0.520087`/`0.544251`. Their fixed-policy
 portfolio returns are `-3.64071%`/`-3.88909%`, versus `+6.24789%` for
 buy-and-hold. M-006 exceeds M-001 through M-004 on fair-date test balanced

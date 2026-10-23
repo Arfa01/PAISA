@@ -26,7 +26,7 @@ React/Plotly dashboard.
   collision refusal.
 - Trained three Random Forest variants (`M-001` to `M-003`) and one XGBoost
   variant (`M-004`) on the same OGDC observations.
-- Passed each model's untouched test predictions through the same separate
+- Passed each model's then-held-out test predictions through the same separate
   decision policy and independent portfolio engine.
 - Added cash-only and 50%-allocated buy-and-hold benchmarks, fees, trade
   ledgers, daily snapshots, drawdowns, and aggregate reports.
@@ -34,6 +34,11 @@ React/Plotly dashboard.
   model/portfolio comparisons, experiment details, and provenance.
 - Preserved the completed run and its model-training reference as immutable,
   checksum-inventoried local artifacts.
+
+The test window was held out when this baseline work was performed. The later
+M-005/M-006 experiment reused the same 184 dates and the already-exposed
+M-001–M-004 outcomes, so it is now a shared project holdout rather than a
+globally untouched test.
 
 ## Data and split evidence
 

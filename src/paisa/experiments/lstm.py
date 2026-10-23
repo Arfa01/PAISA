@@ -505,6 +505,52 @@ class LSTMInferenceBundle:
         if self.keras_format != "keras-v3":
             raise ValueError("keras_format must be 'keras-v3'")
 
+    def __setstate__(self, state: Any) -> None:
+        """Restore current and legacy slotted bundles from joblib state.
+
+        Bundles written before the train-only imputer was introduced have no
+        ``preprocessor`` slot in their pickle state.  Python can otherwise
+        deserialize such an object while leaving the new slot unset, causing
+        inference to fail only when the attribute is first accessed.
+        """
+
+        if isinstance(state, tuple):
+            if len(state) != 2:
+                raise ValueError("LSTM bundle pickle state must contain two items")
+            dictionary_state, slot_state = state
+            if dictionary_state is not None and not isinstance(
+                dictionary_state, Mapping
+            ):
+                raise TypeError("LSTM bundle dictionary state must be a mapping")
+            if not isinstance(slot_state, Mapping):
+                raise TypeError("LSTM bundle slot state must be a mapping")
+            restored = dict(dictionary_state or {})
+            restored.update(slot_state)
+        elif isinstance(state, Mapping):
+            restored = dict(state)
+        else:
+            raise TypeError("LSTM bundle pickle state must be a mapping or pair")
+
+        field_names = (
+            "keras_model_bytes",
+            "scaler",
+            "feature_columns",
+            "sequence_length",
+            "keras_format",
+            "preprocessor",
+        )
+        unknown = sorted(set(restored) - set(field_names))
+        if unknown:
+            raise ValueError(f"LSTM bundle pickle state has unknown fields: {unknown}")
+        restored.setdefault("preprocessor", None)
+        missing = sorted(set(field_names) - set(restored))
+        if missing:
+            raise ValueError(f"LSTM bundle pickle state is missing fields: {missing}")
+
+        for field_name in field_names:
+            object.__setattr__(self, field_name, restored[field_name])
+        self.__post_init__()
+
     def load_keras_model(self, *, tensorflow_module: Any | None = None) -> Any:
         """Reconstruct the Keras model without making TensorFlow a core dependency."""
 
@@ -620,6 +666,10 @@ def build_lstm_sequence_batch(
 
     history = all_rows.copy()
     history["feature_date"] = pd.to_datetime(history["feature_date"], errors="raise")
+    if "target_date" in history.columns:
+        history["target_date"] = pd.to_datetime(
+            history["target_date"], errors="raise"
+        )
     history = history.sort_values("feature_date", kind="mergesort").reset_index(drop=True)
     if history["feature_date"].duplicated().any():
         raise ValueError("all_rows feature_date must be unique")
@@ -651,6 +701,34 @@ def build_lstm_sequence_batch(
     if not (selected["target_date"] > selected["feature_date"]).all():
         raise ValueError("Every LSTM target_date must be later than feature_date")
 
+    selected_has_targets = TARGET_NAME in selected.columns
+    if selected_has_targets:
+        required_authoritative = {"target_date", TARGET_NAME}
+        missing_authoritative = sorted(
+            required_authoritative - set(history.columns)
+        )
+        if missing_authoritative:
+            raise ValueError(
+                "all_rows is missing authoritative target metadata required for "
+                f"labelled target_rows: {missing_authoritative}"
+            )
+        selected_target_values = pd.to_numeric(
+            selected[TARGET_NAME], errors="raise"
+        ).to_numpy(dtype=float, na_value=np.nan)
+        if not np.isfinite(selected_target_values).all():
+            raise ValueError(
+                f"target_rows {TARGET_NAME} must contain only classes 0 and 1"
+            )
+        parsed_selected_targets = selected_target_values.astype(np.int32)
+        if (
+            not np.equal(selected_target_values, parsed_selected_targets).all()
+            or not np.isin(parsed_selected_targets, [0, 1]).all()
+        ):
+            raise ValueError(
+                f"target_rows {TARGET_NAME} must contain only classes 0 and 1"
+            )
+        selected[TARGET_NAME] = selected_target_values.astype(np.int32)
+
     history_index = {
         timestamp: index for index, timestamp in enumerate(history["feature_date"])
     }
@@ -663,6 +741,31 @@ def build_lstm_sequence_batch(
         if feature_date not in history_index:
             raise ValueError(f"Target feature_date is absent from all_rows: {feature_date.date()}")
         end_index = history_index[feature_date]
+        authoritative_row = history.iloc[end_index]
+        if "target_date" in history.columns and pd.Timestamp(
+            row["target_date"]
+        ) != pd.Timestamp(authoritative_row["target_date"]):
+            raise ValueError(
+                "target_rows target_date does not match all_rows for feature_date "
+                f"{feature_date.date()}"
+            )
+        if selected_has_targets:
+            authoritative_target = pd.to_numeric(
+                pd.Series([authoritative_row[TARGET_NAME]]), errors="raise"
+            ).to_numpy(dtype=float, na_value=np.nan)
+            if (
+                not np.isfinite(authoritative_target).all()
+                or not np.isin(authoritative_target, [0.0, 1.0]).all()
+            ):
+                raise ValueError(
+                    f"all_rows {TARGET_NAME} must contain class 0 or 1 for selected "
+                    f"feature_date {feature_date.date()}"
+                )
+            if int(row[TARGET_NAME]) != int(authoritative_target[0]):
+                raise ValueError(
+                    f"target_rows {TARGET_NAME} does not match all_rows for "
+                    f"feature_date {feature_date.date()}"
+                )
         start_index = end_index - sequence_length + 1
         if start_index < 0:
             missing_context.append(feature_date.strftime("%Y-%m-%d"))

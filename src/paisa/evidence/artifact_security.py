@@ -7,6 +7,8 @@ committed accidentally, and avoid exposing host paths in validation errors.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -34,6 +36,79 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+def _is_link_like(path: Path) -> bool:
+    """Return whether an existing path is a symlink or Windows reparse link.
+
+    ``Path.is_symlink()`` does not identify every directory junction on all
+    supported Python versions. ``st_file_attributes`` covers older Windows
+    runtimes where ``Path.is_junction()`` is unavailable.
+    """
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(reparse_flag and file_attributes & reparse_flag)
+
+
+def _physical_relative_to(path: Path, parent: Path) -> Path | None:
+    """Return a relative path when an existing ancestor is physically ``parent``."""
+
+    for candidate in (path, *path.parents):
+        if not os.path.lexists(candidate):
+            continue
+        try:
+            if candidate.samefile(parent):
+                return path.relative_to(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _canonical_repository_path(
+    repository: Path,
+    relative: Path,
+    *,
+    error_type: type[_Error],
+    label: str,
+) -> Path:
+    """Use on-disk component names for a path physically under a repository."""
+
+    current = repository
+    parts = relative.parts
+    for index, part in enumerate(parts):
+        requested = current / part
+        if not os.path.lexists(requested):
+            return current.joinpath(*parts[index:])
+        try:
+            requested_metadata = requested.lstat()
+            with os.scandir(current) as entries:
+                matching_name = next(
+                    (
+                        entry.name
+                        for entry in entries
+                        if os.path.samestat(
+                            requested_metadata,
+                            entry.stat(follow_symlinks=False),
+                        )
+                    ),
+                    None,
+                )
+        except OSError:
+            _raise(error_type, f"Could not verify {label.lower()} path identity")
+        if matching_name is None:
+            _raise(error_type, f"Could not verify {label.lower()} path identity")
+        current = current / matching_name
+    return current
+
+
 def _reject_symlink_components(
     path: Path,
     *,
@@ -47,7 +122,7 @@ def _reject_symlink_components(
     current = boundary
     for part in relative.parts:
         current = current / part
-        if os.path.lexists(current) and current.is_symlink():
+        if os.path.lexists(current) and _is_link_like(current):
             _raise(error_type, f"{label} cannot contain symlink components")
 
 
@@ -135,13 +210,22 @@ def prepare_output_root(
     if not repository.is_dir():
         _raise(error_type, "Configured repository root must be a directory")
 
-    if os.path.lexists(lexical) and lexical.is_symlink():
+    if os.path.lexists(lexical) and _is_link_like(lexical):
         _raise(error_type, f"{label} cannot be a symlink")
 
     lexically_inside = _is_relative_to(lexical, repository_lexical)
-    if lexically_inside:
-        unresolved_target = lexical.resolve(strict=False)
-        if not _is_relative_to(unresolved_target, repository):
+    repository_relative = _physical_relative_to(lexical, repository)
+    if lexically_inside and repository_relative is None:
+        _raise(error_type, f"{label} resolves outside the configured repository")
+    if repository_relative is not None:
+        target = _canonical_repository_path(
+            repository,
+            repository_relative,
+            error_type=error_type,
+            label=label,
+        )
+        unresolved_target = target.resolve(strict=False)
+        if _physical_relative_to(unresolved_target, repository) is None:
             _raise(error_type, f"{label} resolves outside the configured repository")
         _git_output_policy(
             unresolved_target,
@@ -149,22 +233,31 @@ def prepare_output_root(
             error_type=error_type,
             label=label,
         )
+    else:
+        target = lexical
 
     try:
-        lexical.mkdir(parents=True, exist_ok=True, mode=0o700)
-        metadata = lexical.lstat()
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = target.lstat()
     except OSError:
         _raise(error_type, f"{label} could not be created safely")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    if _is_link_like(target) or not stat.S_ISDIR(metadata.st_mode):
         _raise(error_type, f"{label} must be a real directory")
     try:
-        resolved = lexical.resolve(strict=True)
+        resolved = target.resolve(strict=True)
     except OSError:
         _raise(error_type, f"{label} could not be resolved safely")
 
-    if lexically_inside and not _is_relative_to(resolved, repository):
+    resolved_relative = _physical_relative_to(resolved, repository)
+    if repository_relative is not None and resolved_relative is None:
         _raise(error_type, f"{label} resolves outside the configured repository")
-    if _is_relative_to(resolved, repository):
+    if resolved_relative is not None:
+        resolved = _canonical_repository_path(
+            repository,
+            resolved_relative,
+            error_type=error_type,
+            label=label,
+        ).resolve(strict=True)
         _git_output_policy(
             resolved,
             repository_root=repository,
@@ -172,6 +265,96 @@ def prepare_output_root(
             label=label,
         )
     return resolved
+
+
+def atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename one staged entry while refusing any destination.
+
+    ``os.rename`` replaces an existing destination on POSIX, so publication
+    code must use the platform's exclusive rename primitive instead.  Both
+    dangling symlinks and entries created concurrently count as collisions.
+    The source and destination must be direct children of already validated
+    directories on the same filesystem.
+    """
+
+    if source.name in {"", ".", ".."} or destination.name in {"", ".", ".."}:
+        raise ValueError("Publication paths must be direct children")
+
+    if os.name == "nt":
+        # Windows rename already refuses to replace an existing destination.
+        os.rename(source, destination)
+        return
+
+    parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    parent_flags |= getattr(os, "O_DIRECTORY", 0)
+    parent_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_parent_fd = os.open(source.parent, parent_flags)
+    destination_parent_fd: int | None = None
+    try:
+        destination_parent_fd = os.open(destination.parent, parent_flags)
+        libc = ctypes.CDLL(None, use_errno=True)
+        source_bytes = os.fsencode(source.name)
+        destination_bytes = os.fsencode(destination.name)
+        if hasattr(libc, "renameat2"):
+            operation = libc.renameat2
+            operation.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            operation.restype = ctypes.c_int
+            result = operation(
+                source_parent_fd,
+                source_bytes,
+                destination_parent_fd,
+                destination_bytes,
+                1,  # RENAME_NOREPLACE
+            )
+        elif hasattr(libc, "renameatx_np"):
+            operation = libc.renameatx_np
+            operation.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            operation.restype = ctypes.c_int
+            result = operation(
+                source_parent_fd,
+                source_bytes,
+                destination_parent_fd,
+                destination_bytes,
+                0x00000004,  # RENAME_EXCL
+            )
+        else:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace publication is unavailable on this platform",
+            )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise FileExistsError(
+                    error_number,
+                    os.strerror(error_number),
+                    destination,
+                )
+            raise OSError(error_number, os.strerror(error_number), destination)
+    finally:
+        if destination_parent_fd is not None:
+            try:
+                os.close(destination_parent_fd)
+            except OSError:
+                # Descriptor cleanup must not turn a successful atomic rename
+                # into an apparent publication failure.
+                pass
+        try:
+            os.close(source_parent_fd)
+        except OSError:
+            pass
 
 
 def make_pack_private(
@@ -268,6 +451,7 @@ def remove_staging_tree(staging: Path, *, output_root: Path) -> None:
 
 
 __all__ = [
+    "atomic_rename_noreplace",
     "make_pack_private",
     "prepare_output_root",
     "reject_symlink_components",

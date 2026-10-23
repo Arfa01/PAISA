@@ -329,6 +329,109 @@ def test_runner_refuses_collision_before_training_and_preserves_baselines(
     assert vertical_marker.read_text(encoding="utf-8") == "vertical\n"
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_runner_rejects_direct_and_intermediate_output_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool
+):
+    prices = tmp_path / "prices.csv"
+    prices.write_text("date,open,close,volume\n", encoding="utf-8")
+    training_root = tmp_path / "training"
+    vertical_root = tmp_path / "vertical"
+    training_root.mkdir()
+    vertical_root.mkdir()
+    training_evidence = SimpleNamespace(
+        run_directory=training_root.resolve(),
+        run_id="TRN-test",
+        invocation_id="training-invocation",
+        run_manifest_sha256="a" * 64,
+        artifact_sha256=(("frozen_input/OGDC_prices.csv", _sha256(prices)),),
+    )
+    vertical_evidence = runner.DirectoryInventoryEvidence(
+        directory=vertical_root.resolve(),
+        manifest_sha256="b" * 64,
+        files=(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_training_run_artifacts",
+        lambda *_args, **_kwargs: training_evidence,
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_vertical_slice_artifacts",
+        lambda *_args, **_kwargs: vertical_evidence,
+    )
+    monkeypatch.setattr(runner, "_validate_baseline_relationship", lambda *_args: None)
+
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    output_link = tmp_path / "output-link"
+    output_link.symlink_to(real_output, target_is_directory=True)
+    output = output_link / "nested" if nested else output_link
+
+    with pytest.raises(ValueError, match="cannot contain symlink components"):
+        runner.run_lstm_price_only_experiments(
+            prices_path=prices,
+            output_dir=output,
+            run_id="LSTM-output-link",
+            baseline_training_run=training_root,
+            baseline_vertical_slice=vertical_root,
+            create_zip=False,
+            tensorflow_module=object(),
+        )
+
+    assert list(real_output.iterdir()) == []
+
+
+def test_runner_rejects_output_below_baseline_before_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    prices = tmp_path / "prices.csv"
+    prices.write_text("date,open,close,volume\n", encoding="utf-8")
+    training_root = tmp_path / "training"
+    vertical_root = tmp_path / "vertical"
+    training_root.mkdir()
+    vertical_root.mkdir()
+    training_evidence = SimpleNamespace(
+        run_directory=training_root.resolve(),
+        run_id="TRN-test",
+        invocation_id="training-invocation",
+        run_manifest_sha256="a" * 64,
+        artifact_sha256=(("frozen_input/OGDC_prices.csv", _sha256(prices)),),
+    )
+    vertical_evidence = runner.DirectoryInventoryEvidence(
+        directory=vertical_root.resolve(),
+        manifest_sha256="b" * 64,
+        files=(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_training_run_artifacts",
+        lambda *_args, **_kwargs: training_evidence,
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_vertical_slice_artifacts",
+        lambda *_args, **_kwargs: vertical_evidence,
+    )
+    monkeypatch.setattr(runner, "_validate_baseline_relationship", lambda *_args: None)
+    forbidden_output = training_root / "must-not-be-created"
+
+    with pytest.raises(ValueError, match="inside a retained baseline"):
+        runner.run_lstm_price_only_experiments(
+            prices_path=prices,
+            output_dir=forbidden_output,
+            run_id="LSTM-inside-baseline",
+            baseline_training_run=training_root,
+            baseline_vertical_slice=vertical_root,
+            create_zip=False,
+            tensorflow_module=object(),
+        )
+
+    assert not forbidden_output.exists()
+    assert list(training_root.iterdir()) == []
+
+
 def test_runner_cleans_staging_after_late_failure_and_preserves_baselines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -429,7 +532,7 @@ def test_runner_cleans_staging_after_late_failure_and_preserves_baselines(
     assert vertical_marker.read_text(encoding="utf-8") == "vertical baseline\n"
 
 
-def test_zip_publish_failure_rolls_back_just_published_run(
+def test_zip_publish_failure_never_exposes_run_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     stage_parent = tmp_path / ".stage"
@@ -456,6 +559,141 @@ def test_zip_publish_failure_rolls_back_just_published_run(
     assert not final_run.exists()
     assert not final_zip.exists()
     assert staged_zip.read_bytes() == b"complete staged zip"
+
+
+@pytest.mark.parametrize("collision_kind", ["run", "zip"])
+def test_publication_rejects_dangling_destination_symlinks(
+    tmp_path: Path, collision_kind: str
+):
+    stage_parent = tmp_path / ".stage"
+    stage_dir = stage_parent / "LSTM-dangling-link"
+    stage_dir.mkdir(parents=True)
+    (stage_dir / "run_manifest.json").write_text("{}", encoding="utf-8")
+    staged_zip = stage_parent / "LSTM-dangling-link.zip"
+    staged_zip.write_bytes(b"sealed zip")
+    final_run = tmp_path / "LSTM-dangling-link"
+    final_zip = tmp_path / "LSTM-dangling-link.zip"
+    collision = final_run if collision_kind == "run" else final_zip
+    collision.symlink_to(tmp_path / "missing-target", target_is_directory=False)
+
+    with pytest.raises(FileExistsError, match="appeared during staging"):
+        runner._publish_staged_artifacts(
+            stage_dir=stage_dir,
+            staged_zip=staged_zip,
+            final_run_dir=final_run,
+            final_zip=final_zip,
+        )
+
+    assert collision.is_symlink()
+    assert stage_dir.is_dir()
+    assert staged_zip.read_bytes() == b"sealed zip"
+
+
+def test_publication_is_no_replace_during_destination_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    stage_parent = tmp_path / ".stage"
+    stage_dir = stage_parent / "LSTM-race"
+    stage_dir.mkdir(parents=True)
+    staged_zip = stage_parent / "LSTM-race.zip"
+    staged_zip.write_bytes(b"sealed zip")
+    final_run = tmp_path / "LSTM-race"
+    final_zip = tmp_path / "LSTM-race.zip"
+    original = runner.atomic_rename_noreplace
+
+    def create_raced_destination(source: Path, destination: Path) -> None:
+        if destination == final_zip:
+            destination.write_bytes(b"incumbent")
+        original(source, destination)
+
+    monkeypatch.setattr(
+        runner, "atomic_rename_noreplace", create_raced_destination
+    )
+    with pytest.raises(FileExistsError):
+        runner._publish_staged_artifacts(
+            stage_dir=stage_dir,
+            staged_zip=staged_zip,
+            final_run_dir=final_run,
+            final_zip=final_zip,
+        )
+
+    assert final_zip.read_bytes() == b"incumbent"
+    assert staged_zip.read_bytes() == b"sealed zip"
+    assert stage_dir.is_dir()
+    assert not final_run.exists()
+
+
+def test_zip_is_published_first_and_retained_if_run_commit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    stage_parent = tmp_path / ".stage"
+    stage_dir = stage_parent / "LSTM-final-boundary"
+    stage_dir.mkdir(parents=True)
+    staged_zip = stage_parent / "LSTM-final-boundary.zip"
+    staged_zip.write_bytes(b"sealed zip")
+    final_run = tmp_path / "LSTM-final-boundary"
+    final_zip = tmp_path / "LSTM-final-boundary.zip"
+    original = runner.atomic_rename_noreplace
+    calls: list[tuple[str, str]] = []
+
+    def fail_run_commit(source: Path, destination: Path) -> None:
+        calls.append((source.name, destination.name))
+        if destination == final_run:
+            destination.mkdir()
+            (destination / "incumbent.txt").write_text("old", encoding="utf-8")
+        original(source, destination)
+
+    monkeypatch.setattr(runner, "atomic_rename_noreplace", fail_run_commit)
+    with pytest.raises(FileExistsError):
+        runner._publish_staged_artifacts(
+            stage_dir=stage_dir,
+            staged_zip=staged_zip,
+            final_run_dir=final_run,
+            final_zip=final_zip,
+        )
+
+    assert calls == [
+        ("LSTM-final-boundary.zip", "LSTM-final-boundary.zip"),
+        ("LSTM-final-boundary", "LSTM-final-boundary"),
+    ]
+    assert final_zip.read_bytes() == b"sealed zip"
+    assert (final_run / "incumbent.txt").read_text(encoding="utf-8") == "old"
+    assert stage_dir.is_dir()
+
+
+def test_failed_run_commit_does_not_delete_replaced_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    stage_parent = tmp_path / ".stage"
+    stage_dir = stage_parent / "LSTM-owned-cleanup"
+    stage_dir.mkdir(parents=True)
+    staged_zip = stage_parent / "LSTM-owned-cleanup.zip"
+    staged_zip.write_bytes(b"sealed zip")
+    final_run = tmp_path / "LSTM-owned-cleanup"
+    final_zip = tmp_path / "LSTM-owned-cleanup.zip"
+    original = runner.atomic_rename_noreplace
+
+    def replace_zip_before_run_failure(source: Path, destination: Path) -> None:
+        if destination == final_run:
+            final_zip.unlink()
+            final_zip.write_bytes(b"replacement owned elsewhere")
+            raise OSError("injected run publication failure")
+        original(source, destination)
+
+    monkeypatch.setattr(
+        runner, "atomic_rename_noreplace", replace_zip_before_run_failure
+    )
+    with pytest.raises(OSError, match="injected run publication failure"):
+        runner._publish_staged_artifacts(
+            stage_dir=stage_dir,
+            staged_zip=staged_zip,
+            final_run_dir=final_run,
+            final_zip=final_zip,
+        )
+
+    assert final_zip.read_bytes() == b"replacement owned elsewhere"
+    assert stage_dir.is_dir()
+    assert not final_run.exists()
 
 
 class _FakeModel:
@@ -722,6 +960,19 @@ def test_all_six_fair_predictions_use_identical_rules_and_unique_portfolios(
         )
     }
     assert len(portfolio_ids) == 18
+    comparison_leaderboard = pd.read_csv(stage / "comparison_leaderboard.csv")
+    assert "registered_model_id" in comparison_leaderboard.columns
+    assert "registered_model_id_x" not in comparison_leaderboard.columns
+    assert "registered_model_id_y" not in comparison_leaderboard.columns
+    assert dict(
+        zip(
+            comparison_leaderboard["variant_id"],
+            comparison_leaderboard["registered_model_id"],
+            strict=True,
+        )
+    ) == {
+        variant_id: f"{variant_id}-registered" for variant_id in probabilities
+    }
     assert (stage / "comparison_plots" / "prediction_metric_comparison.png").is_file()
     assert (stage / "comparison_plots" / "portfolio_equity_comparison.png").is_file()
 
@@ -890,6 +1141,7 @@ def test_fake_end_to_end_run_has_required_structure_and_valid_seal(
         tensorflow_module=_fake_tensorflow(),
     )
 
+    assert summary["path_base"] == "absolute"
     run_dir = Path(summary["artifact_directory"])
     zip_path = Path(summary["zip_path"])
     required = {
@@ -922,11 +1174,21 @@ def test_fake_end_to_end_run_has_required_structure_and_valid_seal(
     assert run_dir / data_manifest["prices_path"] == frozen_prices
     assert data_manifest["prices_sha256"] == _sha256(frozen_prices)
     assert zip_path.is_file()
+    relocated_root = tmp_path / "relocated"
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
+        archive.extractall(relocated_root)
     assert names
     assert all(name.startswith("LSTM-fixture-run/") for name in names)
     assert "LSTM-fixture-run/frozen_input/OGDC_prices.csv" in names
+    relocated_run = relocated_root / "LSTM-fixture-run"
+    relocated_summary = json.loads(
+        (relocated_run / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert relocated_summary["path_base"] == "output_root"
+    assert relocated_summary["artifact_directory"] == "LSTM-fixture-run"
+    assert str(tmp_path) not in json.dumps(relocated_summary, sort_keys=True)
+    validate_sealed_training_run(relocated_run)
     assert {path.name for path in (tmp_path / "runs").iterdir()} == {
         "LSTM-fixture-run",
         "LSTM-fixture-run.zip",
@@ -979,10 +1241,35 @@ def test_fake_end_to_end_run_has_required_structure_and_valid_seal(
     final_summary = json.loads(
         (run_dir / "final_summary.json").read_text(encoding="utf-8")
     )
+    assert final_summary["schema_version"] == "1.1"
+    assert final_summary["artifact_directory"] == "LSTM-fixture-run"
+    assert final_summary["zip_path"] == "LSTM-fixture-run.zip"
+    assert final_summary["path_base"] == "output_root"
+    assert str(tmp_path) not in json.dumps(final_summary, sort_keys=True)
     assert set(final_summary["lstm_metrics"]) == {
         "validation",
-        "untouched_test",
+        "post_freeze_lstm_test",
     }
+    assert "untouched_test_lstm_ranking" not in final_summary
+    assert "post_freeze_lstm_test_ranking" in final_summary
+    holdout_context = final_summary["shared_test_holdout_context"]
+    assert holdout_context["selection_frozen_before_lstm_test_inference"] is True
+    assert holdout_context["globally_untouched_project_holdout"] is False
+    assert holdout_context["previously_exposed_through_variants"] == [
+        "M-001",
+        "M-002",
+        "M-003",
+        "M-004",
+    ]
+    assert holdout_context["shared_with_variants"] == [
+        "M-001",
+        "M-002",
+        "M-003",
+        "M-004",
+        "M-005",
+        "M-006",
+    ]
+    assert "not a globally untouched project holdout" in holdout_context["disclosure"]
     for split_metrics in final_summary["lstm_metrics"].values():
         assert set(split_metrics) == {"M-005", "M-006"}
         for metrics in split_metrics.values():

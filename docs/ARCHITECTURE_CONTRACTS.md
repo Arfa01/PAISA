@@ -79,7 +79,7 @@ All splits are chronological. A row belongs to a split according to its
 target cannot fall in a later split. Learned preprocessing is fitted on the
 training split only. Hyperparameters, probability thresholds, and variant
 selection may use training and validation data only. Freeze the selected
-variant before evaluating the untouched test split once; test metrics must not
+variant before evaluating the held-out test split once; test metrics must not
 be used to select or tune a model/configuration. Random time-series splitting
 is prohibited.
 
@@ -157,7 +157,7 @@ manifest is JSON.
 | `target_definition` | object | Exact target name, positive-class condition, and class labels defined below. |
 | `prediction_horizon` | object | `{ "value": 1, "unit": "trading_session" }` for the vertical slice. |
 | `random_seed` | integer | Seed used by the model and every stochastic transform. |
-| `metrics` | object | Exact per-split prediction metric structure defined below. Test metrics come from the untouched chronological test split. |
+| `metrics` | object | Exact per-split prediction metric structure defined below. Test metrics come from the held-out chronological test split. |
 | `artifact_path` | string | Unique path, relative to the configured model artifact root, to the fitted binary inside this model's directory. |
 | `created_at` | UTC timestamp | Time at which the completed artifact was registered. |
 | `symbols` | array of strings | Training universe; `['OGDC']` for the first vertical slice unless explicitly documented otherwise. |

@@ -1,0 +1,213 @@
+# PAISA OGDC Price-Only LSTM Experiments
+
+This runbook covers the controlled `M-005` and `M-006` recurrent experiments.
+They use price and technical features only: no article, sentiment, event, or
+future-market field enters either model. The experiment is an academic
+simulation and is not financial advice.
+
+The authoritative outcome of any execution is its checksum-inventoried
+`final_summary.json`; documentation text is not a substitute for that artifact.
+
+## Controlled variants
+
+| Variant | Frozen label | Controlled configuration |
+|---|---|---|
+| `M-005` | `LSTM | 20-session sequence | baseline recurrent configuration | frozen` | One 64-unit LSTM layer, 20-session input, dropout `0.20`, and sigmoid binary output. |
+| `M-006` | `LSTM | 20-session sequence | regularized recurrent configuration | frozen` | The same ordered features, 20-session input, and 64 recurrent units, with stronger dropout/recurrent regularization. |
+
+The two variants retain the same data, feature order, sequence length, target,
+split dates, random-seed policy, optimizer family, prediction schema, trading
+rules, and portfolio assumptions. Their immutable model manifests contain the
+complete realized layer, regularization, optimizer, learning-rate, batch-size,
+early-stopping, and class-weight configuration. A neural-network label is not
+evidence of superiority.
+
+## Optional runtime
+
+TensorFlow/Keras remains outside `requirements.txt`, so normal PAISA CPU tests
+and the Random Forest/XGBoost pipeline do not depend on it. Install the default
+environment first, then add a compatible TensorFlow build only in the runtime
+used for this experiment. TensorFlow 2.21 supports CPython 3.10 through 3.13;
+do not create this environment with Python 3.14. For example, select Python
+3.13 explicitly:
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-lstm.txt
+python -m pip install -e .
+```
+
+`requirements-lstm.txt` includes the normal PAISA requirements and pins the
+supported TensorFlow release range for this workflow.
+
+CPU execution is supported. A Colab GPU may be used when available. Apple
+Metal is optional, macOS-only, and requires a TensorFlow-visible GPU through a
+separately installed/configured plugin such as `tensorflow-metal`; it is never
+a requirement for tests or the real run. Use `--device gpu` for a generic GPU
+request, `--device metal` only for that macOS policy, or the default
+`--device auto` to use TensorFlow's available runtime. The artifact records the
+actual Python, TensorFlow/Keras and NumPy versions, effective device, duration,
+seeds, and determinism status. Deterministic operations are requested where
+supported, but PAISA does not claim bit-identical CPU/GPU/Metal results.
+
+## Required immutable inputs
+
+For the canonical comparison, use the retained daily OGDC input and the exact
+baseline evidence it belongs to:
+
+```text
+artifacts/model_training/TRN-20261020-191815-624662-nogit/
+artifacts/vertical_slice/VSL-20261020-OGDC-main-02/
+```
+
+These generated artifacts are ignored by Git. A fresh clone must restore a
+checksum-verified custodian bundle or regenerate equivalent evidence with new
+immutable IDs. Do not silently fetch replacement data and call it the canonical
+comparison. The accepted training run's `frozen_input/OGDC_prices.csv` contains
+1,239 sessions from 2021-09-16 through 2026-09-15.
+
+## Run from the command line
+
+Choose a new run ID. Existing destinations fail rather than being overwritten:
+
+```bash
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/TRN-20261020-191815-624662-nogit/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id LSTM-REPLACE-WITH-A-NEW-UNUSED-ID \
+  --baseline-training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --baseline-vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+```
+
+Use `--no-zip` only when an archive is not needed. Run
+`python scripts/run_lstm_price_only_experiments.py --help` for the exact CLI
+contract.
+
+The equivalent reusable entry point is:
+
+```python
+from paisa.experiments.lstm_runner import run_lstm_price_only_experiments
+
+summary = run_lstm_price_only_experiments(
+    prices_path="path/to/OGDC_prices.csv",
+    output_dir="artifacts/lstm_experiments",
+    run_id="LSTM-NEW-UNUSED-ID",
+    baseline_training_run="path/to/TRN-run",
+    baseline_vertical_slice="path/to/VSL-run",
+    create_zip=True,
+    device="auto",
+)
+```
+
+The Colab/CPU notebook
+[`PAISA_OGDC_LSTM_Experiments.ipynb`](../notebooks/PAISA_OGDC_LSTM_Experiments.ipynb)
+calls this reusable entry point and only displays saved evidence. It does not
+reimplement sequence, model, metric, or portfolio logic.
+
+## Selection and untouched-test policy
+
+The common target-date split is chronological. Learned preprocessing is fit on
+training rows only. Early stopping, learning-rate decisions, epoch selection,
+checkpoint selection, and variant preference use validation evidence only.
+The test split is evaluated after the controlled configurations are frozen and
+is never used to tune or relabel a champion.
+
+On the canonical data, the 20-session contract yields 834 training, 182
+validation, and 184 test sequences. All baseline and LSTM validation/test dates
+match, but the runner still proves and persists the common-date intersection.
+See [the sequence contract](LSTM_SEQUENCE_CONTRACT.md) for boundary details.
+
+`validation_preferred_variant` means only the result of the declared
+validation rule. It is not renamed because of test accuracy or simulated
+portfolio return. Test results and portfolio outcomes are reported separately.
+
+## Backtesting contract
+
+Each test `predictions.csv` is passed directly to the existing portfolio engine
+with no schema conversion. It has exactly:
+
+```text
+schema_version,model_id,ticker,feature_date,target_date,predicted_class,
+probability_up,probability_down,actual_class
+```
+
+Probabilities must be finite, lie in `[0, 1]`, and sum to one within `1e-6`.
+Backtests retain the baseline rules: PKR 100,000 initial cash, buy at `0.60`,
+sell at `0.40`, 50% maximum allocation, 10-basis-point transaction cost, zero
+slippage, long-only state transitions, next-session-open execution, close
+valuation, and a 50%-allocated buy-and-hold benchmark. Every variant owns an
+independent strategy and benchmark portfolio.
+
+## Artifact layout
+
+Each successful execution creates one new immutable directory:
+
+```text
+artifacts/lstm_experiments/<run_id>/
+├── run_manifest.json
+├── frozen_input/
+│   └── OGDC_prices.csv
+├── split_reference.json
+├── preprocessing/
+├── models/
+│   ├── <M-005-registered_model_id>/
+│   └── <M-006-registered_model_id>/
+├── validation_leaderboard.csv
+├── test_leaderboard.csv
+├── training_history.csv
+├── comparison_plots/
+├── final_summary.json
+└── artifact_manifest.json
+```
+
+`run_manifest.json` maps the stable experiment variant IDs `M-005` and `M-006`
+to their unique immutable `registered_model_id` directory names. Consumers must
+follow that mapping instead of assuming the variant ID is the directory name.
+
+Per-model evidence includes the registered model identity, fitted model,
+preprocessing artifacts, ordered features, sequence length, split dates,
+configuration/architecture, parameter count, training history, predictions,
+metrics, confusion matrix, environment/source provenance, and checksums. The
+run-level manifest binds those files and rejects collisions or later mutation.
+
+## Interpretation and real-run status
+
+Report accuracy, balanced accuracy, precision, recall, F1, Matthews correlation
+coefficient, ROC-AUC, Brier score, confusion matrix, and calibration evidence.
+Report portfolio ending value, total return, maximum drawdown, volatility,
+Sharpe ratio, trades, fees, and result versus buy-and-hold separately. Any
+comparison with `M-001` through `M-004` must use persisted identical common
+target dates.
+
+`REAL_RUN_RESULTS_PENDING`: replace this marker only after a completed immutable
+run has passed artifact, prediction-schema, sequence-leakage, save/load, and
+backtester validation. At that point quote the generated `final_summary.json`
+run ID and results; do not infer or pre-fill metrics here.
+
+One stock, one period, and one trading policy cannot establish general market
+superiority or future performance. Unknown corporate-action adjustment,
+unmodeled dividends, small sample size, class/regime sensitivity, threshold
+sensitivity, and cross-device numeric variation remain limitations.
+
+## Verification
+
+From an activated environment, run:
+
+```bash
+python -m pytest
+python -m pip check
+python -m compileall src scripts
+git diff --check
+
+cd frontend
+npm ci
+npm run test
+npm run lint
+npm run build
+```
+
+The default test suite must remain offline. TensorFlow smoke training is bounded
+to a tiny fixture and skips only when the optional dependency is absent; a real
+completion claim requires running it in a TensorFlow-enabled environment.

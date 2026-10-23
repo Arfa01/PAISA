@@ -76,7 +76,7 @@ python -m pip install -r requirements-sentiment.txt
 | Providers and legacy data pipeline | `src/paisa/providers/`, `src/paisa/pipeline.py`, `src/paisa/preprocessing.py`, `src/paisa/features.py`, `scripts/run_v0_pipeline.py` |
 | Experiment data and targets | `src/paisa/experiments/training_features.py`, `src/paisa/experiments/training_targets.py`, `src/paisa/splits.py` |
 | Model training and evaluation | `src/paisa/experiments/trainer.py`, `src/paisa/experiments/evaluation.py`, `src/paisa/experiments/artifacts.py`, `src/paisa/experiments/registry.py`, `scripts/train_ogdc_models.py` |
-| Optional LSTM | `src/paisa/experiments/lstm.py`, `notebooks/PAISA_OGDC_LSTM_Training.ipynb` |
+| Price-only LSTM experiments | `src/paisa/experiments/lstm.py`, `src/paisa/experiments/lstm_runner.py`, `scripts/run_lstm_price_only_experiments.py`, `notebooks/PAISA_OGDC_LSTM_Experiments.ipynb`, `docs/LSTM_PRICE_ONLY_EXPERIMENTS.md`, `docs/LSTM_SEQUENCE_CONTRACT.md` |
 | Decision policy and portfolio | `src/paisa/trading/policy.py`, `src/paisa/trading/execution.py`, `src/paisa/trading/portfolio.py`, `src/paisa/trading/models.py` |
 | Backtesting and benchmarks | `src/paisa/backtesting/engine.py`, `src/paisa/backtesting/metrics.py`, `src/paisa/backtesting/benchmarks.py`, `src/paisa/backtesting/reports.py`, `scripts/run_backtest.py` |
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
@@ -118,7 +118,9 @@ experiments/<experiment_id>/
 ```
 
 Other generated roots are `runs/<experiment_id>/` for standalone backtests,
-`artifacts/lstm/<model_id>/` for optional LSTM registration,
+`artifacts/lstm_experiments/<run_id>/` for the immutable M-005/M-006
+price-only LSTM comparison (with `final_summary.json` as the run source of
+record),
 `artifacts/news_ingestion/<run_id>/` plus `data/news/paisa_news.sqlite3` for
 news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
 audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
@@ -963,8 +965,11 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    `available_at <= decision_cutoff`.
 2. Keep the current price-only feature set as the control; prepare paired
    price-only and price-plus-sentiment configurations with identical splits.
-3. Train and evaluate the paired Random Forest/XGBoost/LSTM experiments without
-   using test results for selection.
+3. Execute and certify the frozen price-only M-005/M-006 comparison first. Use
+   validation evidence to select/report the preferred variant and evaluate test
+   evidence only post-freeze. After the sentiment coverage gate passes, train
+   paired price-only and price-plus-sentiment experiments without using test
+   results for selection.
 4. Add SHAP result views only after Waqas exposes a validated artifact/API
    schema; explain model behavior, not causality.
 5. Extend dashboard components and client schemas without recalculating backend
@@ -984,8 +989,9 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    the retained real-run artifacts and audit sample before implementing
    leakage-safe daily aggregation with the
    `available_at <= decision_cutoff` rule.
-4. Develop the LSTM and relationship/knowledge-graph components behind the
-   current prediction and artifact contracts.
+4. Review and operate the price-only M-005/M-006 workflow behind the current
+   prediction and artifact contracts; develop the separate
+   relationship/knowledge-graph component only after its contract is written.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
    and `src/paisa/api/router_v1.py` additively for news, sentiment,
    explanations, and relationships; keep GET requests read-only.
@@ -1087,6 +1093,19 @@ python scripts/train_ogdc_models.py \
   --prices artifacts/vertical_slice/VSL-20261020-OGDC-main-02/input_snapshot/psx_prices.csv \
   --run-id "$PAISA_NEW_TRAINING_RUN_ID"
 
+# Optional TensorFlow price-only comparison. M-005 and M-006 both use the
+# frozen OGDC evidence; validation selects/reports and test is post-freeze.
+# CPU and Colab GPU are supported, Apple Metal is optional, and results are not
+# promised to be bit-identical across devices.
+python -m pip install -r requirements-lstm.txt
+PAISA_NEW_LSTM_RUN_ID="LSTM-REPLACE-WITH-A-NEW-UNUSED-ID"
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/TRN-20261020-191815-624662-nogit/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id "$PAISA_NEW_LSTM_RUN_ID" \
+  --baseline-training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --baseline-vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+
 # Full OGDC vertical slice with a new immutable ID. The command still attempts
 # live PSX-DPS first, then validates this complete checksum-bound cache bundle.
 PAISA_NEW_VERTICAL_RUN_ID="VSL-20261022-OGDC-team-handoff-01"
@@ -1108,8 +1127,10 @@ supervisor run must remain unchanged.
 From the repository root with `.venv` active:
 
 ```bash
+python -m pytest tests/test_lstm_notebook.py
 python -m pytest
 python -m pip check
+python -m compileall src scripts
 cd frontend
 npm ci
 npm run test

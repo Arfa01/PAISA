@@ -1,8 +1,8 @@
 # PAISA Current Implementation Status
 
-Status date: 23 October 2026
+Status date: 24 October 2026
 
-Feature base: `origin/main` at `9dc4b3a` after PR #13
+Feature base: `origin/main` at `cf897e1` after PR #15
 
 Retained demonstration run: `VSL-20261020-OGDC-main-02`
 
@@ -16,6 +16,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Stock-data foundation | The legacy v0 path implements PSX acquisition through `psx-dps`, with manual-CSV and offline sample alternatives; cleans the canonical daily schema; creates backward-looking technical features and `target_next_day_up`; trains the compatibility Random Forest; and preserves the original FastAPI routes. The acquisition path is implemented, but the live endpoint returned HTTP 404 during the retained run, so fresh live ingestion is not currently demonstrated. The optional `pypsx` provider remains separate from the default installation. |
 | Leakage-safe experiment data | The versioned path distinguishes `feature_date` and next-session `target_date`, splits chronologically by target date, fits learned transforms on training data only, records feature order and seeds, and preserves immutable input and model evidence. |
 | Versioned model comparison | `M-001`, `M-002`, and `M-003` are Random Forest variants; `M-004` is XGBoost. All four use the same daily OGDC feature set, target, split dates, and untouched test observations. Each has a unique registered model identity and checksum-protected artifacts. |
+| Price-only LSTM comparison | The isolated optional-TensorFlow workflow adds `M-005`, a 20-session/64-unit baseline with dropout `0.20`, and `M-006`, the same sequence length and hidden width with stronger dropout and recurrent regularization. It reuses the frozen OGDC input and split evidence, fits preprocessing on training data only, chooses the preferred variant from validation evidence, evaluates test data post-freeze, and publishes immutable run artifacts. No completed real LSTM run ID or metric is claimed in this document; generated `final_summary.json` is authoritative after execution. |
 | Decision and simulation | Predictions pass through a separate threshold policy into separate long-only portfolio ledgers. The retained run uses buy at `probability_up >= 0.60`, sell at `probability_up <= 0.40`, a 50% maximum allocation, whole shares, 10-basis-point execution fees, next-session-open execution, and close valuation. |
 | Independent comparisons | Each model has its own experiment, portfolio, trades, cash, holdings, and snapshots. Cash-only and 50%-allocated buy-and-hold benchmarks use the common test window and cost assumptions. |
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
@@ -53,6 +54,18 @@ The run reports separate conclusions:
 - The 50%-allocated buy-and-hold benchmark ends at PKR 106,247.89, a 6.24789%
   return with a 12.79045% maximum drawdown.
 - No model portfolio beats buy-and-hold in total return in this run.
+
+### LSTM execution status
+
+The price-only LSTM framework and its sequence contract are implemented, but a
+completed real M-005/M-006 run has not been recorded in this status document.
+The canonical split is expected to yield 834 training, 182 validation, and 184
+test sequences after the 20-session window is applied. Those counts are a
+contract check, not model-performance evidence. Do not infer a run ID, winning
+variant, metric, or simulated return from this page. After execution, the
+generated `final_summary.json` and its checksum-inventoried run directory are
+the sources of record; follow
+[`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md).
 
 ### Accepted news-ingestion execution
 
@@ -327,10 +340,12 @@ classifier-accuracy claims, or price-plus-sentiment comparison.
   recommendation engine or execution system.
 - The dashboard and artifact API are demonstration and analysis surfaces, not a
   production deployment or current market-data service.
-- The optional LSTM code and Colab notebook implement the common artifact and
-  chronological-split contract. TensorFlow is intentionally outside the default
-  runtime, and LSTM is not one of the four models in the retained demonstration
-  run.
+- The controlled M-005/M-006 price-only LSTM workflow and thin Colab notebook
+  implement the common artifact and chronological-split contract. TensorFlow is
+  intentionally outside the default runtime. The workflow supports CPU and
+  Colab GPU, with optional Apple Metal, but does not promise bit-identical
+  results across devices. Neither LSTM is part of the four-model retained
+  demonstration run above.
 - Stored Random Forest feature importance is preliminary explainability. SHAP
   explanations have not been implemented.
 - News entity linking is a deterministic first stage for controlled OGDC
@@ -348,7 +363,7 @@ classifier-accuracy claims, or price-plus-sentiment comparison.
 |---|---|
 | Collect, preprocess, and structure historical stock data | Partly complete. The reusable pipeline supports multiple symbols, while the retained vertical slice and its conclusions are OGDC-only and daily-only. |
 | Continuously update financial news, economic reports, and global events | Partly complete. Reproducible explicit RSS/Atom and imported-CSV runs now preserve news evidence, timing, quality, and failures. Scheduling, broad economic/global source coverage, and production operations are not implemented. |
-| Train and compare multiple prediction models | Implemented for three Random Forest configurations and one XGBoost configuration on one frozen OGDC split. The optional LSTM workflow is not promoted into this run. |
+| Train and compare multiple prediction models | Implemented for three Random Forest configurations and one XGBoost configuration on one frozen OGDC split. The separate M-005/M-006 price-only LSTM framework is implemented under the same target-date split contract, but its real run still must be executed and certified before any metric claim. |
 | Compare models with and without sentiment | Not implemented. Article-level inference is implemented, but daily aggregation and the controlled stock-feature comparison remain. The current stock comparison is price-only. |
 | Deploy the best-performing model as the prediction engine | Not complete. The v1 API deliberately serves retained results and does not load `M-001` for live inference; the legacy `/predict/{ticker}` route remains the v0 baseline compatibility path. |
 | Add event-driven company/sector reasoning | Partly complete only at the ingestion boundary: reviewed OGDC aliases are linked deterministically with evidence. General entities, sectors, events, graphs, and propagation are not implemented. |
@@ -361,12 +376,12 @@ Dawn fields or another licensed source, then acquisition/import of news whose
 publication and defensible cutoff availability overlap the frozen OGDC period.
 Only after a new immutable audit passes the configured coverage gate should the
 team review article sentiment and define daily aggregation. Price-only versus
-price-plus-sentiment comparison, LSTM under the same split contract, SHAP,
-additional stocks, and sector/event relationships remain later work. Production storage,
-authentication, scheduled ingestion/retraining, cloud deployment, broker
-integration, and live trading are also absent. Reinforcement learning is
-explicitly deferred until the data, sentiment, supervised-model, evaluation,
-and explanation components are stable.
+price-plus-sentiment comparison, execution and certification of the controlled
+price-only LSTM run, SHAP, additional stocks, and sector/event relationships
+remain later work. Production storage, authentication, scheduled
+ingestion/retraining, cloud deployment, broker integration, and live trading
+are also absent. Reinforcement learning is explicitly deferred until the data,
+sentiment, supervised-model, evaluation, and explanation components are stable.
 
 ## Documentation inconsistencies to keep visible
 
@@ -377,8 +392,9 @@ and explanation components are stable.
   a successful primary PSX price-provider fetch plus an executed TensorFlow
   LSTM smoke run. The retained vertical-slice run records the failed PSX request
   and verified legacy price cache, while the separate GDELT news acquisition
-  above did complete. There is still no LSTM model, and the GDELT success does
-  not satisfy the price-provider acceptance check.
+  above did complete. The M-005/M-006 workflow exists, but no completed retained
+  LSTM run is cited here, and the GDELT success does not satisfy the
+  price-provider acceptance check.
 - The proposal's “best-performing model” is not a single result here: `M-001`
   wins the validation-based prediction selection, while `M-002` produces the
   best model-portfolio simulation. The system correctly preserves that

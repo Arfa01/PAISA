@@ -20,6 +20,17 @@ uses the same preparation and artifact contracts:
 | `M-003` | Random Forest | More flexible configuration. |
 | `M-004` | XGBoost classifier | Same dates, features, target, and splits as the Random Forest variants. |
 
+The separate optional price-only recurrent comparison adds:
+
+| Model | Algorithm | Frozen purpose |
+|---|---|---|
+| `M-005` | LSTM | 20-session input, one 64-unit recurrent layer, and dropout `0.20`. |
+| `M-006` | Regularized LSTM | The same 20-session input and 64-unit width, with stronger dropout and recurrent regularization. |
+
+M-005 and M-006 are not silently added to the default CPU command. They reuse
+the frozen OGDC price/technical feature and target-date split evidence through
+the optional experiment runner described below.
+
 The run also evaluates two non-trained references:
 
 - Majority class, learned from the training split only.
@@ -174,32 +185,62 @@ presentation-only plots from the saved leaderboards, and exposes the generated
 ZIP for download. Training logic remains in `src/paisa/`; plot files are not
 part of the immutable run artifact.
 
-The optional deep-learning workflow is separate:
+The optional price-only deep-learning workflow is separate:
 
 ```text
-notebooks/PAISA_OGDC_LSTM_Training.ipynb
+notebooks/PAISA_OGDC_LSTM_Experiments.ipynb
 ```
 
-Its TensorFlow/Keras installation is notebook-local and is not part of
-`requirements.txt`, so it cannot block the Random Forest/XGBoost CPU pipeline.
-The notebook calls `paisa.experiments.lstm.train_and_register_lstm`; model
-construction, sequence preparation, evaluation, and persistence are not hidden
-in notebook cells. The helper fits `StandardScaler` on training rows only and
-uses earlier chronological rows as validation/test context without changing
-target split membership or including a row after the prediction's
-`feature_date`. Keras training always uses `shuffle=False`.
+Its TensorFlow/Keras installation belongs to a separate optional LSTM experiment
+environment and is not part of `requirements.txt`, so it cannot block the
+Random Forest/XGBoost CPU pipeline. TensorFlow 2.21 requires Python 3.10 through
+3.13; the documented setup selects Python 3.13 explicitly. The thin notebook
+calls the reusable runner and displays saved artifacts; model construction,
+sequence preparation, evaluation, and portfolio logic stay in `src/paisa/`.
+The command-line form is:
 
-Each optional LSTM run creates an immutable model registry directory below
-`artifacts/lstm/<model_id>/`. Its checksum-protected `lstm_bundle.joblib`
-contains both the Keras v3 model bytes and the fitted scaler, along with ordered
-features and sequence length needed for raw-feature inference. `manifest.json`
-uses the same complete model-artifact contract as the CPU models, including
-configuration, transforms, split date ranges and metrics, target/horizon,
-class mapping, source/data provenance, dependencies, artifact path, and
-checksum. The saved test `predictions.csv` is validated through the shared
-prediction-record contract and remains a direct backtesting input. TensorFlow
-is required only to train or invoke this optional bundle; importing and testing
-the CPU pipeline does not import TensorFlow.
+```bash
+python -m pip install -r requirements-lstm.txt
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/<baseline_training_run>/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id <new_lstm_run_id> \
+  --baseline-training-run artifacts/model_training/<baseline_training_run> \
+  --baseline-vertical-slice artifacts/vertical_slice/<baseline_vertical_slice>
+```
+
+The keyword-only Python API is
+`paisa.experiments.lstm_runner.run_lstm_price_only_experiments`, with
+`prices_path`, `output_dir`, `run_id`, `baseline_training_run`,
+`baseline_vertical_slice`, and optional `create_zip` and `device` arguments.
+`device` defaults to `"auto"`; supported policies are `auto`, `cpu`, `gpu`, and
+macOS-only `metal`. Metal additionally requires a TensorFlow-visible GPU from a
+separately configured plugin such as `tensorflow-metal`.
+
+The 20-session contract yields 834/182/184 train/validation/test sequences on
+the canonical frozen split. Learned preprocessing is fit on training rows only.
+Earlier chronological rows may provide context to a validation/test sequence
+without changing its target-date membership, and no row after a prediction's
+`feature_date` may enter that sequence. Validation evidence selects and reports
+the preferred variant; the untouched test split is evaluated only after that
+choice is frozen.
+
+Each execution creates an immutable directory below
+`artifacts/lstm_experiments/<run_id>/` containing the split/source reference,
+the frozen checksum-verified OGDC input, preprocessing evidence, separate
+M-005/M-006 models and predictions, training history, validation/test
+leaderboards, comparison outputs, checksummed manifest, and
+`final_summary.json`. The generated summary is the authoritative source for the
+real run ID and metrics; this document does not pre-fill them. Saved test
+predictions use the shared record contract and remain direct backtesting inputs,
+with independent portfolio state per model.
+
+CPU and Colab GPU are supported. Apple Metal is optional. Seeds, dependencies,
+device, and determinism status are recorded, but bit-identical results are not
+promised across devices. See
+[`LSTM_SEQUENCE_CONTRACT.md`](LSTM_SEQUENCE_CONTRACT.md) and
+[`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md) for the
+normative sequence, comparison, and artifact details.
 
 ## Provider limitations
 

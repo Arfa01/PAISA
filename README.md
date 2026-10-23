@@ -20,6 +20,8 @@ proposal and early-v0 context.
 | [Current implementation status](docs/CURRENT_IMPLEMENTATION_STATUS.md) | Canonical status of implemented code, retained evidence, and incomplete scope. |
 | [October 2026 progress report](docs/PROGRESS_REPORT_OCTOBER_2026.md) | Dated delivery summary, verified results, test evidence, and next milestones. |
 | [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
+| [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
+| [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
 | [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
 | [Supervisor demo script](docs/SUPERVISOR_DEMO_SCRIPT.md) | Fail-fast preflight and timed demonstration walkthrough. |
@@ -535,6 +537,17 @@ chronological, leakage-safe split:
 - `M-003`: more flexible Random Forest.
 - `M-004`: XGBoost using the same features, target dates, and split dates.
 
+The optional price-only recurrent comparison adds two frozen 20-session,
+64-unit LSTM variants without changing the four CPU models:
+
+- `M-005`: baseline LSTM with dropout `0.20`.
+- `M-006`: the same sequence length and hidden width with stronger dropout and
+  recurrent regularization.
+
+On the canonical frozen split, the sequence contract produces 834 training,
+182 validation, and 184 test examples. Validation results select and report the
+preferred variant; the test set is evaluated only after that choice is frozen.
+
 Install the default dependencies and run the unified command:
 
 ```bash
@@ -563,14 +576,29 @@ python scripts/run_backtest.py \
 ```
 
 Open [`notebooks/PAISA_OGDC_Model_Training.ipynb`](notebooks/PAISA_OGDC_Model_Training.ipynb)
-for the Colab workflow. The optional
-[`notebooks/PAISA_OGDC_LSTM_Training.ipynb`](notebooks/PAISA_OGDC_LSTM_Training.ipynb)
-keeps deep-learning dependencies separate from the CPU pipeline. It calls the
-reusable optional LSTM trainer and registers one checksum-protected inference
-bundle containing both the Keras model and its train-fitted scaler; its
-`predictions.csv` uses the same backtesting contract as the CPU models. See
-[`docs/model_training_stage.md`](docs/model_training_stage.md) for target,
-split, metric, artifact, and provider details.
+for the CPU/Colab workflow. The thin optional
+[`notebooks/PAISA_OGDC_LSTM_Experiments.ipynb`](notebooks/PAISA_OGDC_LSTM_Experiments.ipynb)
+installs TensorFlow separately and invokes the reusable experiment runner; it
+does not duplicate model, split, or backtest logic. The same workflow can be
+run directly:
+
+```bash
+python -m pip install -r requirements-lstm.txt
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/<baseline_training_run>/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id <new_lstm_run_id> \
+  --baseline-training-run artifacts/model_training/<baseline_training_run> \
+  --baseline-vertical-slice artifacts/vertical_slice/<baseline_vertical_slice>
+```
+
+CPU and Colab GPU execution are supported; Apple Metal is optional. Fixed
+seeds and recorded runtime metadata improve reproducibility, but bit-identical
+results are not promised across devices. Generated `final_summary.json` is the
+authoritative source for the completed run ID and real metrics. See the
+[LSTM runbook](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md), [sequence
+contract](docs/LSTM_SEQUENCE_CONTRACT.md), and [training-stage
+documentation](docs/model_training_stage.md).
 
 ## Versioned OGDC backtesting
 
@@ -960,10 +988,12 @@ v0 is considered successful when:
 
 The price-only OGDC vertical slice, dashboard, additive news ingestion,
 deterministic OGDC linking, article-level FinBERT inference, historical archive
-adapter, and reproducible coverage audit are implemented. Current retained
-news has no price-period overlap, and the permitted archive cannot retroactively
-prove historical cutoff availability. A licensed overlapping corpus with
-defensible timing remains the gate before daily aggregation or controlled
-price-plus-sentiment experiments. SHAP and relationship graphs also remain
-future work. See [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the
-dependency order.
+adapter, reproducible coverage audit, and price-only M-005/M-006 LSTM experiment
+workflow are implemented. The LSTM runbook deliberately does not claim a real
+run ID or metrics before execution; use its generated `final_summary.json` as
+the source of record. Current retained news has no price-period overlap, and
+the permitted archive cannot retroactively prove historical cutoff
+availability. A licensed overlapping corpus with defensible timing remains the
+gate before daily aggregation or controlled price-plus-sentiment experiments.
+SHAP and relationship graphs also remain future work. See
+[`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) for the dependency order.

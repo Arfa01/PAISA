@@ -218,16 +218,31 @@ Acceptance gate: one comparison report records the ordered feature sets and
 proves matched dates and assumptions; inconclusive or negative results are
 reported without promotion language.
 
-### 6. LSTM under the same split contract
+### 6. Execute and certify the price-only LSTM comparison
 
-Run the existing optional LSTM workflow with the frozen daily dataset contract.
-Fit scaling on training data only, build sequences without crossing temporal
-boundaries, register the model and scaler together, and emit the same prediction
-record used by the backtester. Compare it under the same validation-selection
-and untouched-test policy; do not give it a different window or cost model.
+**Experiment framework implemented; real-run evidence pending.** The controlled
+workflow freezes two price-only variants: `M-005` is a 20-session, 64-unit LSTM
+with dropout `0.20`; `M-006` keeps that sequence length and hidden width while
+using stronger dropout and recurrent regularization. Both consume the same
+frozen daily OGDC source and target-date split evidence. Learned preprocessing
+is fit on training data only. Historical rows from immediately before a split
+may supply context, but validation/test targets never train or select model
+parameters.
 
-Acceptance gate: an actual TensorFlow smoke run and one retained immutable LSTM
-experiment pass checksum, prediction-schema, leakage, and backtest validation.
+The canonical sequence contract expects 834/182/184
+train/validation/test examples. Validation evidence selects and reports the
+preferred variant; test evidence is produced only after that choice is frozen.
+The shared backtest comparison must preserve the same target dates, policy,
+execution rules, fees, initial cash, and independent portfolio ledgers. Follow
+[`LSTM_SEQUENCE_CONTRACT.md`](LSTM_SEQUENCE_CONTRACT.md) and
+[`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md).
+
+Acceptance gate: run TensorFlow on CPU or Colab GPU (with Apple Metal optional),
+retain one immutable M-005/M-006 experiment, and pass checksum,
+prediction-schema, leakage, common-date, and backtest validation. Cross-device
+results are not required to be bit-identical. Do not record a run ID, preferred
+variant, metric, or return in planning prose; the generated
+`final_summary.json` is authoritative after execution.
 
 ### 7. SHAP explanations
 

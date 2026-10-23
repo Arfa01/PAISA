@@ -5,12 +5,14 @@ from datetime import date, datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from paisa.evidence.artifacts import (
     EvidenceRunCollisionError,
     EvidenceVerificationError,
+    _git_provenance,
     load_evidence_run,
     publish_evidence_run,
     verify_evidence_run,
@@ -197,6 +199,19 @@ def test_permission_policy_is_checksum_bound(tmp_path: Path) -> None:
         load_evidence_permission_policy(
             tmp_path / "policy.json", repository_root=tmp_path
         )
+
+
+def test_git_provenance_distinguishes_clean_tree_from_unavailable(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["git", "init", "--quiet"], cwd=tmp_path, check=True, timeout=10
+    )
+
+    assert _git_provenance(tmp_path)["dirty_tree"] is False
+
+    (tmp_path / "untracked.txt").write_text("change\n", encoding="utf-8")
+    assert _git_provenance(tmp_path)["dirty_tree"] is True
 
 
 def test_fetch_result_rejects_mixed_provider_semantics() -> None:

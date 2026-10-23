@@ -767,7 +767,7 @@ def _normalize_input_references(
 
 
 def _git_provenance(repository_root: Path) -> dict[str, Any]:
-    def run(*args: str) -> str | None:
+    def run(*args: str, preserve_empty: bool = False) -> str | None:
         try:
             completed = subprocess.run(
                 ["git", *args],
@@ -779,10 +779,13 @@ def _git_provenance(repository_root: Path) -> dict[str, Any]:
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        return completed.stdout.strip() or None
+        output = completed.stdout.strip()
+        return output if output or preserve_empty else None
 
     revision = run("rev-parse", "HEAD")
-    dirty = run("status", "--porcelain", "--untracked-files=all")
+    dirty = run(
+        "status", "--porcelain", "--untracked-files=all", preserve_empty=True
+    )
     return {
         "producer": "paisa.evidence.coverage_artifacts",
         "code_version": revision,

@@ -205,7 +205,7 @@ def _inventory_digest(inventory: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _git_provenance(repository_root: Path) -> dict[str, Any]:
-    def run(*args: str) -> str | None:
+    def run(*args: str, preserve_empty: bool = False) -> str | None:
         try:
             result = subprocess.run(
                 ["git", *args],
@@ -217,10 +217,11 @@ def _git_provenance(repository_root: Path) -> dict[str, Any]:
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        return result.stdout.strip() or None
+        output = result.stdout.strip()
+        return output if output or preserve_empty else None
 
     revision = run("rev-parse", "HEAD")
-    dirty = run("status", "--porcelain")
+    dirty = run("status", "--porcelain", preserve_empty=True)
     return {
         "code_version": revision,
         "dirty_tree": None if dirty is None else bool(dirty),

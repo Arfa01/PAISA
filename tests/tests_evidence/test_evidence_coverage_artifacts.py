@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -14,6 +15,7 @@ from paisa.evidence.coverage import compute_evidence_coverage
 from paisa.evidence.coverage_artifacts import (
     EvidenceCoverageRunCollisionError,
     EvidenceCoverageVerificationError,
+    _git_provenance,
     publish_evidence_coverage_run,
     verify_evidence_coverage_pack,
 )
@@ -291,6 +293,19 @@ def test_publish_verify_private_flat_pack_and_redact_references(
     ) as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["provider_id"] == "'=archive-provider"
+
+
+def test_coverage_git_provenance_reports_clean_and_dirty_states(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ["git", "init", "--quiet"], cwd=tmp_path, check=True, timeout=10
+    )
+
+    assert _git_provenance(tmp_path)["dirty_tree"] is False
+
+    (tmp_path / "untracked.txt").write_text("change\n", encoding="utf-8")
+    assert _git_provenance(tmp_path)["dirty_tree"] is True
 
 
 def test_publication_refuses_collision_and_dangling_destination(

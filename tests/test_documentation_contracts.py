@@ -29,12 +29,19 @@ CONTINUATION_DOCUMENTS = (
     "docs/REMAINING_ROADMAP.md",
     "docs/ISSUE_BACKLOG.md",
     "docs/REPRODUCTION_COMMANDS.md",
+    "docs/UNIFIED_PRICE_MODEL_COMPARISON.md",
     "docs/FREE_PLAN_WORKFLOW.md",
     "docs/CODEX_PROMPT_LIBRARY.md",
 )
 CONTINUATION_LINK_DOCUMENTS = ("README.md", *CONTINUATION_DOCUMENTS)
 CERTIFIED_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-02"
 HISTORICAL_LSTM_RUN_ID = "LSTM-20261024-OGDC-price-only-01"
+UNIFIED_COMPARISON_ID = "CMP-20261024-OGDC-price-only-02"
+HISTORICAL_UNIFIED_COMPARISON_ID = "CMP-20261024-OGDC-price-only-01"
+UNIFIED_COMPARISON_ZIP_SHA256 = (
+    "8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe"
+)
+UNIFIED_COMPARISON_FILE_COUNT = 65
 ALLOWED_ACTIONS = {
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": 3,
     "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": 2,
@@ -983,8 +990,46 @@ def test_project_state_preserves_canonical_research_boundaries() -> None:
     )
 
     assert "common 184-date test intersection" in state
-    assert "shared project holdout, not a globally untouched test" in state
-    assert "globally untouched 184-date test" not in state
+    assert "shared project holdout" in state
+    assert "globally untouched" not in state
+    assert UNIFIED_COMPARISON_ID.lower() in state
+    assert HISTORICAL_UNIFIED_COMPARISON_ID.lower() in state
+    assert not _has_unsafe_authority_claim(
+        raw_state, HISTORICAL_UNIFIED_COMPARISON_ID
+    )
+    assert UNIFIED_COMPARISON_ZIP_SHA256 in raw_state
+    assert f"`{UNIFIED_COMPARISON_FILE_COUNT}`" in raw_state
+
+    raw_unified = _read("docs/UNIFIED_PRICE_MODEL_COMPARISON.md")
+    unified = _normalized(raw_unified)
+    assert UNIFIED_COMPARISON_ID.lower() in unified
+    assert HISTORICAL_UNIFIED_COMPARISON_ID.lower() in unified
+    assert not _has_unsafe_authority_claim(
+        raw_unified, HISTORICAL_UNIFIED_COMPARISON_ID
+    )
+    assert UNIFIED_COMPARISON_ZIP_SHA256 in raw_unified
+    assert f"total file count is `{UNIFIED_COMPARISON_FILE_COUNT}`" in raw_unified
+    assert "shared project holdout" in unified
+    assert "globally untouched" not in unified
+    assert "universal winner" not in unified
+    assert "does not integrate or evaluate sentiment features" in unified
+    assert "tabular/report-only" in unified
+    assert "exactly two logical rows" in unified
+    assert "six `ledger_provenance` records" in unified
+
+    custody_documents = (
+        "docs/PROJECT_STATE_2026-10-24.md",
+        "docs/CURRENT_IMPLEMENTATION_STATUS.md",
+        "docs/REMAINING_ROADMAP.md",
+        "docs/REPRODUCTION_COMMANDS.md",
+        "docs/RESULTS_INTERPRETATION.md",
+        "docs/UNIFIED_PRICE_MODEL_COMPARISON.md",
+    )
+    for relative_path in custody_documents:
+        document = _read(relative_path)
+        assert "<TO_BE_REGENERATED>" not in document
+        assert UNIFIED_COMPARISON_ZIP_SHA256 in document
+        assert f"`{UNIFIED_COMPARISON_FILE_COUNT}`" in document
 
     assert (
         "| ogdc vertical slice | `vsl-20261020-ogdc-main-02` | completed `pass`"

@@ -37,10 +37,10 @@ The run answers two related but different questions:
    fixed decision policy, become stateful buy/sell/hold signals, execute at the
    next session's open, incur fees, and are valued at daily closes?
 
-Accordingly, PAISA does not declare one universal winner. `M-001` is the model
-selected from validation prediction evidence, while `M-002` has the best
-test-period simulated model-portfolio result. Both statements are true and
-refer to different measurements.
+Accordingly, PAISA keeps the criteria separate. `M-001` is the model selected
+from validation prediction evidence, while `M-002` has the best test-period
+simulated model-portfolio result. Both statements are true and refer to
+different measurements.
 
 ## Prediction results
 
@@ -147,3 +147,61 @@ split, the fixed probability policy, the 50% allocation rule, and the stated
 execution and cost assumptions. They do not establish general performance
 across stocks, periods, feature sets, policies, costs, market regimes, or live
 trading.
+
+## Unified M-001 through M-006 comparison
+
+The authoritative immutable comparison pack
+`CMP-20261024-OGDC-price-only-02` extends the price-only review to the two LSTM
+variants without retraining a model, invoking inference, or calling the
+production backtest runner. `CMP-20261024-OGDC-price-only-01` is a superseded,
+non-portable historical draft and is not current publication evidence. The
+final `-02` ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and its verified total file count is `65`.
+
+The hardened pack recomputes prediction metrics from persisted rows and uses
+two raw market files plus six signal files to replay policy, execution, trades,
+accounting, return, drawdown, and fees with exact `Decimal` arithmetic. Its
+vertical-slice integrity root is represented by a digest-allowlisted redacted
+certificate, and portable-content hygiene scans all text recursively. The
+metrics expose exactly two logical benchmark rows, cash-only and controlled
+buy-and-hold, each with six independent ledger-provenance records. All six
+models share 182 validation dates and the exact 184 dates from `2025-12-16`
+through `2026-09-15` in the **shared project holdout**.
+That period and its M-001 through M-004 results had been exposed previously, so
+the shared project holdout is comparative evidence rather than a fresh
+independent performance estimate.
+
+| Evidence question | Verified outcome |
+|---|---|
+| Validation-selected model across M-001--M-006 | `M-001`; validation balanced accuracy `0.5302041802585478` |
+| LSTM-family validation preference | `M-005`; validation balanced accuracy `0.4792799323426362` |
+| Best model shared project holdout balanced accuracy | `M-006`; `0.544251447477254` |
+| Best model shared project holdout F1 | `M-005`; `0.6396761133603239` |
+| Majority-class baseline on the shared project holdout | Balanced accuracy `0.5`; F1 `0.0` |
+| Previous-direction baseline on the shared project holdout | Balanced accuracy `0.5271771239513174`; F1 `0.5245901639344263` |
+| Best simulated model portfolio by total return | `M-002`; ending value PKR 105,987.04; return `5.98704%` |
+| Lowest-drawdown model portfolio | `M-003`; maximum drawdown `1.18467%` |
+| Lowest-fee model portfolio | `M-003`; fees PKR 98.93 |
+| Cash-only benchmark | Ending value PKR 100,000.00; zero return, drawdown, trades, and fees |
+| Controlled buy-and-hold benchmark | Ending value PKR 106,247.89; return `6.24789%` |
+| Did any model beat buy-and-hold in total return? | No; `M-002`, the closest model, trails by `0.26085` percentage points |
+
+These are separate findings, not inputs to one cross-criterion ranking.
+Validation keeps `M-001` selected even though `M-006` has the highest shared
+project holdout balanced accuracy, `M-005` has the highest shared project
+holdout F1, `M-002` has the highest simulated model-portfolio return, and
+`M-003` has the lowest model-portfolio drawdown and fees. The controlled
+buy-and-hold comparator uses the same 50% allocation constraint as the model
+portfolios; it is not a fully invested benchmark.
+
+This is a price-only, tabular/report-only comparison. It does not integrate
+sentiment, contains no plots, and does not import Matplotlib. CLI results use
+relative artifact names; default failures omit tracebacks and opt-in debug
+diagnostics are sanitized.
+
+See [the unified comparison contract](UNIFIED_PRICE_MODEL_COMPARISON.md) for
+the authoritative source bindings, complete schemas, verification commands,
+rankings, limitations, and portable checksum workflow. All predictions,
+trades, returns, and portfolio values are academic simulations, are not
+financial advice, and are not evidence of future performance.

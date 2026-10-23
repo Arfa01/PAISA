@@ -2,8 +2,8 @@
 
 Status date: 24 October 2026
 
-Base: `origin/main` at `d7015cbb2f630dd1be4a077e407fca961b92f8a6`
-after merged PR #16.
+Base: `origin/main` at `a80594d80a884dcef129f2d4a9c896217c6793c5`
+after merged PR #17.
 
 PAISA is an academic simulation. Predictions, signals, trades, portfolio curves,
 and simulated returns are not financial advice.
@@ -46,7 +46,7 @@ each row into scope, exclusions, acceptance checks, tests, and documentation.
 | `G2-NEWS-PERMISSION` | The exact source, fields, date range, academic-use basis, attribution, retention, redistribution, and automation rights have a recorded `PERMITTED` decision. `REVIEW_REQUIRED` does not pass. | Historical acquisition/import. |
 | `G3-NEWS-OVERLAP` | A fresh current-schema, source-evidence-bound audit uses new immutable IDs, passes source permission and ingestion completeness, and satisfies configured split-coverage thresholds with defensible cutoff-time evidence. A historical `NO_OVERLAP` pack cannot be relabelled or overwritten. | Sentiment inference for the comparison corpus and daily aggregation. |
 | `G4-DAILY-SENTIMENT` | Daily features are derived only from articles whose `available_at` is on or before the declared decision cutoff. After-close and non-trading-day rules, missing-news rows, source counts, and train-only transforms are verified. | Price-plus-sentiment experiments. |
-| `G5-PAIRED-COMPARISON` | Price-only and price-plus-sentiment configurations use identical eligible target dates, target, chronological splits, seeds, selection rule, policy, execution, fees, and independent portfolios. Validation freezes the choice before disclosed shared-holdout evaluation. | Official paired result and the paired-result sections of the final report and demo. |
+| `G5-PAIRED-COMPARISON` | Price-only and price-plus-sentiment configurations use identical eligible target dates, target, chronological splits, seeds, selection rule, policy, execution, fees, and independent portfolios. Validation freezes the choice before disclosed shared project holdout evaluation. | Official paired result and the paired-result sections of the final report and demo. |
 
 If `G2` or `G3` fails, record the negative result and leave all downstream
 issues blocked. Never weaken a threshold, invent a historical timestamp, use a
@@ -59,7 +59,7 @@ the gate pass.
 |---|---|---|---|---|---|
 | `PAISA-RM-001` | MUST | Fixture-backed, read-only LSTM artifact repository and API | None | `G0-INTEGRITY` | Offline API tests accept a sealed fixture and reject corrupt/incomplete packs. |
 | `PAISA-RM-002` | MUST | LSTM result view in the dashboard | `PAISA-RM-001` | `G1-LSTM-READ` | Frontend schema, component, loading/error, and disclaimer tests pass. |
-| `PAISA-RM-003` | MUST | Immutable unified M-001--M-006 comparison artifact | `PAISA-RM-001` | `G1-LSTM-READ` | Builder proves the exact 184-date intersection and keeps validation, test, and portfolio rankings separate. |
+| `PAISA-RM-003` | MUST | Immutable unified M-001--M-006 comparison artifact | `PAISA-RM-001` | `G1-LSTM-READ` | Builder proves the exact 184-date intersection; the offline verifier reconstructs prediction and full `Decimal` portfolio semantics from portable source evidence; and validation, shared project holdout, and portfolio outcomes remain separate. |
 | `PAISA-RM-004` | MUST | Read-only unified comparison API | `PAISA-RM-003` | `G0-INTEGRITY` | Additive typed endpoint returns only verified persisted comparison evidence. |
 | `PAISA-RM-005` | MUST | Unified comparison dashboard and export | `PAISA-RM-002`, `PAISA-RM-004` | `G0-INTEGRITY` | Six models render with selection/holdout caveats and no client-side metric recomputation. |
 | `PAISA-RM-006` | MUST | Historical-news permission dossier and source decision | None | Human review | Exact permissions and prohibited uses are checksum-bound; no acquisition occurs in this issue. |
@@ -79,6 +79,21 @@ the gate pass.
 | `PAISA-RM-020` | STRETCH | Interactive event-graph dashboard | `PAISA-RM-019` | `G0-INTEGRITY` | UI reads the API only and clearly separates observed evidence from inferred relationships. |
 | `PAISA-RM-021` | MUST | Reproducible final report | `PAISA-RM-005`, `PAISA-RM-008`; `PAISA-RM-013` only if `G3` opens | Verified evidence-lane disposition; `G5` for paired claims | Tables are generated from verified artifacts; a blocking overlap result or gated paired result, limitations, and all deferred SHOULD/STRETCH work are explicit. |
 | `PAISA-RM-022` | MUST | Final demo pack and release rehearsal | `PAISA-RM-021` | Release acceptance | Clean-clone fixture workflow, artifact-restored official workflow, API, dashboard, and fallback narrative are rehearsed. |
+
+The `PAISA-RM-003` evidence-only implementation is present on
+`feature/unified-price-model-comparison`, with canonical local pack
+`CMP-20261024-OGDC-price-only-02`. Its final ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and its verified total file count is `65`. The earlier
+`CMP-20261024-OGDC-price-only-01` is a superseded, non-portable historical
+draft. The hardened pack uses a digest-allowlisted redacted vertical
+certificate, recursive portable hygiene, two raw market files, six signal
+files, and full `Decimal` policy, execution, accounting, and benchmark replay.
+It exposes exactly two logical benchmark metric rows, each with six independent
+ledger-provenance records. It was explicitly authorized before `PAISA-RM-001`;
+it does not clear `G1-LSTM-READ`, provide a committed fixture, or change the
+remaining API/dashboard dependency order. This artifact is price-only and
+tabular/report-only: it does not integrate sentiment or import Matplotlib.
 
 ## Recommended execution sequence
 
@@ -118,7 +133,8 @@ article-level model identity, daily feature artifact, stock model, decision
 policy, and portfolio as separate components. The paired experiment must add
 sentiment features without changing the price-only target or evaluation
 assumptions. Reusing the 2025-12-16 through 2026-09-15 test window must be
-reported as repeated shared-holdout evaluation, not a globally untouched test.
+reported as repeated evaluation on the shared project holdout, not as a fresh
+independent evaluation.
 
 ### Track D: explainability, scaling, and events
 

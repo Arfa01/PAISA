@@ -117,7 +117,7 @@ is never used to tune or relabel a champion.
 This timing guarantee applies to the M-005/M-006 selection process only. The
 same 184-date holdout, from 2025-12-16 through 2026-09-15, and its M-001 through
 M-004 results had already been exposed by the earlier baseline experiment. It
-is therefore a reused shared project holdout, not a globally untouched holdout.
+is therefore the reused shared project holdout, not a fresh independent sample.
 
 On the canonical data, the 20-session contract yields 834 training, 182
 validation, and 184 test sequences. All baseline and LSTM validation/test dates

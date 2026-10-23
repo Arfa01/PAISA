@@ -56,7 +56,10 @@ other regular file in the run, including frozen inputs, split and data
 manifests, reports, model manifests, fitted binaries, configurations, metrics,
 and predictions. The listed paths must exactly equal the files on disk; missing
 files, additional files, links, special files, duplicate paths, unsorted paths,
-or checksum changes invalidate the run.
+or checksum changes invalidate the run. When a model advertises nested
+preprocessing or validation-checkpoint checksums, the validator also reconciles
+those claims with their checksum-inventoried files; a coordinated metadata
+rewrite and reseal cannot substitute a false nested digest.
 
 The root manifest excludes only itself because a file cannot contain its own
 final digest. A consumer captures the SHA-256 of `run_manifest.json` together
@@ -68,7 +71,7 @@ controlled metadata rewrite of an unpublished, runner-owned directory must
 reseal and revalidate the run before its final evidence baseline is captured.
 Existing or third-party runs are never silently resealed.
 
-Each model's `predictions.csv` contains only the untouched test split in the
+Each model's `predictions.csv` contains only the held-out test split in the
 prediction-record schema required by `scripts/run_backtest.py`, including
 `schema_version`. `predictions_all_splits.csv` is retained for training and
 evaluation audit work and adds the split name.

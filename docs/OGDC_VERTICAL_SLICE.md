@@ -7,7 +7,7 @@ versioned components:
 real daily PSX OGDC prices
   -> technical features and next-session labels
   -> M-001, M-002, M-003, and M-004 training
-  -> untouched test prediction records
+  -> held-out test prediction records
   -> four independent strategy portfolios
   -> cash-only and buy-and-hold benchmarks
   -> one model-and-portfolio comparison report
@@ -16,6 +16,11 @@ real daily PSX OGDC prices
 This workflow is an academic simulation. Its predictions, signals, trades,
 portfolio curves, benchmark comparisons, and simulated returns are not
 financial advice.
+
+The test window was held out for this original vertical-slice workflow. Its
+dates and M-001 through M-004 outcomes were later reused in the M-005/M-006
+comparison, so current cross-model reporting must describe it as a shared
+project holdout rather than a globally untouched test.
 
 ## Install and validate
 
@@ -335,7 +340,7 @@ The files have these roles:
   ledger, daily strategy snapshots, benchmark ledgers, result/metric records,
   and per-experiment plots. Each file is included in the vertical manifest's
   checksum inventory.
-- `model_metrics.csv` keeps the train, validation, and untouched-test
+- `model_metrics.csv` keeps the train, validation, and held-out-test
   prediction evidence separate from portfolio outcomes.
 - `portfolio_metrics.csv` contains one row for each of the four model
   strategies plus the cash-only and buy-and-hold comparison portfolios.

@@ -211,23 +211,48 @@ fit transforms.
 Freeze paired configurations that differ only by the added sentiment features.
 Use identical target definitions, target-date split boundaries, seeds,
 evaluation rows, decision policy, execution rules, initial cash, and fees.
-Select configurations on validation evidence and evaluate the untouched test
-split once. Report prediction and portfolio metrics separately.
+Select configurations on validation evidence and evaluate a declared
+post-freeze test split once for that comparison. Report prediction and
+portfolio metrics separately. The existing 2025-12-16 through 2026-09-15
+window has already been exposed for M-001 through M-006; any future reuse must
+be disclosed as repeated shared-holdout evaluation rather than described as a
+globally untouched test.
 
 Acceptance gate: one comparison report records the ordered feature sets and
 proves matched dates and assumptions; inconclusive or negative results are
 reported without promotion language.
 
-### 6. LSTM under the same split contract
+### 6. Preserve and interpret the certified price-only LSTM comparison
 
-Run the existing optional LSTM workflow with the frozen daily dataset contract.
-Fit scaling on training data only, build sequences without crossing temporal
-boundaries, register the model and scaler together, and emit the same prediction
-record used by the backtester. Compare it under the same validation-selection
-and untouched-test policy; do not give it a different window or cost model.
+**Completed and certified.** Run `LSTM-20261024-OGDC-price-only-02` executed on
+CPU from clean source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f`
+with Python 3.13 and TensorFlow 2.21. It reproduced the canonical 834/182/184
+train/validation/test sequence counts. Both variants trained for 7 epochs and
+recorded best validation epoch 1.
 
-Acceptance gate: an actual TensorFlow smoke run and one retained immutable LSTM
-experiment pass checksum, prediction-schema, leakage, and backtest validation.
+Validation preferred `M-005` (`0.479280` balanced accuracy) over `M-006`
+(`0.474931`). After that choice was frozen, the common 184-date test reported
+`M-005` at `0.520087` and `M-006` at `0.544251`. `M-006` exceeded the best
+`M-001`–`M-004` baseline test balanced accuracy, `M-002` at `0.524459`, but
+that post-freeze evidence must not be used to relabel it as the selected
+variant or to tune another configuration.
+
+The model portfolios ended at PKR 96,359.29 (-3.64071%) for `M-005` and PKR
+96,110.91 (-3.88909%) for `M-006`. Neither beat buy-and-hold at PKR 106,247.89
+(+6.24789%) or the best baseline model portfolio, `M-002`, at PKR 105,987.04
+(+5.98704%). The acceptance checks passed, including 1,036 backend tests with
+one platform-specific skip, 57 frontend tests, frontend lint/build, dependency,
+bytecode-compilation, and diff checks. The checksum-inventoried artifacts
+remain local and ignored by Git;
+their generated `final_summary.json` is authoritative. These results are an
+academic simulation, not financial advice. Follow
+[`LSTM_SEQUENCE_CONTRACT.md`](LSTM_SEQUENCE_CONTRACT.md) and
+[`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md).
+
+Future reruns must use a new immutable run ID and preserve the same leakage,
+selection, common-date, policy, fee, and independent-ledger contracts. A new
+device or seed is a new experiment; cross-device results are not expected to be
+bit-identical.
 
 ### 7. SHAP explanations
 

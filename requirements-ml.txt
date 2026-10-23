@@ -1,5 +1,6 @@
 # CPU machine-learning runtime for the v0 baseline and versioned experiments.
-# LSTM dependencies remain optional and are installed only by its notebook.
+# LSTM dependencies remain optional; install requirements-lstm.txt only in the
+# separate M-005/M-006 experiment environment used by the notebook or CLI.
 scikit-learn>=1.4.0
 joblib>=1.3.0
 xgboost>=2.1.0,<4.0

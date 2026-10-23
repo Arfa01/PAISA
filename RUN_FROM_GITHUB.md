@@ -492,6 +492,12 @@ production build, `pip check`, `compileall`, and
 `git diff --check origin/main...HEAD`. Always report the counts from the
 checkout actually tested rather than copying these historical numbers.
 
+The hardened certified LSTM run used clean source commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f`. Its completed checkout validation
+reported `1036 passed, 1 skipped` for the backend and `57 passed` for the
+frontend, with frontend lint/build, `pip check`, bytecode compilation, and diff
+checks also passing. The skip is the Windows-only junction test on macOS.
+
 ## 6. Start the API
 
 Activate the environment and set the v1 artifact roots before starting the
@@ -791,16 +797,58 @@ For Colab, use:
 notebooks/PAISA_OGDC_Model_Training.ipynb
 ```
 
-The separate optional LSTM workflow is:
+The separate optional price-only LSTM workflow is:
 
 ```text
-notebooks/PAISA_OGDC_LSTM_Training.ipynb
+notebooks/PAISA_OGDC_LSTM_Experiments.ipynb
 ```
 
-TensorFlow/Keras is not part of the default CPU installation. See
-[`docs/model_training_stage.md`](docs/model_training_stage.md) for the optional
-installation, chronological sequence rules, immutable model-plus-scaler bundle,
-shared prediction contract, and data-provider details.
+TensorFlow/Keras is not part of the default installation. Install the optional
+dependency in the environment used for this experiment, then invoke the thin
+notebook or the same runner directly:
+
+```bash
+python -m pip install -r requirements-lstm.txt
+
+python scripts/run_lstm_price_only_experiments.py \
+  --prices artifacts/model_training/<baseline_training_run>/frozen_input/OGDC_prices.csv \
+  --output-dir artifacts/lstm_experiments \
+  --run-id <new_lstm_run_id> \
+  --baseline-training-run artifacts/model_training/<baseline_training_run> \
+  --baseline-vertical-slice artifacts/vertical_slice/<baseline_vertical_slice>
+```
+
+Use a new run ID: the runner must not overwrite an existing experiment.
+`M-005` is the frozen 20-session, 64-unit baseline with dropout `0.20`;
+`M-006` keeps the same sequence length and hidden width while applying stronger
+dropout and recurrent regularization. Both variants are price-only. The
+canonical sequence contract expects 834/182/184 train/validation/test examples.
+Validation chooses the reported preferred variant, and the test set is
+evaluated only after that choice is frozen.
+
+The workflow supports CPU and Colab GPU. Apple Metal is optional, and no
+bit-identical cross-device result is promised. The certified CPU execution is
+`LSTM-20261024-OGDC-price-only-02`, run from clean commit
+`2bd20edebac9f5a063e2e10cc0394343067d8c7f` with Python 3.13 and TensorFlow
+2.21. It produced 834/182/184 train/validation/test sequences; both variants
+ran for 7 epochs and recorded best validation epoch 1. Validation preferred
+`M-005` at `0.479280` balanced accuracy over `M-006` at `0.474931`.
+
+After that choice was frozen, the common 184-date test scored `M-005` at
+`0.520087` and `M-006` at `0.544251`. `M-006` exceeded all four baseline test
+balanced accuracies (the best was `M-002` at `0.524459`), but it is not the
+validation-selected variant. The `M-005` and `M-006` portfolios ended at PKR
+96,359.29 (-3.64071%) and PKR 96,110.91 (-3.88909%), respectively, below both
+buy-and-hold at PKR 106,247.89 (+6.24789%) and the best baseline model
+portfolio, `M-002`, at PKR 105,987.04 (+5.98704%).
+
+The run directory is generated locally and ignored by Git. Read its
+`final_summary.json` as the authoritative record rather than treating this
+summary as a substitute artifact. See the [LSTM experiment runbook](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md),
+[sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md), and
+[`docs/model_training_stage.md`](docs/model_training_stage.md) for the full
+contract and artifact layout. All outputs are an academic simulation and not
+financial advice.
 
 ## Run a versioned OGDC backtest
 

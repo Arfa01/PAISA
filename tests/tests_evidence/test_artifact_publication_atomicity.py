@@ -365,6 +365,68 @@ def test_output_root_rejects_existing_and_dangling_symlinks(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_output_root_rejects_windows_junction_components(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        pytest.skip("This Windows environment cannot create directory junctions")
+    try:
+        with pytest.raises(ValueError, match="symlink components"):
+            prepare_output_root(
+                junction / "evidence",
+                repository_root=repository,
+                label="Evidence output root",
+            )
+    finally:
+        os.rmdir(junction)
+
+
+def test_repository_output_case_alias_cannot_bypass_git_hygiene(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "case-sensitive-name"
+    repository.mkdir()
+    alias = repository.with_name(repository.name.upper())
+    if alias == repository or not alias.exists() or not alias.samefile(repository):
+        pytest.skip("The temporary filesystem is case-sensitive")
+
+    subprocess.run(
+        ["git", "init", "--quiet"], cwd=repository, check=True, timeout=10
+    )
+    tracked = repository / "tracked"
+    tracked.mkdir()
+    (tracked / ".keep").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "tracked/.keep"], cwd=repository, check=True, timeout=10
+    )
+
+    with pytest.raises(ValueError, match="Git-tracked"):
+        prepare_output_root(
+            alias / "tracked",
+            repository_root=repository,
+            label="Evidence output root",
+        )
+
+    with pytest.raises(ValueError, match="Git-ignored"):
+        prepare_output_root(
+            alias / "unignored",
+            repository_root=repository,
+            label="Evidence output root",
+        )
+    assert not (repository / "unignored").exists()
+
+
 def test_repository_output_must_be_ignored_untracked_and_link_free(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,5 @@
+# Optional recurrent-experiment runtime for CPython 3.10 through 3.13.
+# Core PAISA and its default tests remain TensorFlow-free; install this file only
+# for M-005/M-006 training or inference. TensorFlow 2.21 has no CPython 3.14 wheel.
+-r requirements.txt
+tensorflow>=2.21,<2.22

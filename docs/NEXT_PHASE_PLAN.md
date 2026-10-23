@@ -32,7 +32,7 @@ collision-refusing `COVERAGE-...` packs. Its readiness labels are engineering
 and data-coverage gates, not evidence of statistical sufficiency or predictive
 value.
 
-The existing `news-price-coverage-v2` preflight at
+The existing historical schema-`1.0` / `news-price-coverage-v2` preflight at
 `artifacts/news_coverage/COVERAGE-20261023-100000-preflight003/` covers the five
 retained legacy `PASS` Dawn Business ingestion packs: `150` occurrences
 representing `31` canonical articles and `119` duplicate occurrences. It
@@ -45,33 +45,54 @@ with exact split counts of `853` train, `182` validation, and `184` test
 sessions. Publication overlap and cutoff-eligible availability overlap are both
 zero, and the readiness status is `NO_OVERLAP`. This preflight predates the
 current coverage completion seal. The retained official RSS artifact is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it verifies `PASS`
-with `11` payload artifacts and `450` mapping rows and retains `NO_OVERLAP`.
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`; it verified `PASS`
+at its producing revision with `11` payload artifacts and `450` mapping rows
+and retains `NO_OVERLAP`.
 Ingestion completeness passes, while source permission and legacy database
 provenance remain failed prerequisites.
 
 The later live metadata-only acquisition
 `NEWS-20261023-060000-gdelt-ogdc2` is a separate sealed `PARTIAL/WARN` pack that
-verifies `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It retained `656` raw and `656`
-normalized unique canonicals, including `42` exact OGDC-linked canonicals across
-`93` returned source domains, with zero rejected records. Every canonical keeps
+verifies `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It retained `656` raw rows and
+`656` normalized canonical rows unique under the current exact
+URL/content/title-source-time rules, including `42` exact OGDC-linked rows
+across `93` returned source domains, with zero rejected records. A conservative
+publisher document-ID diagnostic separately flags `17` candidate duplicate
+groups (`36` rows); these are not silently merged. Every canonical keeps
 `published_at` missing. Its raw GDELT `seendate` range is
 `2023-06-18T12:15:00Z`--`2024-06-14T15:00:00Z`, but conservative `available_at`
 is `2026-10-23T06:26:32.440746Z`--`2026-10-23T06:29:25.858147Z`. The pack is
 partial because it preserves `22` provider errors (`15` `ReadTimeout` failures, `4`
 out-of-window quarantines, and `3` exhausted HTTP 429 responses).
+That retained news run predates schema `1.1`: its `seendate` range remains raw
+evidence, and its error rows identify root windows rather than exact attempts.
+New acquisitions preserve audit-only `source_observed_at` under
+`news-availability-v1`, fail closed on missing/malformed historical observation
+time, bind every error to exact request-tile/attempt fingerprints, share one
+bounded DNS/request deadline, and record whether `Retry-After` was applied or
+refused above the wait ceiling.
+Those fields require a new immutable acquisition and are never imputed into the
+old run.
 
-Its `news-price-coverage-v2` preflight
+Its historical schema-`1.0` / `news-price-coverage-v2` preflight
 `COVERAGE-20261023-110000-gdeltpre1` passes source permission and database
-provenance, fails ingestion completeness, reports `null` publication and availability
-calendar-overlap ranges and `0%` coverage for every split/population, and returns
+provenance, fails ingestion completeness, reports `null` publication and
+availability calendar-overlap ranges and `0%` coverage for the supported
+all-news and OGDC populations, and returns
 `NO_OVERLAP`. That preflight remains historical. The retained official GDELT
 artifact is `artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`; it
-verifies `PASS` with `11` payload artifacts and `1,968` mapping rows and retains
+verified `PASS` at its producing revision with `11` payload artifacts and
+`1,968` mapping rows and retains
 `NO_OVERLAP`. Permission and database provenance pass, while ingestion
 completeness fails with `22` provider errors. Both official artifacts were
 generated from clean commit `041c557edf5b15660fd2f02d47ed7f9b8b4152a7`
 with `dirty_tree=false`.
+Both coverage packs remain immutable historical v2 evidence. The current
+schema-`1.1` / `news-price-coverage-v3` semantic verifier requires restored
+source inputs, recomputation, and new run IDs; it does not certify the old
+packs.
+Default v3 verification reports `SOURCE_EVIDENCE_BOUND` only after reopening
+the inputs; explicit `--pack-only` reports weaker `PACK_SEMANTIC` authority.
 
 Remaining work is to obtain permitted, complete, sufficiently covered evidence
 whose availability overlaps the immutable price/split period; the official
@@ -113,8 +134,9 @@ Run `SENT-20261022-172211-real0002` completed with `PASS` on CPU against
 `NEWS-20261022-131242-5ddffd2d`: all `30` requested unique canonical articles
 were scored, none were skipped or failed, one was OGDC-linked, the label counts
 were `negative=11`, `neutral=9`, and `positive=10`, and `17` inputs were
-truncated. Its retained execution used schema version `5`; current code targets
-schema `6`. Generated artifacts remain
+truncated. Its retained execution used schema version `5`; current code advances
+verified storage through schema `6` sentiment certification to the current
+schema `7` audit-only source-observation contract. Generated artifacts remain
 outside Git at
 `artifacts/sentiment_inference/SENT-20261022-172211-real0002`.
 
@@ -122,7 +144,7 @@ Remaining gate: review the retained audit sample and outputs before defining
 daily aggregation. The accepted ingestion artifacts still record their
 historical schema version `3`, while the working
 `data/news/paisa_news.sqlite3` was retained at schema version `5` and is
-upgraded to `6` by current code. Preserve the ignored,
+upgraded through `6` to `7` by current code. Preserve the ignored,
 uncommitted pre-migration copy at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3`, verified as
 schema version `3` with `31` canonical articles, `150` article occurrences,

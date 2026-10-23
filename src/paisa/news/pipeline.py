@@ -23,6 +23,7 @@ import fcntl
 from paisa.news.deduplication import title_source_time_key
 from paisa.news.entity_linking import link_ogdc_articles
 from paisa.news.models import (
+    NEWS_AVAILABILITY_POLICY_VERSION,
     NEWS_SCHEMA_VERSION,
     DuplicateRelationship,
     NormalizedNewsArticle,
@@ -84,6 +85,7 @@ _NORMALIZED_FIELDS = (
     "body",
     "published_at",
     "published_timezone",
+    "source_observed_at",
     "available_at",
     "fetched_at",
     "language",
@@ -435,6 +437,7 @@ def _sanitize_provider_result(result: ProviderFetchResult) -> ProviderFetchResul
             error,
             configured_source=_redact_sensitive_text(error.configured_source),
             message=_redact_sensitive_text(error.message),
+            details=_sanitize_config(error.details),
         )
         for error in result.errors
     )
@@ -1107,6 +1110,7 @@ def _finalization_payloads(
     completion = {
         "schema_version": "1.0",
         "news_record_schema_version": NEWS_SCHEMA_VERSION,
+        "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
         "run_id": summary.run_id,
         "status": summary.run_status,
         "finalization_state": "COMMITTED",
@@ -1611,6 +1615,7 @@ def run_news_pipeline(
             staging / "provider_config.json",
             {
                 "schema_version": NEWS_SCHEMA_VERSION,
+                "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
                 "provider_id": result.provider_id,
                 "provider_mode": result.data_class,
                 "fetched_at": result.fetched_at,
@@ -1847,6 +1852,7 @@ def run_news_pipeline(
         pending_summary["finalization_state"] = "PENDING_DATABASE_FINALIZATION"
         manifest_base = {
             "schema_version": NEWS_SCHEMA_VERSION,
+            "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
             "quality_report_schema_version": quality["schema_version"],
             "run_id": selected_run_id,
             "producer": "paisa.news.pipeline.run_news_pipeline",

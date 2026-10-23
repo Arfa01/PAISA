@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from datetime import date, datetime, time, timezone
 import hashlib
 import json
@@ -8,15 +9,18 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import warnings
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import paisa.news.coverage as coverage_module
+from paisa.news.models import NEWS_AVAILABILITY_POLICY_VERSION
 from paisa.news.coverage import (
     CoverageAuditError,
     CoverageConfig,
     CoverageRunCollisionError,
+    EnergySectorLinkContract,
     NewsEvidence,
     NewsOccurrence,
     ReadinessThresholds,
@@ -27,8 +31,10 @@ from paisa.news.coverage import (
     load_news_evidence,
     load_source_permission_policy,
     load_stock_evidence,
+    parse_cutoff,
     publish_coverage_run,
     sha256_file,
+    verify_coverage_pack,
     verify_coverage_run,
 )
 from paisa.news.pipeline import run_news_pipeline
@@ -69,6 +75,7 @@ def _occurrence(
     run_id: str = "NEWS-20240110-120000-tests",
     data_class: str = "real",
     source_url: str | None = None,
+    source_observed_at: datetime | None = None,
 ) -> NewsOccurrence:
     if published_at is ...:
         published_at = available_at
@@ -108,6 +115,7 @@ def _occurrence(
             }
             for ticker in tickers
         ),
+        source_observed_at=source_observed_at,
     )
 
 
@@ -118,6 +126,7 @@ def _news(
     provider_error_count: int = 0,
     database_provided: bool = True,
     verification_basis: str | None = None,
+    energy_sector_link_contract: EnergySectorLinkContract | None = None,
 ) -> NewsEvidence:
     run_ids = sorted({item.ingestion_run_id for item in occurrences})
     return NewsEvidence(
@@ -163,6 +172,19 @@ def _news(
             ("LICENSING_REVIEW_REQUIRED",)
             if permission_review_required
             else ()
+        ),
+        energy_sector_link_contract=energy_sector_link_contract,
+    )
+
+
+def _energy_contract(
+    contract_id: str,
+    *occurrences: NewsOccurrence,
+) -> EnergySectorLinkContract:
+    return EnergySectorLinkContract(
+        contract_id=contract_id,
+        evidence_sha256=coverage_module._energy_sector_link_evidence_sha256(
+            occurrences
         ),
     )
 
@@ -227,6 +249,7 @@ def _readiness_rows(
     ogdc_coverage: float,
     full_days_with: int = 1,
     gap: int = 0,
+    split_days_with: int = 2,
 ) -> list[dict[str, object]]:
     rows = [
         _split_row(
@@ -240,10 +263,21 @@ def _readiness_rows(
     for split in ("train", "validation", "test"):
         rows.append(
             _split_row(
-                "all_financial_news", split, all_coverage, gap=gap
+                "all_financial_news",
+                split,
+                all_coverage,
+                gap=gap,
+                days_with=split_days_with,
             )
         )
-        rows.append(_split_row("ogdc_linked_news", split, ogdc_coverage))
+        rows.append(
+            _split_row(
+                "ogdc_linked_news",
+                split,
+                ogdc_coverage,
+                days_with=split_days_with,
+            )
+        )
     return rows
 
 
@@ -266,7 +300,16 @@ def _ogdc_split(computation, split: str) -> dict[str, object]:
 
 
 def test_zero_overlap_is_detected_without_backdating_publication() -> None:
-    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    stock = _stock(
+        (
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-08",
+            "2024-01-09",
+        )
+    )
     article = _occurrence(
         "later",
         published_at=_utc("2024-02-01"),
@@ -283,6 +326,43 @@ def test_zero_overlap_is_detected_without_backdating_publication() -> None:
         "end": None,
     }
     assert result.ogdc_article_rows[0]["mapping_status"] == "AFTER_PRICE_PERIOD"
+
+
+def test_source_observation_is_audited_but_never_used_for_eligibility() -> None:
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    source_seen = _utc("2024-01-02", "08:00:00")
+    article = _occurrence(
+        "source-observed-only",
+        published_at=None,
+        source_observed_at=source_seen,
+        available_at=_utc("2024-02-02"),
+        tickers=("OGDC",),
+    )
+
+    result = compute_coverage(_news(article), stock, CoverageConfig())
+
+    assert result.final_summary["readiness_status"] == "NO_OVERLAP"
+    assert result.final_summary["source_observed_at_range"] == {
+        "start": "2024-01-02T08:00:00Z",
+        "end": "2024-01-02T08:00:00Z",
+    }
+    provenance = result.quality_report["source_observed_at"]
+    assert provenance["complete_count"] == 1
+    assert "never used for cutoff eligibility" in provenance[
+        "eligibility_semantics"
+    ]
+    assert (
+        provenance["eligibility_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+    )
+    assert provenance["eligible_for_feature_cutoff"] is False
+    assert (
+        result.final_summary["availability_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+    )
+    mapping = result.article_session_rows[0]
+    assert mapping["source_observed_at"] == "2024-01-02T08:00:00Z"
+    assert mapping["occurrence_mapping_status"] == "AFTER_PRICE_PERIOD"
 
 
 def test_partial_overlap_and_exact_train_validation_test_denominators() -> None:
@@ -329,7 +409,7 @@ def test_complete_overlap_is_one_hundred_percent_for_every_split() -> None:
         ready_minimum_all_news_coverage_percent_each_split=100,
         ready_minimum_ogdc_coverage_percent_each_split=100,
         ready_maximum_all_news_missing_gap_sessions=0,
-        ready_minimum_distinct_sources=1,
+        ready_minimum_distinct_sources=2,
         ready_minimum_publication_time_completeness_percent=100,
         ready_minimum_available_at_completeness_percent=100,
         partial_minimum_all_news_coverage_percent_each_split=1,
@@ -340,6 +420,7 @@ def test_complete_overlap_is_one_hundred_percent_for_every_split() -> None:
             f"ogdc-{index}",
             available_at=_local(day),
             tickers=("OGDC",),
+            source=f"Reviewed Wire {index % 2}",
         )
         for index, day in enumerate(days)
     )
@@ -391,7 +472,7 @@ def test_unresolved_source_permission_prevents_ready_status() -> None:
         ready_minimum_all_news_coverage_percent_each_split=100,
         ready_minimum_ogdc_coverage_percent_each_split=100,
         ready_maximum_all_news_missing_gap_sessions=0,
-        ready_minimum_distinct_sources=1,
+        ready_minimum_distinct_sources=2,
         ready_minimum_publication_time_completeness_percent=100,
         ready_minimum_available_at_completeness_percent=100,
         partial_minimum_all_news_coverage_percent_each_split=1,
@@ -403,6 +484,7 @@ def test_unresolved_source_permission_prevents_ready_status() -> None:
                 f"permission-{index}",
                 available_at=_local(day),
                 tickers=("OGDC",),
+                source=f"Reviewed Wire {index % 2}",
             )
             for index, day in enumerate(days)
         ),
@@ -436,7 +518,7 @@ def test_partial_ingestion_evidence_prevents_ready_status() -> None:
         ready_minimum_all_news_coverage_percent_each_split=100,
         ready_minimum_ogdc_coverage_percent_each_split=100,
         ready_maximum_all_news_missing_gap_sessions=0,
-        ready_minimum_distinct_sources=1,
+        ready_minimum_distinct_sources=2,
         ready_minimum_publication_time_completeness_percent=100,
         ready_minimum_available_at_completeness_percent=100,
         partial_minimum_all_news_coverage_percent_each_split=1,
@@ -448,6 +530,7 @@ def test_partial_ingestion_evidence_prevents_ready_status() -> None:
                 f"partial-{index}",
                 available_at=_local(day),
                 tickers=("OGDC",),
+                source=f"Reviewed Wire {index % 2}",
             )
             for index, day in enumerate(days)
         ),
@@ -499,6 +582,18 @@ def test_weekend_after_cutoff_and_timezone_mapping_prevent_future_leakage() -> N
     assert monday["all_financial_canonical_article_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "value",
+    ("15:30:00.000001", "15:30:00.999999"),
+)
+def test_fractional_decision_cutoffs_are_rejected(value: str) -> None:
+    with pytest.raises(CoverageAuditError, match="whole-second precision"):
+        parse_cutoff(value)
+
+    with pytest.raises(CoverageAuditError, match="whole-second precision"):
+        CoverageConfig(decision_cutoff=time(15, 30, 0, 1))
+
+
 def test_general_news_is_not_counted_as_ogdc_or_energy_news() -> None:
     stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
     result = compute_coverage(
@@ -515,12 +610,12 @@ def test_general_news_is_not_counted_as_ogdc_or_energy_news() -> None:
     first = result.trading_day_rows[0]
     assert first["all_financial_canonical_article_count"] == 2
     assert first["ogdc_linked_canonical_article_count"] == 1
-    assert first["energy_sector_canonical_article_count"] == 0
+    assert first["energy_sector_canonical_article_count"] is None
     assert result.quality_report["energy_sector_linking"] == {
         "supported": False,
         "reason": (
-            "The current news contract does not infer sectors; general news "
-            "was not relabelled as energy-sector news."
+            "No explicit versioned energy-sector link contract was supplied; "
+            "mentioned_sectors values are not interpreted as coverage evidence."
         ),
     }
     assert result.final_summary["population_support"]["energy_sector_news"][
@@ -528,6 +623,180 @@ def test_general_news_is_not_counted_as_ogdc_or_energy_news() -> None:
     ] is False
     assert result.final_summary["readiness_thresholds"]
     assert result.final_summary["readiness_evaluation"]
+
+
+def test_arbitrary_sector_tags_do_not_enable_energy_coverage_without_contract() -> None:
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    result = compute_coverage(
+        _news(
+            _occurrence(
+                "uncontracted-energy",
+                available_at=_local("2024-01-02"),
+                sectors=("energy",),
+            )
+        ),
+        stock,
+        CoverageConfig(),
+    )
+
+    assert result.final_summary["population_support"]["energy_sector_news"] == {
+        "supported": False,
+        "reason": (
+            "No explicit versioned energy-sector link contract was supplied; "
+            "mentioned_sectors values are not interpreted as coverage evidence."
+        ),
+    }
+    assert result.trading_day_rows[0][
+        "energy_sector_canonical_article_count"
+    ] is None
+    energy_splits = [
+        row for row in result.split_rows if row["population"] == "energy_sector_news"
+    ]
+    assert energy_splits
+    assert all(row["population_supported"] is False for row in energy_splits)
+    assert all(row["coverage_percent"] is None for row in energy_splits)
+    assert result.final_summary["full_price_coverage"]["energy_sector_news"] == {
+        "supported": False,
+        "trading_days_with_articles": None,
+        "coverage_percent": None,
+    }
+    assert all(
+        row["energy_sector_news"] is None
+        for row in result.final_summary["split_coverage"].values()
+    )
+    assert not any(
+        row["population"] == "energy_sector_news"
+        for row in result.missing_interval_rows
+    )
+
+
+def test_explicit_versioned_energy_contract_enables_energy_measurement() -> None:
+    occurrence = _occurrence(
+        "contracted-energy",
+        available_at=_local("2024-01-02"),
+        sectors=("energy",),
+    )
+    contract = _energy_contract("ENERGY-LINKS-review-001", occurrence)
+    result = compute_coverage(
+        _news(
+            occurrence,
+            energy_sector_link_contract=contract,
+        ),
+        _stock(("2024-01-02", "2024-01-03", "2024-01-04")),
+        CoverageConfig(),
+    )
+
+    support = result.final_summary["population_support"]["energy_sector_news"]
+    assert support["supported"] is True
+    assert support["contract"] == contract.to_dict()
+    energy_full = next(
+        row
+        for row in result.split_rows
+        if row["population"] == "energy_sector_news"
+        and row["split"] == "full_price_period"
+    )
+    assert energy_full["population_supported"] is True
+    assert energy_full["trading_days_with_articles"] == 1
+
+
+def test_energy_contract_checksum_must_match_exact_occurrence_evidence() -> None:
+    occurrence = _occurrence(
+        "energy-evidence",
+        available_at=_local("2024-01-02"),
+        sectors=("energy",),
+    )
+    mismatched = EnergySectorLinkContract(
+        contract_id="ENERGY-LINKS-mismatch-001",
+        evidence_sha256=_digest("different rows"),
+    )
+
+    with pytest.raises(CoverageAuditError, match="does not match"):
+        compute_coverage(
+            _news(
+                occurrence,
+                energy_sector_link_contract=mismatched,
+            ),
+            _stock(("2024-01-02", "2024-01-03", "2024-01-04")),
+            CoverageConfig(),
+        )
+
+
+def test_energy_contract_is_bound_into_published_input_and_offline_verification(
+    tmp_path: Path,
+) -> None:
+    occurrence = _occurrence(
+        "published-energy",
+        available_at=_local("2024-01-02"),
+        sectors=("energy",),
+    )
+    contract = _energy_contract("ENERGY-LINKS-published-001", occurrence)
+    news = _news(
+        occurrence,
+        energy_sector_link_contract=contract,
+    )
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    assessment = tmp_path / "assessment.md"
+    assessment.write_text("# Reviewed energy links\n", encoding="utf-8")
+
+    destination = publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "coverage",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-energy",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+    reference = json.loads(
+        (destination / "imported_or_acquired_news_reference.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert reference["energy_sector_link_contract"] == contract.to_dict()
+    assert verify_coverage_pack(destination).status == "PASS"
+    with pytest.raises(
+        CoverageAuditError,
+        match="requires the external energy-sector link contract",
+    ):
+        verify_coverage_run(
+            destination,
+            news_run_directories=[tmp_path / "unused-news"],
+            vertical_slice_directory=tmp_path / "unused-vertical",
+            model_training_directory=tmp_path / "unused-training",
+            source_assessment_path=assessment,
+            database_path=tmp_path / "unused-news.sqlite3",
+        )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(VERIFY_SCRIPT_PATH),
+            "--run-dir",
+            str(destination),
+            "--news-run-dir",
+            str(tmp_path / "unused-news"),
+            "--news-database",
+            str(tmp_path / "unused-news.sqlite3"),
+            "--vertical-slice-dir",
+            str(tmp_path / "unused-vertical"),
+            "--model-training-dir",
+            str(tmp_path / "unused-training"),
+            "--source-assessment",
+            str(assessment),
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert json.loads(completed.stdout)["error"] == (
+        "Source-bound verification requires the external energy-sector link contract"
+    )
+    assert str(tmp_path) not in completed.stdout
 
 
 def test_missing_publication_time_remains_missing_but_availability_can_map() -> None:
@@ -572,6 +841,94 @@ def test_duplicate_occurrences_do_not_inflate_canonical_coverage() -> None:
     assert first["all_financial_canonical_article_count"] == 1
     assert first["ogdc_linked_canonical_article_count"] == 1
     assert result.ogdc_article_rows[0]["occurrence_count"] == 1
+
+
+def test_publisher_document_variants_are_reported_as_duplicate_candidates() -> None:
+    result = compute_coverage(
+        _news(
+            _occurrence(
+                "dawn-short",
+                available_at=_local("2024-01-02"),
+                source="Dawn",
+                source_url="https://www.dawn.com/news/1767623",
+            ),
+            _occurrence(
+                "dawn-slug",
+                available_at=_local("2024-01-03"),
+                source="Dawn",
+                source_url="https://www.dawn.com/news/1767623/company-news",
+            ),
+        ),
+        _stock(("2024-01-02", "2024-01-03", "2024-01-04")),
+        CoverageConfig(),
+    )
+
+    identity = result.quality_report["canonical_identity"]
+    assert identity["uniqueness_scope"] == (
+        "current_exact_canonical_url_content_hash_or_title_source_time_rules"
+    )
+    assert identity["unique_under_current_rules"] == 2
+    assert identity["publisher_document_candidate_group_count"] == 1
+    assert identity["publisher_document_candidate_duplicate_rows"] == 1
+    assert identity["publisher_document_candidate_groups"] == [
+        {
+            "publisher_document_key": "dawn.com:news:1767623",
+            "canonical_article_ids": ["dawn-short", "dawn-slug"],
+            "source_urls": [
+                "https://www.dawn.com/news/1767623",
+                "https://www.dawn.com/news/1767623/company-news",
+            ],
+        }
+    ]
+    assert result.final_summary["canonical_uniqueness_scope"] == identity[
+        "uniqueness_scope"
+    ]
+    assert result.final_summary[
+        "publisher_document_candidate_duplicate_groups"
+    ] == 1
+    mapped_documents = {
+        (row["source_url"], row["publisher_document_key"])
+        for row in result.article_session_rows
+        if row["population"] == "all_financial_news"
+    }
+    assert mapped_documents == {
+        (
+            "https://www.dawn.com/news/1767623",
+            "dawn.com:news:1767623",
+        ),
+        (
+            "https://www.dawn.com/news/1767623/company-news",
+            "dawn.com:news:1767623",
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://www.dawn.com/news/1814669/changed-slug",
+            "dawn.com:news:1814669",
+        ),
+        (
+            "https://www.brecorder.com/news/40297919/changed-slug",
+            "brecorder.com:news:40297919",
+        ),
+        (
+            "https://www.thenews.com.pk/print/1185864-changed-slug",
+            "thenews.com.pk:print:1185864",
+        ),
+        (
+            "https://www.iranoilgas.com/news/details.aspx?id=25514&title=changed",
+            "iranoilgas.com:news:25514",
+        ),
+    ],
+)
+def test_candidate_detection_uses_only_reviewed_publisher_document_patterns(
+    url: str,
+    expected: str,
+) -> None:
+    assert coverage_module._publisher_document_key(url) == expected
 
 
 def test_later_duplicate_link_evidence_cannot_backdate_ogdc_coverage() -> None:
@@ -622,7 +979,17 @@ def test_article_session_mapping_is_exhaustive_and_population_specific() -> None
     )
 
     computation = compute_coverage(
-        _news(general, later_ogdc_duplicate, energy),
+        _news(
+            general,
+            later_ogdc_duplicate,
+            energy,
+            energy_sector_link_contract=_energy_contract(
+                "ENERGY-LINKS-mapping-001",
+                general,
+                later_ogdc_duplicate,
+                energy,
+            ),
+        ),
         stock,
         CoverageConfig(),
     )
@@ -737,6 +1104,113 @@ def test_all_readiness_statuses_are_calculated_from_explicit_gates(
 
     assert status == expected
     assert evaluation["passed"] is (expected == "READY_FOR_AGGREGATION")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "ready_minimum_all_news_coverage_percent_each_split",
+            4.999,
+            "at least 5.0",
+        ),
+        (
+            "ready_minimum_ogdc_coverage_percent_each_split",
+            0.999,
+            "at least 1.0",
+        ),
+        (
+            "ready_minimum_publication_time_completeness_percent",
+            0,
+            "strictly positive",
+        ),
+        (
+            "ready_minimum_available_at_completeness_percent",
+            0,
+            "strictly positive",
+        ),
+        (
+            "ready_minimum_publication_time_completeness_percent",
+            True,
+            "must be a finite number",
+        ),
+        (
+            "partial_minimum_all_news_coverage_percent_each_split",
+            0,
+            "strictly positive",
+        ),
+        ("ready_minimum_distinct_sources", 1, "at least 2"),
+        ("ready_minimum_distinct_sources", True, "must be an integer"),
+        ("ready_maximum_all_news_missing_gap_sessions", 1.5, "must be an integer"),
+    ],
+)
+def test_readiness_thresholds_enforce_types_and_positive_safety_floors(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(CoverageAuditError, match=message):
+        ReadinessThresholds(**{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("ready_field", "partial_field"),
+    [
+        (
+            "ready_minimum_all_news_coverage_percent_each_split",
+            "partial_minimum_all_news_coverage_percent_each_split",
+        ),
+        (
+            "ready_minimum_ogdc_coverage_percent_each_split",
+            "partial_minimum_ogdc_coverage_percent_each_split",
+        ),
+    ],
+)
+def test_ready_coverage_threshold_cannot_be_weaker_than_partial_threshold(
+    ready_field: str,
+    partial_field: str,
+) -> None:
+    values = {
+        ready_field: 10.0,
+        partial_field: 20.0,
+    }
+    with pytest.raises(CoverageAuditError, match="cannot be weaker"):
+        ReadinessThresholds(**values)  # type: ignore[arg-type]
+
+
+def test_non_configurable_minimum_evidence_guard_blocks_sparse_ready_result() -> None:
+    rows = _readiness_rows(
+        all_coverage=100.0,
+        ogdc_coverage=100.0,
+        full_days_with=3,
+        gap=0,
+        split_days_with=1,
+    )
+    # The configurable percentage gates pass, but every model split has only one
+    # covered session. That is descriptive overlap, not readiness.
+    status, evaluation = calculate_readiness(
+        rows,
+        thresholds=ReadinessThresholds(
+            ready_minimum_all_news_coverage_percent_each_split=5.0,
+            ready_minimum_ogdc_coverage_percent_each_split=1.0,
+            ready_maximum_all_news_missing_gap_sessions=0,
+            ready_minimum_distinct_sources=2,
+            ready_minimum_publication_time_completeness_percent=1.0,
+            ready_minimum_available_at_completeness_percent=1.0,
+            partial_minimum_all_news_coverage_percent_each_split=1.0,
+            partial_minimum_ogdc_coverage_percent_each_split=1.0,
+        ),
+        publication_completeness_percent=100.0,
+        available_at_completeness_percent=100.0,
+        distinct_sources=2,
+    )
+
+    assert status == "PARTIALLY_COVERED"
+    guard = evaluation["checks"]["non_configurable_minimum_evidence"]
+    assert guard["passed"] is False
+    assert guard["minimum_covered_sessions_each_split"] == 2
+    assert guard["actual_all_news_minimum"] == 1
+    assert guard["actual_ogdc_minimum"] == 1
 
 
 NEWS_FIELDS = (
@@ -1140,6 +1614,11 @@ def test_database_seals_and_fingerprint_use_one_immutable_snapshot(
         == "CURRENT_COMPLETION_REPLAY_AND_DATABASE_SEAL"
         for reference in evidence.run_references
     )
+    assert all(
+        reference["availability_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+        for reference in evidence.run_references
+    )
     assert not verified_paths[0].exists()
     with sqlite3.connect(database) as live:
         assert live.execute(
@@ -1459,8 +1938,8 @@ def test_published_pack_is_portable_credential_free_immutable_and_deterministic(
         created_at=created_at,
     )
 
-    first_verification = verify_coverage_run(first)
-    second_verification = verify_coverage_run(second)
+    first_verification = verify_coverage_pack(first)
+    second_verification = verify_coverage_pack(second)
     assert first_verification.to_dict()["verification"] == "PASS"
     assert first_verification.run_id == first_id
     assert second_verification.run_id == second_id
@@ -1552,6 +2031,7 @@ def test_published_pack_is_portable_credential_free_immutable_and_deterministic(
             str(VERIFY_SCRIPT_PATH),
             "--run-dir",
             str(first),
+            "--pack-only",
         ],
         cwd=REPOSITORY_ROOT,
         capture_output=True,
@@ -1559,7 +2039,10 @@ def test_published_pack_is_portable_credential_free_immutable_and_deterministic(
         check=False,
     )
     assert completed.returncode == 0
-    assert json.loads(completed.stdout)["verification"] == "PASS"
+    verification_payload = json.loads(completed.stdout)
+    assert verification_payload["verification"] == "PASS"
+    assert verification_payload["verification_basis"] == "PACK_SEMANTIC"
+    assert verification_payload["source_evidence_bound"] is False
     assert str(tmp_path) not in completed.stdout
 
     with pytest.raises(CoverageRunCollisionError):
@@ -1582,13 +2065,14 @@ def test_published_pack_is_portable_credential_free_immutable_and_deterministic(
     with pytest.raises(
         CoverageAuditError, match="completion marker does not bind this manifest"
     ):
-        verify_coverage_run(second)
+        verify_coverage_pack(second)
     failed_verification = subprocess.run(
         [
             sys.executable,
             str(VERIFY_SCRIPT_PATH),
             "--run-dir",
             str(second),
+                "--pack-only",
         ],
         cwd=REPOSITORY_ROOT,
         capture_output=True,
@@ -1692,13 +2176,622 @@ def test_published_pack_is_portable_credential_free_immutable_and_deterministic(
     unexpected_directory = first / "unexpected"
     unexpected_directory.mkdir()
     with pytest.raises(CoverageAuditError, match="only regular files"):
-        verify_coverage_run(first)
+        verify_coverage_pack(first)
     unexpected_directory.rmdir()
 
     unexpected_symlink = first / "unexpected-link"
     unexpected_symlink.symlink_to("final_summary.json")
     with pytest.raises(CoverageAuditError, match="only regular files"):
-        verify_coverage_run(first)
+        verify_coverage_pack(first)
+
+
+def _publish_semantic_verification_fixture(tmp_path: Path) -> Path:
+    news = _news(
+        _occurrence(
+            "semantic-article",
+            available_at=_local("2024-01-02", "14:00:00"),
+            tickers=("OGDC",),
+        )
+    )
+    stock = _stock(
+        (
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-08",
+            "2024-01-09",
+        )
+    )
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    return publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "published",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-semantic",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+
+def _reseal_coverage_pack(run_directory: Path) -> None:
+    manifest_path = run_directory / "run_manifest.json"
+    completion_path = run_directory / "completion.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    inventory = coverage_module._artifact_inventory(
+        run_directory,
+        exclude={"run_manifest.json", "completion.json"},
+    )
+    manifest["artifact_inventory"] = inventory
+    inventory_digest = coverage_module._sha256_bytes(
+        coverage_module._canonical_json_bytes(inventory)
+    )
+    manifest["artifact_inventory_sha256"] = inventory_digest
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion.update(
+        {
+            "manifest_sha256": sha256_file(manifest_path),
+            "manifest_size_bytes": manifest_path.stat().st_size,
+            "summary_sha256": sha256_file(run_directory / "final_summary.json"),
+            "artifact_inventory_sha256": inventory_digest,
+            "artifact_count": len(inventory),
+        }
+    )
+    completion_path.write_text(
+        json.dumps(completion, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def test_source_bound_verifier_requires_sealed_sqlite_evidence(
+    tmp_path: Path,
+) -> None:
+    destination = _publish_semantic_verification_fixture(tmp_path)
+
+    with pytest.raises(
+        CoverageAuditError,
+        match="requires the referenced SQLite database",
+    ):
+        verify_coverage_run(
+            destination,
+            news_run_directories=[tmp_path / "unused-news"],
+            vertical_slice_directory=tmp_path / "unused-vertical",
+            model_training_directory=tmp_path / "unused-training",
+            source_assessment_path=tmp_path / "source-assessment.md",
+        )
+
+
+def _run_source_bound_cli_without_optional_evidence(
+    run_directory: Path,
+    tmp_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(VERIFY_SCRIPT_PATH),
+            "--run-dir",
+            str(run_directory),
+            "--news-run-dir",
+            str(tmp_path / "unused-news"),
+            "--vertical-slice-dir",
+            str(tmp_path / "unused-vertical"),
+            "--model-training-dir",
+            str(tmp_path / "unused-training"),
+            "--source-assessment",
+            str(tmp_path / "source-assessment.md"),
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_verification_cli_reports_required_sqlite_without_path_leakage(
+    tmp_path: Path,
+) -> None:
+    destination = _publish_semantic_verification_fixture(tmp_path)
+
+    completed = _run_source_bound_cli_without_optional_evidence(
+        destination,
+        tmp_path,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["error"] == (
+        "Source-bound verification requires the referenced SQLite database"
+    )
+    assert str(tmp_path) not in completed.stdout
+
+
+def test_verification_cli_reports_required_permission_policy_without_path_leakage(
+    tmp_path: Path,
+) -> None:
+    occurrence = _occurrence(
+        "permission-bound",
+        available_at=_local("2024-01-02", "14:00:00"),
+    )
+    news = replace(
+        _news(occurrence, database_provided=False),
+        permission_policy_reference={
+            "schema_version": "1.0",
+            "policy_reference": "source-permission-policy.json",
+            "policy_sha256": _digest("source-permission-policy"),
+            "assessment_document": "source-assessment.md",
+            "assessment_sha256": _digest("# Reviewed source assessment\n"),
+        },
+    )
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    destination = publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "published",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-permission-bound",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+    completed = _run_source_bound_cli_without_optional_evidence(
+        destination,
+        tmp_path,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["error"] == (
+        "Source-bound verification requires the referenced permission policy"
+    )
+    assert str(tmp_path) not in completed.stdout
+
+
+def test_source_bound_verifier_reopens_exact_news_price_and_split_evidence(
+    tmp_path: Path,
+) -> None:
+    news_dir = _write_news_pack(tmp_path / "news")
+    vertical, training = _write_stock_packs(tmp_path / "stock")
+    news = load_news_evidence(
+        [news_dir],
+        database_path=None,
+        allow_legacy_unsealed=True,
+    )
+    stock = load_stock_evidence(vertical, training)
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    destination = publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "coverage",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-source-bound",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+    pack_only = verify_coverage_pack(destination)
+    assert pack_only.to_dict()["verification_basis"] == "PACK_SEMANTIC"
+    assert pack_only.to_dict()["source_evidence_bound"] is False
+
+    source_bound = verify_coverage_run(
+        destination,
+        news_run_directories=[news_dir],
+        vertical_slice_directory=vertical,
+        model_training_directory=training,
+        source_assessment_path=assessment,
+        database_path=None,
+        allow_legacy_unsealed=True,
+    )
+    assert source_bound.to_dict()["verification_basis"] == (
+        "SOURCE_EVIDENCE_BOUND"
+    )
+    assert source_bound.to_dict()["source_evidence_bound"] is True
+
+
+def test_source_bound_verifier_rejects_self_consistent_false_source_references(
+    tmp_path: Path,
+) -> None:
+    news_dir = _write_news_pack(tmp_path / "news")
+    vertical, training = _write_stock_packs(tmp_path / "stock")
+    news = load_news_evidence(
+        [news_dir],
+        database_path=None,
+        allow_legacy_unsealed=True,
+    )
+    stock = load_stock_evidence(vertical, training)
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    destination = publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "coverage",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-false-reference",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+    stock_reference_path = destination / "stock_artifact_reference.json"
+    stock_reference = json.loads(stock_reference_path.read_text(encoding="utf-8"))
+    stock_reference["price_artifact_sha256"] = "0" * 64
+    stock_reference["training_input_snapshot_sha256"] = "0" * 64
+    stock_reference_path.write_text(
+        json.dumps(stock_reference, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = destination / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    news_reference = json.loads(
+        (destination / "imported_or_acquired_news_reference.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assessment_reference = json.loads(
+        (destination / "source_assessment_reference.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest["input_fingerprint_sha256"] = coverage_module._sha256_bytes(
+        coverage_module._canonical_json_bytes(
+            {
+                "news_runs": news_reference["news_runs"],
+                "database": news_reference["database_fingerprints"],
+                "energy_sector_link_contract": news_reference[
+                    "energy_sector_link_contract"
+                ],
+                "stock": stock_reference,
+                "source_assessment": assessment_reference,
+                "config": manifest["config"],
+            }
+        )
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _reseal_coverage_pack(destination)
+
+    # The pack is internally self-consistent and its forged hashes are shaped
+    # correctly, so only an exact source replay can disprove the claim.
+    assert verify_coverage_pack(destination).status == "PASS"
+    with pytest.raises(CoverageAuditError, match="price/split reference differs"):
+        verify_coverage_run(
+            destination,
+            news_run_directories=[news_dir],
+            vertical_slice_directory=vertical,
+            model_training_directory=training,
+            source_assessment_path=assessment,
+            database_path=None,
+            allow_legacy_unsealed=True,
+        )
+
+
+def test_publish_rejects_a_supplied_computation_that_does_not_match_inputs(
+    tmp_path: Path,
+) -> None:
+    news = _news(
+        _occurrence("real-article", available_at=_local("2024-01-02", "14:00:00"))
+    )
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    computation = compute_coverage(news, stock, config)
+    false_summary = dict(computation.final_summary)
+    false_summary["total_news_occurrences"] = 999_999
+    contradictory = replace(
+        computation,
+        article_session_rows=(),
+        final_summary=false_summary,
+    )
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+
+    with pytest.raises(CoverageAuditError, match="recomputed input evidence"):
+        publish_coverage_run(
+            contradictory,
+            news=news,
+            stock=stock,
+            config=config,
+            output_root=tmp_path / "published",
+            source_assessment_path=assessment,
+            run_id="COVERAGE-20240110-120000-contradictory",
+            created_at=_utc("2024-01-10", "12:00:00"),
+        )
+
+
+def test_offline_verifier_rejects_semantically_false_resealed_metrics(
+    tmp_path: Path,
+) -> None:
+    run_directory = _publish_semantic_verification_fixture(tmp_path)
+    summary_path = run_directory / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["total_news_occurrences"] = 999_999
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _reseal_coverage_pack(run_directory)
+
+    with pytest.raises(CoverageAuditError, match="semantic"):
+        verify_coverage_pack(run_directory)
+
+
+def test_offline_verifier_recomputes_session_assignments_from_availability(
+    tmp_path: Path,
+) -> None:
+    run_directory = _publish_semantic_verification_fixture(tmp_path)
+    mappings_path = run_directory / "article_session_mappings.csv"
+    with mappings_path.open("r", encoding="utf-8", newline="") as handle:
+        mapping_reader = csv.DictReader(handle)
+        mapping_fields = list(mapping_reader.fieldnames or ())
+        mappings = list(mapping_reader)
+    for row in mappings:
+        if row["population_supported"] == "True":
+            row["occurrence_assigned_trading_date"] = "2024-01-03"
+            if row["canonical_assigned_trading_date"]:
+                row["canonical_assigned_trading_date"] = "2024-01-03"
+    with mappings_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=mapping_fields)
+        writer.writeheader()
+        writer.writerows(mappings)
+
+    trading_path = run_directory / "overlap_by_trading_day.csv"
+    with trading_path.open("r", encoding="utf-8", newline="") as handle:
+        trading_reader = csv.DictReader(handle)
+        trading_fields = list(trading_reader.fieldnames or ())
+        trading_rows = list(trading_reader)
+    for row in trading_rows:
+        if row["trading_date"] not in {"2024-01-02", "2024-01-03"}:
+            continue
+        replacement = "0" if row["trading_date"] == "2024-01-02" else "1"
+        for prefix in ("all_financial", "ogdc_linked"):
+            row[f"{prefix}_occurrence_count"] = replacement
+            row[f"{prefix}_canonical_article_count"] = replacement
+    with trading_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=trading_fields)
+        writer.writeheader()
+        writer.writerows(trading_rows)
+
+    missing_rows: list[dict[str, object]] = []
+    for population, prefix in (
+        ("all_financial_news", "all_financial"),
+        ("ogdc_linked_news", "ogdc_linked"),
+    ):
+        for split in ("full_price_period", "train", "validation", "test"):
+            selected = (
+                trading_rows
+                if split == "full_price_period"
+                else [row for row in trading_rows if row["split"] == split]
+            )
+            dates = tuple(date.fromisoformat(row["trading_date"]) for row in selected)
+            covered = {
+                date.fromisoformat(row["trading_date"])
+                for row in selected
+                if int(row[f"{prefix}_canonical_article_count"]) > 0
+            }
+            missing_rows.extend(
+                coverage_module._missing_intervals(
+                    dates,
+                    covered,
+                    population=population,
+                    split=split,
+                )
+            )
+    coverage_module._write_csv(
+        run_directory / "missing_intervals.csv",
+        missing_rows,
+        (
+            "population",
+            "split",
+            "start_date",
+            "end_date",
+            "missing_trading_sessions",
+        ),
+    )
+
+    ogdc_path = run_directory / "ogdc_linked_articles.csv"
+    with ogdc_path.open("r", encoding="utf-8", newline="") as handle:
+        ogdc_reader = csv.DictReader(handle)
+        ogdc_fields = list(ogdc_reader.fieldnames or ())
+        ogdc_rows = list(ogdc_reader)
+    for row in ogdc_rows:
+        row["assigned_trading_date"] = "2024-01-03"
+    with ogdc_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ogdc_fields)
+        writer.writeheader()
+        writer.writerows(ogdc_rows)
+
+    _reseal_coverage_pack(run_directory)
+
+    with pytest.raises(CoverageAuditError, match="invalid occurrence assignment"):
+        verify_coverage_pack(run_directory)
+
+
+def test_offline_verifier_rejects_population_varying_occurrence_identity(
+    tmp_path: Path,
+) -> None:
+    run_directory = _publish_semantic_verification_fixture(tmp_path)
+    mappings_path = run_directory / "article_session_mappings.csv"
+    with mappings_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = list(reader.fieldnames or ())
+        rows = list(reader)
+    energy_row = next(
+        row for row in rows if row["population"] == "energy_sector_news"
+    )
+    energy_row["source_name"] = "Contradictory Source"
+    with mappings_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    _reseal_coverage_pack(run_directory)
+
+    with pytest.raises(CoverageAuditError, match="population-varying occurrence"):
+        verify_coverage_pack(run_directory)
+
+
+def test_offline_verifier_requires_regeneration_of_schema_1_0_pack(
+    tmp_path: Path,
+) -> None:
+    run_directory = _publish_semantic_verification_fixture(tmp_path)
+    manifest_path = run_directory / "run_manifest.json"
+    summary_path = run_directory / "final_summary.json"
+    completion_path = run_directory / "completion.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "1.0"
+    manifest["algorithm_version"] = "news-price-coverage-v2"
+    summary["schema_version"] = "1.0"
+    completion["coverage_schema_version"] = "1.0"
+    completion["algorithm_version"] = "news-price-coverage-v2"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    completion_path.write_text(
+        json.dumps(completion, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _reseal_coverage_pack(run_directory)
+
+    with pytest.raises(CoverageAuditError, match="regenerate.*schema 1.1"):
+        verify_coverage_pack(run_directory)
+
+
+def test_post_commit_reservation_cleanup_failure_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    news = _news(
+        _occurrence("cleanup-article", available_at=_local("2024-01-02", "14:00:00"))
+    )
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    output = tmp_path / "published"
+    run_id = "COVERAGE-20240110-120000-cleanup"
+    destination = output / run_id
+    original_unlink = Path.unlink
+
+    def fail_post_commit_cleanup(
+        path: Path, missing_ok: bool = False,
+    ) -> None:
+        if path.name == f".{run_id}.publish.lock" and destination.is_dir():
+            raise OSError("simulated post-commit reservation cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_post_commit_cleanup)
+    with pytest.warns(RuntimeWarning, match="already committed"):
+        published = publish_coverage_run(
+            compute_coverage(news, stock, config),
+            news=news,
+            stock=stock,
+            config=config,
+            output_root=output,
+            source_assessment_path=assessment,
+            run_id=run_id,
+            created_at=_utc("2024-01-10", "12:00:00"),
+        )
+
+    assert published == destination
+    assert verify_coverage_pack(destination).status == "PASS"
+
+
+def test_post_commit_cleanup_warning_cannot_overturn_success_when_warnings_are_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    news = _news(
+        _occurrence(
+            "cleanup-warning-error",
+            available_at=_local("2024-01-02", "14:00:00"),
+        )
+    )
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    assessment = tmp_path / "source-assessment.md"
+    assessment.write_text("# Reviewed source assessment\n", encoding="utf-8")
+    output = tmp_path / "published"
+    run_id = "COVERAGE-20240110-120000-cleanup-warning-error"
+    destination = output / run_id
+    original_unlink = Path.unlink
+
+    def fail_post_commit_cleanup(
+        path: Path, missing_ok: bool = False,
+    ) -> None:
+        if path.name == f".{run_id}.publish.lock" and destination.is_dir():
+            raise OSError("simulated post-commit reservation cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_post_commit_cleanup)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        published = publish_coverage_run(
+            compute_coverage(news, stock, config),
+            news=news,
+            stock=stock,
+            config=config,
+            output_root=output,
+            source_assessment_path=assessment,
+            run_id=run_id,
+            created_at=_utc("2024-01-10", "12:00:00"),
+        )
+
+    assert published == destination
+    assert verify_coverage_pack(destination).status == "PASS"
+
+
+def test_coverage_csv_neutralizes_formula_leading_provider_text(
+    tmp_path: Path,
+) -> None:
+    occurrence = replace(
+        _occurrence(
+            "formula-safe",
+            available_at=_local("2024-01-02", "14:00:00"),
+            tickers=("OGDC",),
+            source="+SUM(1,1)",
+        ),
+        title="=HYPERLINK(\"https://example.test\")",
+    )
+    news = _news(occurrence)
+    stock = _stock(("2024-01-02", "2024-01-03", "2024-01-04"))
+    config = CoverageConfig()
+    assessment = tmp_path / "assessment.md"
+    assessment.write_text("# Reviewed\n", encoding="utf-8")
+    destination = publish_coverage_run(
+        compute_coverage(news, stock, config),
+        news=news,
+        stock=stock,
+        config=config,
+        output_root=tmp_path / "coverage",
+        source_assessment_path=assessment,
+        run_id="COVERAGE-20240110-120000-formula-safe",
+        created_at=_utc("2024-01-10", "12:00:00"),
+    )
+
+    with (destination / "article_session_mappings.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        mapping = next(csv.DictReader(handle))
+    with (destination / "ogdc_linked_articles.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        linked = next(csv.DictReader(handle))
+    assert mapping["source_name"] == "'+SUM(1,1)"
+    assert linked["title"] == "'=HYPERLINK(\"https://example.test\")"
+    assert verify_coverage_pack(destination).status == "PASS"
 
 
 def test_coverage_cli_help_exposes_reproducibility_and_safety_options() -> None:
@@ -1738,5 +2831,17 @@ def test_coverage_verification_cli_help_exposes_offline_run_check() -> None:
     )
 
     assert completed.returncode == 0
-    assert "--run-dir" in completed.stdout
+    for option in (
+        "--run-dir",
+        "--news-run-dir",
+        "--news-database",
+        "--vertical-slice-dir",
+        "--model-training-dir",
+        "--source-assessment",
+        "--source-permission-policy",
+        "--energy-sector-link-contract",
+        "--pack-only",
+    ):
+        assert option in completed.stdout
+    assert "source-bound" in completed.stdout
     assert "without network access" in completed.stdout

@@ -192,22 +192,37 @@ python scripts/run_news_pipeline.py \
 ```
 
 GDELT `seendate` is source-observation evidence, not a publisher publication
-time. PAISA still calculates normalized eligibility as the maximum of fetch,
-valid publication, and valid source-availability time. A historical archive
-query made today therefore cannot be backdated into an earlier model cutoff.
+time. New schema-`1.1` runs preserve it separately as `source_observed_at`,
+which is audit-only under `news-availability-v1` and excluded from cutoff
+eligibility. Normalized
+`available_at` is therefore controlled by the later PAISA fetch for these
+metadata-only records; an archive query made today cannot be backdated into an
+earlier model cutoff.
 
 The completed live metadata-only acquisition
 `NEWS-20261023-060000-gdelt-ogdc2` is retained separately from the RSS evidence.
-It is a sealed `PARTIAL` run with `WARN` quality and verifies `PASS` with
-`DATABASE_AND_ARTIFACT_BOUND` authority. It preserves `656` raw records and
-`656` normalized, unique canonical records, including `42` exact OGDC-linked
-canonicals across `93` returned source domains, with no duplicates or rejected
-records. All `656` records keep `published_at` missing. Raw GDELT `seendate`
+It is a sealed historical `PARTIAL` run with `WARN` quality. Its
+news-ingestion seal verified `PASS` with `DATABASE_AND_ARTIFACT_BOUND`
+authority at the producing revision; the coverage claims below are separate
+historical evidence. It preserves `656` raw records and
+`656` normalized canonical rows that are unique only under the current exact
+URL/content/title-source-time rules, including `42` exact OGDC-linked rows
+across `93` returned source domains, with no exact-rule duplicate relationships
+or rejected records. This is not a claim of article-level uniqueness: the
+conservative reviewed-publisher document-ID diagnostic flags `17` candidate
+groups (`36` rows, or `19` rows beyond one per group) for later adjudication;
+the `42` OGDC matches and zero-overlap result are unchanged. All `656` records
+keep `published_at` missing. Raw GDELT `seendate`
 evidence spans `2023-06-18T12:15:00Z` through `2024-06-14T15:00:00Z`, while
 conservative `available_at` spans `2026-10-23T06:26:32.440746Z` through
 `2026-10-23T06:29:25.858147Z`. The run remains `PARTIAL` because it records
 `22` provider errors: `15` `ReadTimeout` failures, `4` quarantined out-of-window
 responses, and `3` exhausted HTTP 429 responses.
+That immutable run predates schema `1.1`; new acquisitions additionally bind
+errors to exact request tiles/attempts and sanitized fingerprints, quarantine
+missing or malformed historical observation times, share one bounded
+DNS/request deadline, and record applied or policy-refused `Retry-After`
+durations. Those facts are not retroactively imputed into the retained run.
 The permission policy permits this exact run under the reviewed,
 permission-relevant metadata-only controls. It does not grant permission to a
 future run automatically.
@@ -251,6 +266,12 @@ permission policy checksum-binds the reviewed assessment, permission-relevant
 provider controls, and any exact allowlisted run identities; unresolved
 decisions cannot support readiness:
 
+**Artifact-present retained example:** the following command requires the
+ignored news/database evidence and the retained `VSL-...`/`TRN-...` pair. A
+fresh clone must first restore checksum-verified custodian exports using
+[`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate every input and
+the coverage output under new IDs.
+
 ```bash
 python scripts/audit_news_price_overlap.py \
   --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
@@ -272,7 +293,7 @@ python scripts/audit_news_price_overlap.py \
 
 The retained five-pack RSS evidence from October 2026 is later than the frozen
 price series, which ends on 2026-09-15. The existing
-`news-price-coverage-v2` preflight
+historical schema-`1.0` / `news-price-coverage-v2` preflight
 `COVERAGE-20261023-100000-preflight003` therefore reports `NO_OVERLAP`; fixture
 results never replace that finding. The explicit legacy flag is required
 because these five retained packs predate completion seals. It validates their
@@ -285,8 +306,9 @@ immutable SQLite online-backup image and fingerprints those same bytes. The
 preflight's checksum-bound `article_session_mappings.csv` carries the exhaustive
 occurrence/population and canonical session assignments needed by a later
 aggregation component. The retained official RSS artifact is
-`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. It verifies `PASS`,
-contains `11` payload artifacts and `450` mapping rows, and retains
+`artifacts/news_coverage/COVERAGE-20261023-120000-real0002/`. At its producing
+revision it verified `PASS`, contained `11` payload artifacts and `450` mapping
+rows, and retained
 `NO_OVERLAP`: ingestion completeness passes, while source permission and legacy
 database provenance do not. Its completion marker binds manifest SHA-256
 `57d1f2e3b099318062e4f094c127de7d130953e38b76564684c7427fa3139b54`
@@ -297,16 +319,20 @@ runbook](docs/HISTORICAL_NEWS_COVERAGE.md) and
 [overlap contract](docs/NEWS_PRICE_OVERLAP_CONTRACT.md) for the exact session
 mapping, population, artifact, and readiness rules.
 
-The live GDELT pack has a separate `news-price-coverage-v2` preflight,
+The live GDELT pack has a separate historical schema-`1.0` /
+`news-price-coverage-v2` preflight,
 `COVERAGE-20261023-110000-gdeltpre1`. Source permission and database provenance
 pass, but ingestion completeness fails because the selected run is `PARTIAL`
 and contains `22` provider errors. Publication and
-availability calendar-overlap ranges are both `null`, every all-news,
-OGDC-linked, and energy population reports `0%` train/validation/test coverage,
-and readiness is `NO_OVERLAP`. The preflight remains historical; the retained
+availability calendar-overlap ranges are both `null`, and the supported
+all-news and OGDC-linked populations report `0%` train/validation/test
+coverage. Its old schema encoded unsupported energy-sector metrics as `0%`;
+that value is not a measurement. Readiness is `NO_OVERLAP`. The preflight
+remains historical; the retained
 official GDELT artifact is
-`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. It verifies
-`PASS`, contains `11` payload artifacts and `1,968` mapping rows, and retains
+`artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001/`. At its producing
+revision it verified `PASS`, contained `11` payload artifacts and `1,968`
+mapping rows, and retained
 `NO_OVERLAP`: source permission and database provenance pass, while ingestion
 completeness fails with `22` provider errors. Its completion marker binds
 manifest SHA-256
@@ -315,6 +341,17 @@ and inventory SHA-256
 `51d170ce3a0e26aa743d37b9e32335bfbfe0e1bdf9abee89e0d3683b748e0673`.
 Both official packs were generated from clean code commit
 `041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`.
+They remain immutable historical evidence. The current coverage contract is
+schema `1.1` / `news-price-coverage-v3`; its semantic verifier intentionally
+does not certify these v2 packs. Restore their ignored inputs and regenerate
+under new run IDs to obtain current-verifier evidence.
+For a current v3 pack, `scripts/verify_news_coverage.py` is source-bound by
+default and requires the referenced news, SQLite, vertical-slice, training,
+assessment, and permission-policy inputs. `--pack-only` explicitly selects a
+weaker internal semantic check. The modes report `SOURCE_EVIDENCE_BOUND` and
+`PACK_SEMANTIC` respectively; a pack-only PASS is not source-evidence-bound.
+Strict mode also requires every database, permission-policy, and optional
+energy-sector link contract declared by the sealed references.
 Neither the historical preflights nor the retained official results authorize
 daily sentiment aggregation.
 
@@ -362,11 +399,13 @@ never replaced with a generic classifier.
 
 The loader verifies reviewed SHA-256 hashes for the configuration, safetensors
 weights, tokenizer configuration, vocabulary, and special-token map before and
-after model loading. SQLite schema `6` records those hashes, ordered input and
-generated/reused/error associations, post-truncation token counts, and both
-artifact recovery seals before `PASS` is allowed. An interrupted `RUNNING` run
-is never reused globally. After confirming it is stale, retry its exact
-`--run-id` with `--discard-stale-running`; finalized runs cannot be discarded.
+after model loading. SQLite schema `6` introduced those hashes, ordered input
+and generated/reused/error associations, post-truncation token counts, and both
+artifact recovery seals before `PASS` is allowed. Current schema `7` preserves
+those guarantees and adds nullable audit-only `source_observed_at`. An
+interrupted `RUNNING` run is never reused globally. After confirming it is
+stale, retry its exact `--run-id` with `--discard-stale-running`; finalized runs
+cannot be discarded.
 
 The current stage emits article-level sentiment only. It does not aggregate by
 day, join prices, retrain a stock model, emit a trading signal, or alter the API
@@ -711,7 +750,11 @@ configure it from the repository root:
 ```bash
 cd frontend
 npm ci
-cp .env.example .env.local
+if [ ! -e .env.local ] && [ ! -L .env.local ]; then
+  cp .env.example .env.local
+else
+  printf 'Keeping existing frontend/.env.local\n'
+fi
 ```
 
 The example environment file configures the browser client with:

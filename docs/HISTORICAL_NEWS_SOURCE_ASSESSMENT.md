@@ -120,9 +120,11 @@ DOC ArticleList has no documented page cursor. Therefore the provider must:
 4. split the tile deterministically and retry until every leaf window is
    below the cap, or fail closed at the configured minimum window size;
 5. issue requests sequentially with a configurable delay;
-6. honour HTTP 429 and 5xx responses with bounded exponential backoff; and
-7. quarantine any response whose parseable `seendate` falls outside its
-   inclusive target tile; and
+6. honour HTTP 429 and 5xx responses with bounded exponential backoff; honour
+   valid `Retry-After` within the approved wait ceiling and fail the tile when
+   the requested wait exceeds that ceiling;
+7. quarantine any response whose `seendate` is missing, malformed, or outside
+   its inclusive target tile; and
 8. never rotate addresses, credentials, or queries to evade service limits.
 
 The normal `format=json` ArticleList response contains an `articles` list. The
@@ -133,7 +135,7 @@ documented/current fields used by PAISA are mapped as follows:
 | `url` | Source URL and provider record identity input. Preserve the exact value and also compute the normalised canonical URL used for deduplication. |
 | `url_mobile` | Optional alternate source URL. Preserve only as metadata; do not follow it to scrape content. |
 | `title` | Article title as released in the GDELT dataset. Preserve verbatim plus a checksum. |
-| `seendate` | **GDELT/source observation evidence only.** Preserve it as the source-availability input and original UTC literal. Do not map it to `published_at`, and do not use it directly as the final normalized `available_at`. GDELT explains elsewhere that only a minority of articles expose an exact publication timestamp and otherwise its article date is when GDELT first saw the article. |
+| `seendate` | **GDELT/source observation evidence only.** Preserve it as first-class `source_observed_at` and as the original UTC literal. Do not map it to `published_at` or use it for cutoff eligibility under the current policy. GDELT explains elsewhere that only a minority of articles expose an exact publication timestamp and otherwise its article date is when GDELT first saw the article. |
 | `domain` | Source identity/domain. It does not prove publisher ownership or licence. |
 | `language` | Provider-reported article language. Preserve rather than infer. |
 | `sourcecountry` | Provider-reported source country. It is source metadata, not a statement about the event/company location. |
@@ -144,14 +146,14 @@ Additional PAISA fields must be populated without inventing source facts:
 - `published_at`: `null` unless independent captured source evidence provides a
   publisher publication timestamp. Never copy `seendate` here merely to satisfy
   a non-null constraint.
-- `source_available_at`: parsed GDELT `seendate`, together with the original
-  literal value and its GDELT-observation semantics. This is provenance input,
-  not the normalized eligibility timestamp.
+- `source_observed_at`: parsed GDELT `seendate`, together with the original
+  literal value and its GDELT-observation semantics. This is audit provenance,
+  never an eligibility input without a new reviewed policy version.
 - `available_at`: the conservative PAISA eligibility time,
-  `max(fetched_at, published_at, source_available_at)` over the timestamps that
-  are present. In particular, a GDELT record first fetched from the archive at
-  a later date cannot be backdated to `seendate` for model features; the later
-  `fetched_at` wins.
+  `max(fetched_at, published_at, reviewed source-availability evidence)` over
+  eligible timestamps that are present. GDELT `seendate` is not such evidence
+  under the current policy. An archive record cannot be backdated to
+  `source_observed_at` for model features.
 - `fetched_at` / `imported_at`: PAISA acquisition/import time, not a historical
   availability time.
 - `summary` / `body`: `null`. The selected provider does not fetch them.

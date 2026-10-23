@@ -11,7 +11,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timezone
 import csv
 import errno
@@ -28,21 +28,39 @@ import stat
 import subprocess
 import sys
 import tempfile
+import warnings
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from paisa.news.models import NEWS_AVAILABILITY_POLICY_VERSION
 from paisa.news.verification import NewsRunVerificationError, verify_news_run
 
 from paisa.news.providers.manual_csv import LICENSING_REVIEW_REQUIRED
 
 
-COVERAGE_SCHEMA_VERSION = "1.0"
-COVERAGE_ALGORITHM_VERSION = "news-price-coverage-v2"
+COVERAGE_SCHEMA_VERSION = "1.1"
+COVERAGE_ALGORITHM_VERSION = "news-price-coverage-v3"
+READINESS_CONFIG_SCHEMA_VERSION = "1.0"
 ACADEMIC_DISCLAIMER = "Academic simulation; not financial advice."
 _COVERAGE_MANIFEST = "run_manifest.json"
 _COVERAGE_COMPLETION = "completion.json"
 _COVERAGE_SEAL_FILES = frozenset({_COVERAGE_MANIFEST, _COVERAGE_COMPLETION})
+_COVERAGE_PAYLOAD_FILES = frozenset(
+    {
+        "article_session_mappings.csv",
+        "final_summary.json",
+        "imported_or_acquired_news_reference.json",
+        "missing_intervals.csv",
+        "ogdc_linked_articles.csv",
+        "overlap_by_month.csv",
+        "overlap_by_trading_day.csv",
+        "quality_report.json",
+        "source_assessment_reference.json",
+        "split_coverage.csv",
+        "stock_artifact_reference.json",
+    }
+)
 READINESS_STATUSES = {
     "READY_FOR_AGGREGATION",
     "PARTIALLY_COVERED",
@@ -51,6 +69,13 @@ READINESS_STATUSES = {
 }
 POPULATIONS = ("all_financial_news", "ogdc_linked_news", "energy_sector_news")
 SPLITS = ("train", "validation", "test")
+ENERGY_SECTOR_LINK_CONTRACT_SCHEMA_VERSION = "1.0"
+ENERGY_SECTOR_LINK_METHOD = "reviewed_deterministic_article_sector_links"
+_MINIMUM_READY_ALL_NEWS_COVERAGE_PERCENT = 5.0
+_MINIMUM_READY_OGDC_COVERAGE_PERCENT = 1.0
+_MINIMUM_READY_COMPLETENESS_PERCENT = 1.0
+_MINIMUM_READY_DISTINCT_SOURCES = 2
+_MINIMUM_READY_COVERED_SESSIONS_EACH_SPLIT = 2
 _SAFE_RUN_ID = re.compile(
     r"^COVERAGE-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
@@ -409,15 +434,71 @@ class ReadinessThresholds:
             "partial_minimum_ogdc_coverage_percent_each_split",
         )
         for name in percentage_fields:
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or not 0.0 <= value <= 100.0:
-                raise CoverageAuditError(f"{name} must be between 0 and 100")
+            raw_value = getattr(self, name)
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise CoverageAuditError(f"{name} must be a finite number")
+            value = float(raw_value)
+            if not math.isfinite(value) or not 0.0 < value <= 100.0:
+                raise CoverageAuditError(
+                    f"{name} must be strictly positive and no greater than 100"
+                )
+        integer_fields = (
+            "ready_maximum_all_news_missing_gap_sessions",
+            "ready_minimum_distinct_sources",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CoverageAuditError(f"{name} must be an integer")
         if self.ready_maximum_all_news_missing_gap_sessions < 0:
             raise CoverageAuditError(
                 "ready_maximum_all_news_missing_gap_sessions cannot be negative"
             )
-        if self.ready_minimum_distinct_sources < 1:
-            raise CoverageAuditError("ready_minimum_distinct_sources must be positive")
+        if self.ready_minimum_distinct_sources < _MINIMUM_READY_DISTINCT_SOURCES:
+            raise CoverageAuditError(
+                "ready_minimum_distinct_sources must be at least "
+                f"{_MINIMUM_READY_DISTINCT_SOURCES}"
+            )
+        if (
+            self.ready_minimum_all_news_coverage_percent_each_split
+            < _MINIMUM_READY_ALL_NEWS_COVERAGE_PERCENT
+        ):
+            raise CoverageAuditError(
+                "ready_minimum_all_news_coverage_percent_each_split must be at "
+                f"least {_MINIMUM_READY_ALL_NEWS_COVERAGE_PERCENT}"
+            )
+        if (
+            self.ready_minimum_ogdc_coverage_percent_each_split
+            < _MINIMUM_READY_OGDC_COVERAGE_PERCENT
+        ):
+            raise CoverageAuditError(
+                "ready_minimum_ogdc_coverage_percent_each_split must be at least "
+                f"{_MINIMUM_READY_OGDC_COVERAGE_PERCENT}"
+            )
+        for name in (
+            "ready_minimum_publication_time_completeness_percent",
+            "ready_minimum_available_at_completeness_percent",
+        ):
+            if float(getattr(self, name)) < _MINIMUM_READY_COMPLETENESS_PERCENT:
+                raise CoverageAuditError(
+                    f"{name} must be at least {_MINIMUM_READY_COMPLETENESS_PERCENT}"
+                )
+        if (
+            self.ready_minimum_all_news_coverage_percent_each_split
+            < self.partial_minimum_all_news_coverage_percent_each_split
+        ):
+            raise CoverageAuditError(
+                "ready all-news coverage threshold cannot be weaker than its "
+                "partial threshold"
+            )
+        if (
+            self.ready_minimum_ogdc_coverage_percent_each_split
+            < self.partial_minimum_ogdc_coverage_percent_each_split
+        ):
+            raise CoverageAuditError(
+                "ready OGDC coverage threshold cannot be weaker than its partial "
+                "threshold"
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ReadinessThresholds":
@@ -428,7 +509,10 @@ class ReadinessThresholds:
                 "Readiness configuration has unsupported fields: "
                 + ", ".join(unexpected)
             )
-        if value.get("schema_version", COVERAGE_SCHEMA_VERSION) != COVERAGE_SCHEMA_VERSION:
+        if (
+            value.get("schema_version", READINESS_CONFIG_SCHEMA_VERSION)
+            != READINESS_CONFIG_SCHEMA_VERSION
+        ):
             raise CoverageAuditError("Unsupported readiness configuration schema")
         kwargs = {name: value[name] for name in allowed if name in value}
         return cls(**kwargs)
@@ -453,6 +537,10 @@ class CoverageConfig:
             raise CoverageAuditError("Unknown market timezone") from exc
         if self.decision_cutoff.tzinfo is not None:
             raise CoverageAuditError("decision_cutoff must be a local wall-clock time")
+        if self.decision_cutoff.microsecond:
+            raise CoverageAuditError(
+                "decision_cutoff must use whole-second precision"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -473,7 +561,47 @@ def parse_cutoff(value: str) -> time:
         raise CoverageAuditError("Decision cutoff must be HH:MM or HH:MM:SS") from exc
     if parsed.tzinfo is not None:
         raise CoverageAuditError("Decision cutoff must not include a timezone offset")
+    if parsed.microsecond:
+        raise CoverageAuditError("Decision cutoff must use whole-second precision")
     return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class EnergySectorLinkContract:
+    """Explicit reviewed authority for interpreting sector-link fields."""
+
+    contract_id: str
+    evidence_sha256: str
+    schema_version: str = ENERGY_SECTOR_LINK_CONTRACT_SCHEMA_VERSION
+    link_method: str = ENERGY_SECTOR_LINK_METHOD
+    evidence_field: str = "mentioned_sectors"
+
+    def __post_init__(self) -> None:
+        if (
+            not self.contract_id
+            or self.contract_id.strip() != self.contract_id
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.contract_id)
+        ):
+            raise CoverageAuditError("Energy-sector link contract ID is invalid")
+        if self.schema_version != ENERGY_SECTOR_LINK_CONTRACT_SCHEMA_VERSION:
+            raise CoverageAuditError("Energy-sector link contract schema is unsupported")
+        if self.link_method != ENERGY_SECTOR_LINK_METHOD:
+            raise CoverageAuditError("Energy-sector link method is unsupported")
+        if self.evidence_field != "mentioned_sectors":
+            raise CoverageAuditError("Energy-sector evidence field is unsupported")
+        if not _SHA256.fullmatch(self.evidence_sha256):
+            raise CoverageAuditError(
+                "Energy-sector link evidence SHA-256 is invalid"
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "contract_id": self.contract_id,
+            "schema_version": self.schema_version,
+            "link_method": self.link_method,
+            "evidence_field": self.evidence_field,
+            "evidence_sha256": self.evidence_sha256,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +628,7 @@ class NewsOccurrence:
     data_class: str
     duplicate_of: str | None
     entity_links: tuple[Mapping[str, str], ...]
+    source_observed_at: datetime | None = None
 
     @property
     def is_ogdc(self) -> bool:
@@ -516,6 +645,78 @@ class NewsOccurrence:
         )
 
 
+def _energy_sector_link_evidence_sha256(
+    occurrences: Sequence[NewsOccurrence],
+) -> str:
+    payload = [
+        {
+            "occurrence_key": item.occurrence_key,
+            "article_id": item.article_id,
+            "canonical_article_id": item.canonical_article_id,
+            "content_sha256": item.content_sha256,
+            "mentioned_sectors": sorted(set(item.sectors)),
+        }
+        for item in sorted(occurrences, key=lambda value: value.occurrence_key)
+    ]
+    return _sha256_bytes(_canonical_json_bytes(payload))
+
+
+def _publisher_document_key(value: str | None) -> str | None:
+    """Return conservative IDs only for reviewed publisher URL structures."""
+
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    path = re.sub(r"/{2,}", "/", parsed.path).casefold()
+    patterns = {
+        "dawn.com": ("news", r"^/news/([0-9]+)(?:/.*)?$"),
+        "brecorder.com": ("news", r"^/news/([0-9]+)(?:/.*)?$"),
+        "thenews.com.pk": ("print", r"^/print/([0-9]+)(?:[-/].*)?$"),
+    }
+    configured = patterns.get(host)
+    if configured is not None:
+        namespace, pattern = configured
+        match = re.fullmatch(pattern, path)
+        if match is not None:
+            return f"{host}:{namespace}:{match.group(1)}"
+    if host == "iranoilgas.com" and path == "/news/details.aspx":
+        identifiers = [
+            item
+            for key, item in parse_qsl(parsed.query, keep_blank_values=False)
+            if key.casefold() == "id" and item.isdecimal()
+        ]
+        if len(identifiers) == 1:
+            return f"{host}:news:{identifiers[0]}"
+    return None
+
+
+def _publisher_document_duplicate_candidates(
+    occurrences: Sequence[NewsOccurrence],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {"canonical_article_ids": set(), "source_urls": set()}
+    )
+    for item in occurrences:
+        key = _publisher_document_key(item.source_url)
+        if key is None or item.source_url is None:
+            continue
+        grouped[key]["canonical_article_ids"].add(item.canonical_article_id)
+        grouped[key]["source_urls"].add(item.source_url)
+    return [
+        {
+            "publisher_document_key": key,
+            "canonical_article_ids": sorted(values["canonical_article_ids"]),
+            "source_urls": sorted(values["source_urls"]),
+        }
+        for key, values in sorted(grouped.items())
+        if len(values["canonical_article_ids"]) > 1
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class NewsEvidence:
     occurrences: tuple[NewsOccurrence, ...]
@@ -524,6 +725,7 @@ class NewsEvidence:
     permission_review_required: bool = False
     permission_notes: tuple[str, ...] = ()
     permission_policy_reference: Mapping[str, Any] = field(default_factory=dict)
+    energy_sector_link_contract: EnergySectorLinkContract | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,7 +765,7 @@ class CoverageComputation:
 
 @dataclass(frozen=True, slots=True)
 class CoverageRunVerification:
-    """Offline integrity result for one completed coverage evidence pack."""
+    """Verification result with an explicit evidence-authority boundary."""
 
     run_id: str
     status: str
@@ -571,8 +773,10 @@ class CoverageRunVerification:
     artifact_count: int
     manifest_sha256: str
     artifact_inventory_sha256: str
+    verification_basis: str = "PACK_SEMANTIC"
 
     def to_dict(self) -> dict[str, Any]:
+        source_bound = self.verification_basis == "SOURCE_EVIDENCE_BOUND"
         return {
             "run_id": self.run_id,
             "status": self.status,
@@ -580,7 +784,13 @@ class CoverageRunVerification:
             "artifact_count": self.artifact_count,
             "manifest_sha256": self.manifest_sha256,
             "artifact_inventory_sha256": self.artifact_inventory_sha256,
-            "completion_acceptance": "ARTIFACT_AND_MANIFEST_BOUND",
+            "verification_basis": self.verification_basis,
+            "source_evidence_bound": source_bound,
+            "completion_acceptance": (
+                "SOURCE_EVIDENCE_BOUND_SEMANTIC_REPLAY"
+                if source_bound
+                else "PACK_SEMANTIC_RECONCILIATION_NOT_SOURCE_EVIDENCE_BOUND"
+            ),
             "verification": "PASS",
         }
 
@@ -721,6 +931,20 @@ def _load_one_news_run(
         raise CoverageAuditError("News run directory and manifest identity differ")
     if manifest.get("status") not in {"PASS", "PARTIAL"}:
         raise CoverageAuditError("Only completed PASS/PARTIAL news runs may be audited")
+    news_schema_version = str(manifest.get("schema_version") or "")
+    availability_policy_version = manifest.get("availability_policy_version")
+    if news_schema_version == "1.1":
+        if availability_policy_version != NEWS_AVAILABILITY_POLICY_VERSION:
+            raise CoverageAuditError(
+                "News run availability policy version is missing or unsupported"
+            )
+    elif news_schema_version == "1.0":
+        if availability_policy_version is not None:
+            raise CoverageAuditError(
+                "Legacy news schema 1.0 cannot declare a later availability policy"
+            )
+    else:
+        raise CoverageAuditError("News run record schema is unsupported")
     provider_mode = str(
         manifest.get("provider_mode") or manifest.get("data_kind") or ""
     ).casefold()
@@ -863,6 +1087,10 @@ def _load_one_news_run(
                     row.get("published_at"),
                     field_name=f"published_at row {index}",
                 )
+                source_observed_at = parse_timestamp(
+                    row.get("source_observed_at"),
+                    field_name=f"source_observed_at row {index}",
+                )
                 available_at = parse_timestamp(
                     row.get("available_at"),
                     field_name=f"available_at row {index}",
@@ -941,6 +1169,7 @@ def _load_one_news_run(
                         data_class=data_class,
                         duplicate_of=duplicate_of,
                         entity_links=row_links,
+                        source_observed_at=source_observed_at,
                     )
                 )
     except (OSError, UnicodeError, csv.Error) as exc:
@@ -1001,6 +1230,7 @@ def _load_one_news_run(
         ),
         "completion_marker_present": completion_marker_present,
         "verification_basis": verification_basis,
+        "availability_policy_version": availability_policy_version,
         "provider_error_count": provider_error_count,
         "rejected_record_count": rejected_record_count,
         "ingestion_complete": (
@@ -1668,6 +1898,14 @@ def calculate_readiness(
         float(lookup[("ogdc_linked_news", split)]["coverage_percent"])
         for split in SPLITS
     ]
+    all_split_covered_sessions = [
+        int(lookup[("all_financial_news", split)]["trading_days_with_articles"])
+        for split in SPLITS
+    ]
+    ogdc_split_covered_sessions = [
+        int(lookup[("ogdc_linked_news", split)]["trading_days_with_articles"])
+        for split in SPLITS
+    ]
     maximum_gap = max(
         int(lookup[("all_financial_news", split)]["longest_missing_gap_sessions"])
         for split in SPLITS
@@ -1716,6 +1954,23 @@ def calculate_readiness(
             "passed": available_at_completeness_percent
             >= thresholds.ready_minimum_available_at_completeness_percent,
         },
+        "non_configurable_minimum_evidence": {
+            "actual_all_news_minimum": min(all_split_covered_sessions),
+            "actual_ogdc_minimum": min(ogdc_split_covered_sessions),
+            "minimum_covered_sessions_each_split": (
+                _MINIMUM_READY_COVERED_SESSIONS_EACH_SPLIT
+            ),
+            "passed": (
+                min(all_split_covered_sessions)
+                >= _MINIMUM_READY_COVERED_SESSIONS_EACH_SPLIT
+                and min(ogdc_split_covered_sessions)
+                >= _MINIMUM_READY_COVERED_SESSIONS_EACH_SPLIT
+            ),
+            "interpretation": (
+                "Non-configurable engineering sanity floor; not a statistical-"
+                "sufficiency claim."
+            ),
+        },
     }
     if all(bool(value["passed"]) for value in checks.values()):
         return "READY_FOR_AGGREGATION", {"passed": True, "checks": checks}
@@ -1752,7 +2007,16 @@ def compute_coverage(
     config: CoverageConfig,
 ) -> CoverageComputation:
     occurrences = list(news.occurrences)
-    energy_evidence_present = any(item.sectors for item in occurrences)
+    energy_link_contract = news.energy_sector_link_contract
+    if (
+        energy_link_contract is not None
+        and energy_link_contract.evidence_sha256
+        != _energy_sector_link_evidence_sha256(occurrences)
+    ):
+        raise CoverageAuditError(
+            "Energy-sector link contract does not match the supplied occurrence evidence"
+        )
+    energy_evidence_present = energy_link_contract is not None
     population_supported = {
         "all_financial_news": True,
         "ogdc_linked_news": True,
@@ -1764,6 +2028,8 @@ def compute_coverage(
     }
     for canonical_id, values in attributes.items():
         for population in POPULATIONS:
+            if not population_supported[population]:
+                continue
             representative = values["population_representatives"][population]
             if representative is not None:
                 canonical_assignments[population][canonical_id] = assign_to_session(
@@ -1778,9 +2044,12 @@ def compute_coverage(
         occurrence_assignment = occurrence_assignments[item.occurrence_key]
         canonical_attributes = attributes[item.canonical_article_id]
         for population in POPULATIONS:
-            canonical_representative = canonical_attributes[
-                "population_representatives"
-            ][population]
+            population_is_supported = population_supported[population]
+            canonical_representative = (
+                canonical_attributes["population_representatives"][population]
+                if population_is_supported
+                else None
+            )
             canonical_assignment = canonical_assignments[population].get(
                 item.canonical_article_id
             )
@@ -1792,23 +2061,40 @@ def compute_coverage(
                     "canonical_article_id": item.canonical_article_id,
                     "provider": item.provider,
                     "source_name": item.source_name,
+                    "source_url": item.source_url,
+                    "publisher_document_key": _publisher_document_key(
+                        item.source_url
+                    ),
+                    "mentioned_sectors": list(item.sectors),
                     "data_class": item.data_class,
                     "population": population,
-                    "population_supported": population_supported[population],
-                    "occurrence_in_population": _occurrence_population_match(
-                        population, item
+                    "population_supported": population_is_supported,
+                    "occurrence_in_population": (
+                        _occurrence_population_match(population, item)
+                        if population_is_supported
+                        else None
                     ),
                     "is_duplicate_occurrence": item.duplicate_of is not None,
                     "published_at": utc_iso(item.published_at),
+                    "source_observed_at": utc_iso(item.source_observed_at),
                     "available_at": utc_iso(item.available_at),
                     "fetched_at": utc_iso(item.fetched_at),
                     "occurrence_assigned_trading_date": (
                         occurrence_assignment.session_date.isoformat()
-                        if occurrence_assignment.session_date is not None
+                        if population_is_supported
+                        and occurrence_assignment.session_date is not None
                         else None
                     ),
-                    "occurrence_mapping_status": occurrence_assignment.mapping_status,
-                    "occurrence_arrival_class": occurrence_assignment.arrival_class,
+                    "occurrence_mapping_status": (
+                        occurrence_assignment.mapping_status
+                        if population_is_supported
+                        else None
+                    ),
+                    "occurrence_arrival_class": (
+                        occurrence_assignment.arrival_class
+                        if population_is_supported
+                        else None
+                    ),
                     "canonical_representative_article_id": (
                         canonical_representative.article_id
                         if canonical_representative is not None
@@ -1820,12 +2106,21 @@ def compute_coverage(
                         else None
                     ),
                     "is_population_canonical_representative": (
-                        canonical_representative is not None
-                        and canonical_representative.occurrence_key
-                        == item.occurrence_key
+                        (
+                            canonical_representative is not None
+                            and canonical_representative.occurrence_key
+                            == item.occurrence_key
+                        )
+                        if population_is_supported
+                        else None
                     ),
                     "canonical_available_at": (
                         utc_iso(canonical_representative.available_at)
+                        if canonical_representative is not None
+                        else None
+                    ),
+                    "canonical_source_observed_at": (
+                        utc_iso(canonical_representative.source_observed_at)
                         if canonical_representative is not None
                         else None
                     ),
@@ -1891,11 +2186,15 @@ def compute_coverage(
         }
         for population in POPULATIONS:
             prefix = population.removesuffix("_news")
-            row[f"{prefix}_occurrence_count"] = occurrence_count(
-                session_date, population
+            row[f"{prefix}_occurrence_count"] = (
+                occurrence_count(session_date, population)
+                if population_supported[population]
+                else None
             )
-            row[f"{prefix}_canonical_article_count"] = canonical_count(
-                session_date, population
+            row[f"{prefix}_canonical_article_count"] = (
+                canonical_count(session_date, population)
+                if population_supported[population]
+                else None
             )
         trading_day_rows.append(row)
 
@@ -1907,6 +2206,23 @@ def compute_coverage(
     }
     for population in POPULATIONS:
         for split, dates in date_groups.items():
+            if not population_supported[population]:
+                split_rows.append(
+                    {
+                        "population": population,
+                        "population_supported": False,
+                        "split": split,
+                        "trading_days": len(dates),
+                        "trading_days_with_articles": None,
+                        "coverage_percent": None,
+                        "article_occurrences": None,
+                        "canonical_articles": None,
+                        "articles_per_trading_day": None,
+                        "zero_article_trading_days": None,
+                        "longest_missing_gap_sessions": None,
+                    }
+                )
+                continue
             covered = {
                 session_date
                 for session_date in dates
@@ -1923,6 +2239,7 @@ def compute_coverage(
             split_rows.append(
                 {
                     "population": population,
+                    "population_supported": True,
                     "split": split,
                     "trading_days": trading_day_count,
                     "trading_days_with_articles": days_with,
@@ -1950,6 +2267,22 @@ def compute_coverage(
     monthly_rows: list[dict[str, Any]] = []
     for month, dates in sorted(month_dates.items()):
         for population in POPULATIONS:
+            if not population_supported[population]:
+                monthly_rows.append(
+                    {
+                        "month": month,
+                        "population": population,
+                        "population_supported": False,
+                        "trading_days": len(dates),
+                        "trading_days_with_articles": None,
+                        "coverage_percent": None,
+                        "article_occurrences": None,
+                        "canonical_articles": None,
+                        "articles_per_trading_day": None,
+                        "zero_article_trading_days": None,
+                    }
+                )
+                continue
             covered = {
                 session_date
                 for session_date in dates
@@ -1962,6 +2295,7 @@ def compute_coverage(
                 {
                     "month": month,
                     "population": population,
+                    "population_supported": True,
                     "trading_days": len(dates),
                     "trading_days_with_articles": len(covered),
                     "coverage_percent": round(100.0 * len(covered) / len(dates), 6),
@@ -1993,6 +2327,7 @@ def compute_coverage(
                 "source_url": representative.source_url,
                 "title": representative.title,
                 "published_at": utc_iso(representative.published_at),
+                "source_observed_at": utc_iso(representative.source_observed_at),
                 "available_at": utc_iso(representative.available_at),
                 "assigned_trading_date": (
                     assignment.session_date.isoformat()
@@ -2014,12 +2349,21 @@ def compute_coverage(
     total_occurrences = len(occurrences)
     unique_canonicals = len(representatives)
     missing_publication = sum(item.published_at is None for item in occurrences)
+    missing_source_observed = sum(
+        item.source_observed_at is None for item in occurrences
+    )
     missing_available = sum(item.available_at is None for item in occurrences)
     publication_completeness = round(
         100.0 * (total_occurrences - missing_publication) / total_occurrences, 6
     ) if total_occurrences else 0.0
     availability_completeness = round(
         100.0 * (total_occurrences - missing_available) / total_occurrences, 6
+    ) if total_occurrences else 0.0
+    source_observed_completeness = round(
+        100.0
+        * (total_occurrences - missing_source_observed)
+        / total_occurrences,
+        6,
     ) if total_occurrences else 0.0
     sources = Counter(item.source_name for item in occurrences)
     source_canonicals: dict[str, set[str]] = defaultdict(set)
@@ -2040,6 +2384,13 @@ def compute_coverage(
     )
     mapping_counts = Counter(
         assignment.mapping_status for assignment in occurrence_assignments.values()
+    )
+    publisher_duplicate_candidates = _publisher_document_duplicate_candidates(
+        occurrences
+    )
+    publisher_candidate_duplicate_rows = sum(
+        len(item["canonical_article_ids"]) - 1
+        for item in publisher_duplicate_candidates
     )
     publication_overlap = _calendar_overlap(
         (item.published_at for item in occurrences), stock, zone
@@ -2133,33 +2484,79 @@ def compute_coverage(
     quality_report: dict[str, Any] = {
         "schema_version": COVERAGE_SCHEMA_VERSION,
         "algorithm_version": COVERAGE_ALGORITHM_VERSION,
+        "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
         "total_news_occurrences": total_occurrences,
         "unique_canonical_articles": unique_canonicals,
         "ogdc_linked_occurrences": sum(item.is_ogdc for item in occurrences),
         "ogdc_linked_canonical_articles": sum(
             bool(value["is_ogdc"]) for value in attributes.values()
         ),
-        "energy_linked_occurrences": sum(item.is_energy for item in occurrences),
-        "energy_linked_canonical_articles": sum(
-            bool(value["is_energy"]) for value in attributes.values()
+        "energy_linked_occurrences": (
+            sum(item.is_energy for item in occurrences)
+            if energy_evidence_present
+            else None
         ),
-        "energy_sector_linking": {
-            "supported": energy_evidence_present,
-            "reason": (
-                "Deterministic mentioned_sectors evidence was present."
-                if energy_evidence_present
-                else "The current news contract does not infer sectors; general news "
-                "was not relabelled as energy-sector news."
-            ),
-        },
+        "energy_linked_canonical_articles": (
+            sum(bool(value["is_energy"]) for value in attributes.values())
+            if energy_evidence_present
+            else None
+        ),
+        "energy_sector_linking": (
+            {
+                "supported": True,
+                "reason": (
+                    "A checksum-bound, explicit versioned energy-sector link "
+                    "contract authorizes mentioned_sectors interpretation."
+                ),
+                "contract": energy_link_contract.to_dict(),
+            }
+            if energy_link_contract is not None
+            else {
+                "supported": False,
+                "reason": (
+                    "No explicit versioned energy-sector link contract was supplied; "
+                    "mentioned_sectors values are not interpreted as coverage evidence."
+                ),
+            }
+        ),
         "duplicated_occurrences": sum(item.duplicate_of is not None for item in occurrences),
         "canonical_article_count": unique_canonicals,
+        "canonical_identity": {
+            "uniqueness_scope": (
+                "current_exact_canonical_url_content_hash_or_title_source_time_rules"
+            ),
+            "unique_under_current_rules": unique_canonicals,
+            "publisher_document_candidate_detection_policy": (
+                "reviewed_publisher_document_url_patterns_v1"
+            ),
+            "publisher_document_candidate_group_count": len(
+                publisher_duplicate_candidates
+            ),
+            "publisher_document_candidate_duplicate_rows": (
+                publisher_candidate_duplicate_rows
+            ),
+            "publisher_document_candidate_groups": publisher_duplicate_candidates,
+        },
         "publication_time": {
             "complete_count": total_occurrences - missing_publication,
             "missing_count": missing_publication,
             "completeness_percent": publication_completeness,
             "range": _date_range(item.published_at for item in occurrences),
             "calendar_overlap_with_prices": publication_overlap,
+        },
+        "source_observed_at": {
+            "complete_count": total_occurrences - missing_source_observed,
+            "missing_count": missing_source_observed,
+            "completeness_percent": source_observed_completeness,
+            "range": _date_range(
+                item.source_observed_at for item in occurrences
+            ),
+            "eligibility_semantics": (
+                "audit provenance only; never used for cutoff eligibility "
+                "without a new versioned policy"
+            ),
+            "eligibility_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
+            "eligible_for_feature_cutoff": False,
         },
         "available_at": {
             "complete_count": total_occurrences - missing_available,
@@ -2208,6 +2605,8 @@ def compute_coverage(
         "limitations": [
             "Coverage uses available_at for session eligibility and never backdates "
             "a later import to its historical publication date.",
+            "source_observed_at is audit-only provider provenance and is never "
+            "used for eligibility under this policy version.",
             "This audit performs no sentiment aggregation or model training.",
             ACADEMIC_DISCLAIMER,
         ],
@@ -2219,17 +2618,28 @@ def compute_coverage(
     }
     final_summary: dict[str, Any] = {
         "schema_version": COVERAGE_SCHEMA_VERSION,
+        "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
         "status": "PASS",
         "readiness_status": readiness,
         "symbol": stock.symbol,
         "total_news_occurrences": total_occurrences,
         "unique_canonical_articles": unique_canonicals,
+        "canonical_uniqueness_scope": quality_report["canonical_identity"][
+            "uniqueness_scope"
+        ],
+        "publisher_document_candidate_duplicate_groups": quality_report[
+            "canonical_identity"
+        ]["publisher_document_candidate_group_count"],
+        "publisher_document_candidate_duplicate_rows": quality_report[
+            "canonical_identity"
+        ]["publisher_document_candidate_duplicate_rows"],
         "ogdc_linked_canonical_articles": quality_report[
             "ogdc_linked_canonical_articles"
         ],
         "ogdc_linked_occurrences": quality_report["ogdc_linked_occurrences"],
         "duplicated_occurrences": quality_report["duplicated_occurrences"],
         "publication_date_range": quality_report["publication_time"]["range"],
+        "source_observed_at_range": quality_report["source_observed_at"]["range"],
         "available_at_range": quality_report["available_at"]["range"],
         "publication_calendar_overlap_with_prices": quality_report[
             "publication_time"
@@ -2240,6 +2650,7 @@ def compute_coverage(
         "stock_date_range": stock.reference["price_date_range"],
         "full_price_coverage": {
             population: {
+                "supported": population_supported[population],
                 "trading_days_with_articles": full_rows[population][
                     "trading_days_with_articles"
                 ],
@@ -2292,6 +2703,29 @@ def compute_coverage(
     )
 
 
+_SPREADSHEET_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _spreadsheet_safe_text(value: str) -> str:
+    """Encode a CSV scalar reversibly so spreadsheet imports cannot execute it."""
+
+    if value.startswith("'"):
+        return "'" + value
+    if value.startswith(_SPREADSHEET_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _spreadsheet_restore_text(value: str) -> str:
+    if value.startswith("''"):
+        return value[1:]
+    if value.startswith("'") and value[1:].startswith(
+        _SPREADSHEET_FORMULA_PREFIXES
+    ):
+        return value[1:]
+    return value
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_bytes(_json_bytes(value))
 
@@ -2303,9 +2737,13 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[s
         for row in rows:
             writer.writerow(
                 {
-                    field: json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    if isinstance(value, (list, tuple, dict))
-                    else value
+                    field: _spreadsheet_safe_text(
+                        json.dumps(value, ensure_ascii=False, sort_keys=True)
+                        if isinstance(value, (list, tuple, dict))
+                        else ""
+                        if value is None
+                        else str(value)
+                    )
                     for field, value in ((field, row.get(field)) for field in fields)
                 }
             )
@@ -2367,8 +2805,1671 @@ def _normalize_coverage_inventory(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def verify_coverage_run(run_directory: str | Path) -> CoverageRunVerification:
-    """Verify a completed coverage pack without contacting a provider or database."""
+def _coverage_csv_rows(
+    root: Path,
+    filename: str,
+    *,
+    required_fields: set[str],
+) -> list[dict[str, str]]:
+    """Read one sealed CSV with a non-ambiguous, minimally complete schema."""
+
+    path = _regular_file(
+        root / filename, root=root, label=f"coverage payload {filename}"
+    )
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fields = reader.fieldnames
+            if fields is None or len(fields) != len(set(fields)):
+                raise CoverageAuditError(
+                    f"Coverage semantic verification found an invalid {filename} header"
+                )
+            missing = sorted(required_fields - set(fields))
+            if missing:
+                raise CoverageAuditError(
+                    f"Coverage semantic verification found missing {filename} fields: "
+                    + ", ".join(missing)
+                )
+            rows: list[dict[str, str]] = []
+            for row in reader:
+                restored: dict[str, str] = {}
+                for field, value in row.items():
+                    if value is None:
+                        raise CoverageAuditError(
+                            f"Coverage semantic verification found an invalid "
+                            f"{filename} row"
+                        )
+                    raw = _spreadsheet_restore_text(value)
+                    if _spreadsheet_safe_text(raw) != value:
+                        raise CoverageAuditError(
+                            f"Coverage semantic verification found unsafe CSV text "
+                            f"in {filename}"
+                        )
+                    restored[field] = raw
+                rows.append(restored)
+            return rows
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise CoverageAuditError(
+            f"Coverage semantic verification could not parse {filename}"
+        ) from exc
+
+
+def _coverage_int(value: Any, *, field_name: str) -> int:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise CoverageAuditError(
+            f"Coverage semantic verification found invalid {field_name}"
+        ) from exc
+    if parsed < 0 or str(parsed) != str(value):
+        raise CoverageAuditError(
+            f"Coverage semantic verification found invalid {field_name}"
+        )
+    return parsed
+
+
+def _coverage_float(value: Any, *, field_name: str) -> float:
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise CoverageAuditError(
+            f"Coverage semantic verification found invalid {field_name}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise CoverageAuditError(
+            f"Coverage semantic verification found invalid {field_name}"
+        )
+    return parsed
+
+
+def _coverage_bool(value: Any, *, field_name: str) -> bool:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    raise CoverageAuditError(
+        f"Coverage semantic verification found invalid {field_name}"
+    )
+
+
+def _verify_sha256_fields(value: Any, *, field_name: str) -> None:
+    """Validate every explicitly named SHA-256 in a portable reference tree."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            label = f"{field_name}.{key}"
+            if str(key).endswith("sha256"):
+                if not isinstance(item, str) or not _SHA256.fullmatch(item):
+                    raise CoverageAuditError(
+                        f"Coverage semantic verification found invalid {label}"
+                    )
+            else:
+                _verify_sha256_fields(item, field_name=label)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _verify_sha256_fields(item, field_name=f"{field_name}[{index}]")
+
+
+def _verify_coverage_semantics(
+    root: Path,
+    *,
+    manifest: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> None:
+    """Reconcile sealed metrics with mappings and portable input references."""
+
+    quality = _read_json(
+        root / "quality_report.json", root=root, label="coverage quality report"
+    )
+    news_reference = _read_json(
+        root / "imported_or_acquired_news_reference.json",
+        root=root,
+        label="coverage news reference",
+    )
+    stock_reference = _read_json(
+        root / "stock_artifact_reference.json",
+        root=root,
+        label="coverage stock reference",
+    )
+    assessment_reference = _read_json(
+        root / "source_assessment_reference.json",
+        root=root,
+        label="coverage source-assessment reference",
+    )
+    _verify_sha256_fields(news_reference, field_name="news_reference")
+    _verify_sha256_fields(stock_reference, field_name="stock_reference")
+    _verify_sha256_fields(assessment_reference, field_name="source_assessment")
+
+    config = manifest.get("config")
+    if not isinstance(config, Mapping):
+        raise CoverageAuditError(
+            "Coverage semantic verification found an invalid configuration"
+        )
+    try:
+        serialized_thresholds = config["readiness_thresholds"]
+        if not isinstance(serialized_thresholds, Mapping):
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid readiness thresholds"
+            )
+        reconstructed_config = CoverageConfig(
+            market_timezone=str(config["market_timezone"]),
+            decision_cutoff=parse_cutoff(str(config["decision_cutoff"])),
+            thresholds=ReadinessThresholds.from_mapping(serialized_thresholds),
+        )
+    except (KeyError, TypeError) as exc:
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid serialized configuration"
+        ) from exc
+    if reconstructed_config.to_dict() != dict(config):
+        raise CoverageAuditError(
+            "Coverage semantic verification found a non-canonical configuration"
+        )
+    policy_digest = _sha256_bytes(_canonical_json_bytes(config))
+    if manifest.get("effective_readiness_policy_sha256") != policy_digest:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a readiness-policy fingerprint mismatch"
+        )
+    expected_input_fingerprint = _sha256_bytes(
+        _canonical_json_bytes(
+            {
+                "news_runs": news_reference.get("news_runs"),
+                "database": news_reference.get("database_fingerprints"),
+                "energy_sector_link_contract": news_reference.get(
+                    "energy_sector_link_contract"
+                ),
+                "stock": stock_reference,
+                "source_assessment": assessment_reference,
+                "config": config,
+            }
+        )
+    )
+    if manifest.get("input_fingerprint_sha256") != expected_input_fingerprint:
+        raise CoverageAuditError(
+            "Coverage semantic verification found an input fingerprint mismatch"
+        )
+    if news_reference.get("schema_version") != COVERAGE_SCHEMA_VERSION:
+        raise CoverageAuditError(
+            "Coverage semantic verification found an invalid news-reference schema"
+        )
+    if (
+        quality.get("schema_version") != COVERAGE_SCHEMA_VERSION
+        or quality.get("algorithm_version") != COVERAGE_ALGORITHM_VERSION
+        or quality.get("availability_policy_version")
+        != NEWS_AVAILABILITY_POLICY_VERSION
+        or summary.get("availability_policy_version")
+        != NEWS_AVAILABILITY_POLICY_VERSION
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid quality-report provenance"
+        )
+    source_observation_policy = quality.get("source_observed_at")
+    if (
+        not isinstance(source_observation_policy, Mapping)
+        or source_observation_policy.get("eligibility_policy_version")
+        != NEWS_AVAILABILITY_POLICY_VERSION
+        or source_observation_policy.get("eligible_for_feature_cutoff") is not False
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid availability-policy evidence"
+        )
+    referenced_news_runs = news_reference.get("news_runs")
+    if not isinstance(referenced_news_runs, list) or any(
+        not isinstance(reference, Mapping)
+        or reference.get("availability_policy_version")
+        not in {None, NEWS_AVAILABILITY_POLICY_VERSION}
+        for reference in referenced_news_runs
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found an unsupported input availability policy"
+        )
+    serialized_energy_contract = news_reference.get("energy_sector_link_contract")
+    if serialized_energy_contract is None:
+        energy_supported = False
+        expected_energy_contract: dict[str, str] | None = None
+    elif isinstance(serialized_energy_contract, Mapping):
+        if set(serialized_energy_contract) != {
+            "contract_id",
+            "schema_version",
+            "link_method",
+            "evidence_field",
+            "evidence_sha256",
+        }:
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid energy link contract"
+            )
+        try:
+            parsed_energy_contract = EnergySectorLinkContract(
+                **dict(serialized_energy_contract)
+            )
+        except TypeError as exc:
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid energy link contract"
+            ) from exc
+        expected_energy_contract = parsed_energy_contract.to_dict()
+        energy_supported = True
+    else:
+        raise CoverageAuditError(
+            "Coverage semantic verification found an invalid energy link contract"
+        )
+    energy_quality = quality.get("energy_sector_linking")
+    if not isinstance(energy_quality, Mapping) or energy_quality.get(
+        "supported"
+    ) is not energy_supported:
+        raise CoverageAuditError(
+            "Coverage semantic verification found energy-support contradictions"
+        )
+    if energy_supported:
+        if energy_quality.get("contract") != expected_energy_contract:
+            raise CoverageAuditError(
+                "Coverage semantic verification found an energy-contract contradiction"
+            )
+    elif "contract" in energy_quality:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a contract for unsupported energy data"
+        )
+
+    mappings = _coverage_csv_rows(
+        root,
+        "article_session_mappings.csv",
+        required_fields={
+            "occurrence_key",
+            "ingestion_run_id",
+            "article_id",
+            "canonical_article_id",
+            "provider",
+            "source_name",
+            "source_url",
+            "publisher_document_key",
+            "mentioned_sectors",
+            "data_class",
+            "population",
+            "population_supported",
+            "occurrence_in_population",
+            "is_duplicate_occurrence",
+            "published_at",
+            "source_observed_at",
+            "available_at",
+            "fetched_at",
+            "occurrence_assigned_trading_date",
+            "occurrence_mapping_status",
+            "occurrence_arrival_class",
+            "canonical_representative_article_id",
+            "canonical_representative_ingestion_run_id",
+            "is_population_canonical_representative",
+            "canonical_available_at",
+            "canonical_source_observed_at",
+            "canonical_assigned_trading_date",
+            "canonical_mapping_status",
+            "canonical_arrival_class",
+            "content_sha256",
+            "raw_artifact_reference",
+        },
+    )
+    trading_rows = _coverage_csv_rows(
+        root,
+        "overlap_by_trading_day.csv",
+        required_fields={
+            "trading_date",
+            "split",
+            *{
+                f"{population.removesuffix('_news')}_{kind}_count"
+                for population in POPULATIONS
+                for kind in ("occurrence", "canonical_article")
+            },
+        },
+    )
+    split_rows = _coverage_csv_rows(
+        root,
+        "split_coverage.csv",
+        required_fields={
+            "population",
+            "population_supported",
+            "split",
+            "trading_days",
+            "trading_days_with_articles",
+            "coverage_percent",
+            "article_occurrences",
+            "canonical_articles",
+            "articles_per_trading_day",
+            "zero_article_trading_days",
+            "longest_missing_gap_sessions",
+        },
+    )
+    monthly_rows = _coverage_csv_rows(
+        root,
+        "overlap_by_month.csv",
+        required_fields={
+            "month",
+            "population",
+            "population_supported",
+            "trading_days",
+            "trading_days_with_articles",
+            "coverage_percent",
+            "article_occurrences",
+            "canonical_articles",
+            "articles_per_trading_day",
+            "zero_article_trading_days",
+        },
+    )
+    missing_rows = _coverage_csv_rows(
+        root,
+        "missing_intervals.csv",
+        required_fields={
+            "population",
+            "split",
+            "start_date",
+            "end_date",
+            "missing_trading_sessions",
+        },
+    )
+    ogdc_rows = _coverage_csv_rows(
+        root,
+        "ogdc_linked_articles.csv",
+        required_fields={
+            "canonical_article_id",
+            "representative_article_id",
+            "source_name",
+            "source_url",
+            "published_at",
+            "source_observed_at",
+            "available_at",
+            "assigned_trading_date",
+            "mapping_status",
+            "arrival_class",
+            "occurrence_count",
+            "sources",
+            "link_basis",
+            "link_evidence",
+            "content_sha256",
+        },
+    )
+
+    mapping_keys = [(row["occurrence_key"], row["population"]) for row in mappings]
+    if len(mapping_keys) != len(set(mapping_keys)):
+        raise CoverageAuditError(
+            "Coverage semantic verification found duplicate mapping rows"
+        )
+    occurrence_keys = {key for key, _ in mapping_keys}
+    canonical_ids = {row["canonical_article_id"] for row in mappings}
+    expected_mapping_keys = {
+        (occurrence_key, population)
+        for occurrence_key in occurrence_keys
+        for population in POPULATIONS
+    }
+    if set(mapping_keys) != expected_mapping_keys:
+        raise CoverageAuditError(
+            "Coverage semantic verification found incomplete population mappings"
+        )
+    invariant_fields = (
+        "ingestion_run_id",
+        "article_id",
+        "canonical_article_id",
+        "provider",
+        "source_name",
+        "source_url",
+        "publisher_document_key",
+        "mentioned_sectors",
+        "data_class",
+        "is_duplicate_occurrence",
+        "published_at",
+        "source_observed_at",
+        "available_at",
+        "fetched_at",
+        "content_sha256",
+        "raw_artifact_reference",
+    )
+    mappings_by_occurrence: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in mappings:
+        mappings_by_occurrence[row["occurrence_key"]].append(row)
+    for occurrence_key, rows in mappings_by_occurrence.items():
+        if len(rows) != len(POPULATIONS) or any(
+            len({row[field] for row in rows}) != 1 for field in invariant_fields
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found population-varying occurrence "
+                f"identity for {occurrence_key}"
+            )
+        if not _SHA256.fullmatch(rows[0]["content_sha256"]):
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid content identity"
+            )
+        _safe_relative(
+            rows[0]["raw_artifact_reference"],
+            field_name="mapping raw artifact reference",
+        )
+    population_support: dict[str, bool] = {}
+    summary_population_support = summary.get("population_support")
+    if not isinstance(summary_population_support, Mapping):
+        raise CoverageAuditError(
+            "Coverage semantic verification found missing population support"
+        )
+    for population in POPULATIONS:
+        flags = {
+            _coverage_bool(
+                row["population_supported"], field_name="population_supported"
+            )
+            for row in mappings
+            if row["population"] == population
+        }
+        declared_support = summary_population_support.get(population)
+        if not isinstance(declared_support, Mapping) or not isinstance(
+            declared_support.get("supported"), bool
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid population support"
+            )
+        if len(flags) > 1 or (
+            flags and flags != {declared_support["supported"]}
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found inconsistent population support"
+            )
+        population_support[population] = bool(declared_support["supported"])
+    if not population_support["all_financial_news"] or not population_support[
+        "ogdc_linked_news"
+    ]:
+        raise CoverageAuditError(
+            "Coverage semantic verification found unsupported core populations"
+        )
+    if population_support["energy_sector_news"] is not energy_supported:
+        raise CoverageAuditError(
+            "Coverage semantic verification found energy-contract/support contradictions"
+        )
+    canonical_invariant_fields = (
+        "canonical_representative_article_id",
+        "canonical_representative_ingestion_run_id",
+        "canonical_available_at",
+        "canonical_source_observed_at",
+        "canonical_assigned_trading_date",
+        "canonical_mapping_status",
+        "canonical_arrival_class",
+    )
+    mappings_by_population_canonical: dict[
+        tuple[str, str], list[dict[str, str]]
+    ] = defaultdict(list)
+    for row in mappings:
+        mappings_by_population_canonical[
+            (row["population"], row["canonical_article_id"])
+        ].append(row)
+    for (population, _canonical_id), rows in mappings_by_population_canonical.items():
+        if any(
+            len({row[field] for row in rows}) != 1
+            for field in canonical_invariant_fields
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found inconsistent canonical "
+                "representative evidence"
+            )
+        representative_flags = [
+            _coverage_bool(
+                row["is_population_canonical_representative"],
+                field_name="is_population_canonical_representative",
+            )
+            for row in rows
+            if row["is_population_canonical_representative"] != ""
+        ]
+        membership_values = [
+            row["occurrence_in_population"]
+            for row in rows
+            if row["occurrence_in_population"] != ""
+        ]
+        matched_population = any(
+            _coverage_bool(
+                value,
+                field_name="occurrence_in_population",
+            )
+            for value in membership_values
+        )
+        representative_id = rows[0]["canonical_representative_article_id"]
+        if not population_support[population]:
+            if representative_flags or representative_id:
+                raise CoverageAuditError(
+                    "Coverage semantic verification found canonical evidence for an "
+                    "unsupported population"
+                )
+            continue
+        if len(representative_flags) != len(rows) or len(membership_values) != len(
+            rows
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found missing supported-population flags"
+            )
+        if matched_population:
+            representative_rows = [
+                row for row, selected in zip(rows, representative_flags, strict=True)
+                if selected
+            ]
+            if (
+                len(representative_rows) != 1
+                or not representative_id
+                or representative_rows[0]["article_id"] != representative_id
+                or representative_rows[0]["ingestion_run_id"]
+                != rows[0]["canonical_representative_ingestion_run_id"]
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found an invalid canonical "
+                    "representative identity"
+                )
+        elif any(representative_flags) or any(
+            rows[0][field] for field in canonical_invariant_fields
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found a representative outside its "
+                "population"
+            )
+    occurrence_count = _coverage_int(
+        news_reference.get("occurrence_count"), field_name="news occurrence count"
+    )
+    canonical_count = _coverage_int(
+        news_reference.get("canonical_count"), field_name="news canonical count"
+    )
+    if occurrence_count != len(occurrence_keys) or canonical_count != len(canonical_ids):
+        raise CoverageAuditError(
+            "Coverage semantic verification found news-reference count contradictions"
+        )
+    for payload, label in ((summary, "summary"), (quality, "quality report")):
+        if payload.get("total_news_occurrences") != occurrence_count:
+            raise CoverageAuditError(
+                f"Coverage semantic verification found a {label} occurrence contradiction"
+            )
+        unique_value = payload.get(
+            "unique_canonical_articles", payload.get("canonical_article_count")
+        )
+        if unique_value != canonical_count:
+            raise CoverageAuditError(
+                f"Coverage semantic verification found a {label} canonical contradiction"
+            )
+
+    first_by_occurrence = {
+        row["occurrence_key"]: row
+        for row in mappings
+        if row["population"] == "all_financial_news"
+    }
+    energy_evidence_payload: list[dict[str, Any]] = []
+    for occurrence_key, row in sorted(first_by_occurrence.items()):
+        sectors = _json_list(
+            row["mentioned_sectors"], field_name="mapping mentioned_sectors"
+        )
+        energy_evidence_payload.append(
+            {
+                "occurrence_key": occurrence_key,
+                "article_id": row["article_id"],
+                "canonical_article_id": row["canonical_article_id"],
+                "content_sha256": row["content_sha256"],
+                "mentioned_sectors": sorted(set(sectors)),
+            }
+        )
+    observed_energy_evidence_sha256 = _sha256_bytes(
+        _canonical_json_bytes(energy_evidence_payload)
+    )
+    if energy_supported and (
+        expected_energy_contract is None
+        or expected_energy_contract["evidence_sha256"]
+        != observed_energy_evidence_sha256
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found an energy evidence-digest "
+            "contradiction"
+        )
+    candidate_groups: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {"canonical_article_ids": set(), "source_urls": set()}
+    )
+    for row in first_by_occurrence.values():
+        source_url = row["source_url"] or None
+        expected_document_key = _publisher_document_key(source_url)
+        if row["publisher_document_key"] != (expected_document_key or ""):
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid publisher document key"
+            )
+        if expected_document_key is not None and source_url is not None:
+            candidate_groups[expected_document_key]["canonical_article_ids"].add(
+                row["canonical_article_id"]
+            )
+            candidate_groups[expected_document_key]["source_urls"].add(source_url)
+    expected_candidate_groups = [
+        {
+            "publisher_document_key": key,
+            "canonical_article_ids": sorted(values["canonical_article_ids"]),
+            "source_urls": sorted(values["source_urls"]),
+        }
+        for key, values in sorted(candidate_groups.items())
+        if len(values["canonical_article_ids"]) > 1
+    ]
+    expected_candidate_duplicate_rows = sum(
+        len(item["canonical_article_ids"]) - 1
+        for item in expected_candidate_groups
+    )
+    canonical_identity = quality.get("canonical_identity")
+    if not isinstance(canonical_identity, Mapping) or canonical_identity != {
+        "uniqueness_scope": (
+            "current_exact_canonical_url_content_hash_or_title_source_time_rules"
+        ),
+        "unique_under_current_rules": canonical_count,
+        "publisher_document_candidate_detection_policy": (
+            "reviewed_publisher_document_url_patterns_v1"
+        ),
+        "publisher_document_candidate_group_count": len(expected_candidate_groups),
+        "publisher_document_candidate_duplicate_rows": (
+            expected_candidate_duplicate_rows
+        ),
+        "publisher_document_candidate_groups": expected_candidate_groups,
+    }:
+        raise CoverageAuditError(
+            "Coverage semantic verification found publisher-document candidate "
+            "contradictions"
+        )
+    if (
+        summary.get("canonical_uniqueness_scope")
+        != canonical_identity["uniqueness_scope"]
+        or summary.get("publisher_document_candidate_duplicate_groups")
+        != len(expected_candidate_groups)
+        or summary.get("publisher_document_candidate_duplicate_rows")
+        != expected_candidate_duplicate_rows
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found summary candidate contradictions"
+        )
+    duplicate_count = sum(
+        _coverage_bool(
+            row["is_duplicate_occurrence"],
+            field_name="is_duplicate_occurrence",
+        )
+        for row in first_by_occurrence.values()
+    )
+    if summary.get("duplicated_occurrences") != duplicate_count or quality.get(
+        "duplicated_occurrences"
+    ) != duplicate_count:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a duplicate-count contradiction"
+        )
+    published_values = [
+        parse_timestamp(
+            row.get("published_at"), field_name="mapping published_at"
+        )
+        for row in first_by_occurrence.values()
+    ]
+    available_values = [
+        parse_timestamp(
+            row.get("available_at"), field_name="mapping available_at"
+        )
+        for row in first_by_occurrence.values()
+    ]
+    source_observed_values = [
+        parse_timestamp(
+            row.get("source_observed_at"), field_name="mapping source_observed_at"
+        )
+        for row in first_by_occurrence.values()
+    ]
+    expected_publication_complete = sum(value is not None for value in published_values)
+    expected_available_complete = sum(value is not None for value in available_values)
+    publication_quality = quality.get("publication_time")
+    availability_quality = quality.get("available_at")
+    source_observed_quality = quality.get("source_observed_at")
+    if not isinstance(publication_quality, Mapping) or not isinstance(
+        availability_quality, Mapping
+    ) or not isinstance(source_observed_quality, Mapping):
+        raise CoverageAuditError(
+            "Coverage semantic verification found incomplete timestamp quality evidence"
+        )
+    expected_publication_completeness = (
+        round(100.0 * expected_publication_complete / occurrence_count, 6)
+        if occurrence_count
+        else 0.0
+    )
+    expected_availability_completeness = (
+        round(100.0 * expected_available_complete / occurrence_count, 6)
+        if occurrence_count
+        else 0.0
+    )
+    expected_source_observed_complete = sum(
+        value is not None for value in source_observed_values
+    )
+    expected_source_observed_completeness = (
+        round(100.0 * expected_source_observed_complete / occurrence_count, 6)
+        if occurrence_count
+        else 0.0
+    )
+    if (
+        publication_quality.get("complete_count") != expected_publication_complete
+        or publication_quality.get("missing_count")
+        != occurrence_count - expected_publication_complete
+        or publication_quality.get("completeness_percent")
+        != expected_publication_completeness
+        or publication_quality.get("range") != _date_range(published_values)
+        or availability_quality.get("complete_count") != expected_available_complete
+        or availability_quality.get("missing_count")
+        != occurrence_count - expected_available_complete
+        or availability_quality.get("completeness_percent")
+        != expected_availability_completeness
+        or availability_quality.get("range") != _date_range(available_values)
+        or source_observed_quality.get("complete_count")
+        != expected_source_observed_complete
+        or source_observed_quality.get("missing_count")
+        != occurrence_count - expected_source_observed_complete
+        or source_observed_quality.get("completeness_percent")
+        != expected_source_observed_completeness
+        or source_observed_quality.get("range")
+        != _date_range(source_observed_values)
+        or summary.get("publication_date_range") != _date_range(published_values)
+        or summary.get("available_at_range") != _date_range(available_values)
+        or summary.get("source_observed_at_range")
+        != _date_range(source_observed_values)
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found timestamp metric contradictions"
+        )
+
+    ogdc_mappings = [
+        row
+        for row in mappings
+        if row["population"] == "ogdc_linked_news"
+        and _coverage_bool(
+            row["occurrence_in_population"], field_name="occurrence_in_population"
+        )
+    ]
+    ogdc_canonical_ids = {row["canonical_article_id"] for row in ogdc_mappings}
+    if (
+        summary.get("ogdc_linked_occurrences") != len(ogdc_mappings)
+        or summary.get("ogdc_linked_canonical_articles") != len(ogdc_canonical_ids)
+        or quality.get("ogdc_linked_occurrences") != len(ogdc_mappings)
+        or quality.get("ogdc_linked_canonical_articles")
+        != len(ogdc_canonical_ids)
+        or {row["canonical_article_id"] for row in ogdc_rows}
+        != ogdc_canonical_ids
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found an OGDC-count contradiction"
+        )
+    ogdc_occurrences_by_canonical = Counter(
+        row["canonical_article_id"] for row in ogdc_mappings
+    )
+    for row in ogdc_rows:
+        try:
+            link_evidence = json.loads(row["link_evidence"])
+        except json.JSONDecodeError as exc:
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid OGDC link evidence"
+            ) from exc
+        if (
+            row["link_basis"] != "checksum_bound_article_entity_links"
+            or not isinstance(link_evidence, list)
+            or not link_evidence
+            or _coverage_int(
+                row["occurrence_count"], field_name="OGDC occurrence count"
+            )
+            != ogdc_occurrences_by_canonical[row["canonical_article_id"]]
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid OGDC article evidence"
+            )
+        canonical_mapping_rows = mappings_by_population_canonical[
+            ("ogdc_linked_news", row["canonical_article_id"])
+        ]
+        representative_rows = [
+            mapping
+            for mapping in canonical_mapping_rows
+            if _coverage_bool(
+                mapping["is_population_canonical_representative"],
+                field_name="OGDC canonical representative",
+            )
+        ]
+        if len(representative_rows) != 1:
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid OGDC representative evidence"
+            )
+        representative = representative_rows[0]
+        try:
+            sources = json.loads(row["sources"])
+        except json.JSONDecodeError as exc:
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid OGDC source evidence"
+            ) from exc
+        expected_sources = sorted(
+            {
+                mapping["source_name"]
+                for mapping in canonical_mapping_rows
+                if _coverage_bool(
+                    mapping["occurrence_in_population"],
+                    field_name="OGDC population membership",
+                )
+            }
+        )
+        if (
+            sources != expected_sources
+            or row["representative_article_id"] != representative["article_id"]
+            or row["source_name"] != representative["source_name"]
+            or row["source_url"] != representative["source_url"]
+            or row["published_at"] != representative["published_at"]
+            or row["source_observed_at"] != representative["source_observed_at"]
+            or row["available_at"] != representative["available_at"]
+            or row["assigned_trading_date"]
+            != representative["canonical_assigned_trading_date"]
+            or row["mapping_status"] != representative["canonical_mapping_status"]
+            or row["arrival_class"] != representative["canonical_arrival_class"]
+            or row["content_sha256"] != representative["content_sha256"]
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found OGDC/mapping contradictions"
+            )
+
+    trading_dates: list[date] = []
+    trading_by_date: dict[str, dict[str, str]] = {}
+    for row in trading_rows:
+        parsed_date = _parse_date(
+            row["trading_date"], field_name="coverage trading date"
+        )
+        if row["trading_date"] in trading_by_date:
+            raise CoverageAuditError(
+                "Coverage semantic verification found duplicate trading dates"
+            )
+        trading_dates.append(parsed_date)
+        trading_by_date[row["trading_date"]] = row
+    if not trading_dates or trading_dates != sorted(trading_dates):
+        raise CoverageAuditError(
+            "Coverage semantic verification found unordered trading dates"
+        )
+    claimed_range = stock_reference.get("price_date_range")
+    observed_range = {
+        "start": trading_dates[0].isoformat(),
+        "end": trading_dates[-1].isoformat(),
+    }
+    if claimed_range != observed_range or summary.get("stock_date_range") != observed_range:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a stock date-range contradiction"
+        )
+    if "price_trading_day_count" in stock_reference and stock_reference.get(
+        "price_trading_day_count"
+    ) != len(trading_rows):
+        raise CoverageAuditError(
+            "Coverage semantic verification found a stock row-count contradiction"
+        )
+    symbol = stock_reference.get("symbol")
+    if not isinstance(symbol, str) or not symbol or summary.get("symbol") != symbol:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a stock symbol contradiction"
+        )
+    if (
+        "training_input_snapshot_sha256" in stock_reference
+        and stock_reference.get("training_input_snapshot_sha256")
+        != stock_reference.get("price_artifact_sha256")
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found mismatched stock/training evidence"
+        )
+    split_counts = stock_reference.get("split_counts")
+    split_ranges = stock_reference.get("split_ranges")
+    if split_counts is not None or split_ranges is not None:
+        if not isinstance(split_counts, Mapping) or not isinstance(
+            split_ranges, Mapping
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found incomplete split references"
+            )
+        for split in SPLITS:
+            selected_dates = [
+                row["trading_date"] for row in trading_rows if row["split"] == split
+            ]
+            if (
+                split_counts.get(split) != len(selected_dates)
+                or not selected_dates
+                or split_ranges.get(split)
+                != {"start": selected_dates[0], "end": selected_dates[-1]}
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found split-reference contradictions"
+                )
+
+    reconstructed_split_dates = {
+        split: tuple(
+            _parse_date(row["trading_date"], field_name=f"{split} trading date")
+            for row in trading_rows
+            if row["split"] == split
+        )
+        for split in SPLITS
+    }
+    reconstructed_stock = StockEvidence(
+        symbol=symbol,
+        trading_dates=tuple(trading_dates),
+        split_dates=reconstructed_split_dates,
+        reference=stock_reference,
+    )
+    cutoffs, _ = _session_cutoffs(
+        reconstructed_stock.trading_dates, reconstructed_config
+    )
+    for row, cutoff in zip(trading_rows, cutoffs, strict=True):
+        if row.get("decision_cutoff_utc") != utc_iso(cutoff):
+            raise CoverageAuditError(
+                "Coverage semantic verification found a decision-cutoff contradiction"
+            )
+
+    for row in mappings:
+        population = row["population"]
+        available_at = parse_timestamp(
+            row["available_at"], field_name="mapping available_at"
+        )
+        fetched_at = parse_timestamp(
+            row["fetched_at"], field_name="mapping fetched_at"
+        )
+        published_at = parse_timestamp(
+            row["published_at"], field_name="mapping published_at"
+        )
+        source_observed_at = parse_timestamp(
+            row["source_observed_at"], field_name="mapping source_observed_at"
+        )
+        if available_at is None or fetched_at is None or available_at < fetched_at:
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid availability evidence"
+            )
+        if published_at is not None and available_at < published_at:
+            raise CoverageAuditError(
+                "Coverage semantic verification found backdated publication eligibility"
+            )
+        if source_observed_at is not None and available_at < source_observed_at:
+            raise CoverageAuditError(
+                "Coverage semantic verification found backdated source-observation eligibility"
+            )
+        if not population_support[population]:
+            continue
+        occurrence_assignment = assign_to_session(
+            available_at, reconstructed_stock, reconstructed_config
+        )
+        expected_occurrence_date = (
+            occurrence_assignment.session_date.isoformat()
+            if occurrence_assignment.session_date is not None
+            else ""
+        )
+        if (
+            row["occurrence_assigned_trading_date"] != expected_occurrence_date
+            or row["occurrence_mapping_status"]
+            != occurrence_assignment.mapping_status
+            or row["occurrence_arrival_class"]
+            != occurrence_assignment.arrival_class
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found a backdated or invalid "
+                "occurrence assignment"
+            )
+        canonical_available_at = parse_timestamp(
+            row["canonical_available_at"],
+            field_name="mapping canonical_available_at",
+        )
+        if canonical_available_at is None:
+            if any(
+                row[field]
+                for field in (
+                    "canonical_representative_article_id",
+                    "canonical_representative_ingestion_run_id",
+                    "canonical_source_observed_at",
+                    "canonical_assigned_trading_date",
+                    "canonical_mapping_status",
+                    "canonical_arrival_class",
+                )
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found incomplete canonical evidence"
+                )
+            continue
+        canonical_assignment = assign_to_session(
+            canonical_available_at, reconstructed_stock, reconstructed_config
+        )
+        expected_canonical_date = (
+            canonical_assignment.session_date.isoformat()
+            if canonical_assignment.session_date is not None
+            else ""
+        )
+        if (
+            row["canonical_assigned_trading_date"] != expected_canonical_date
+            or row["canonical_mapping_status"] != canonical_assignment.mapping_status
+            or row["canonical_arrival_class"] != canonical_assignment.arrival_class
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found a backdated or invalid "
+                "canonical assignment"
+            )
+
+    news_runs = news_reference.get("news_runs")
+    database_fingerprints = news_reference.get("database_fingerprints")
+    if not isinstance(news_runs, list) or not all(
+        isinstance(item, Mapping) and isinstance(item.get("run_id"), str)
+        for item in news_runs
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid news-run references"
+        )
+    referenced_run_ids = {str(item["run_id"]) for item in news_runs}
+    mapped_run_ids = {row["ingestion_run_id"] for row in mappings}
+    if not mapped_run_ids.issubset(referenced_run_ids):
+        raise CoverageAuditError(
+            "Coverage semantic verification found unreferenced news mappings"
+        )
+    if all("occurrence_count" in reference for reference in news_runs):
+        mapped_occurrences_by_run = Counter(
+            row["ingestion_run_id"] for row in first_by_occurrence.values()
+        )
+        if any(
+            _coverage_int(
+                reference["occurrence_count"],
+                field_name="news-run occurrence count",
+            )
+            != mapped_occurrences_by_run[str(reference["run_id"])]
+            for reference in news_runs
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found news-run count contradictions"
+            )
+    expected_input_source_evidence = [
+        {
+            "run_id": reference["run_id"],
+            "provider": reference.get("provider"),
+            "provider_mode": reference.get("provider_mode"),
+            "licensing_usage_note": reference.get("licensing_usage_note"),
+            "source_permission_decision": reference.get(
+                "source_permission_decision"
+            ),
+        }
+        for reference in news_runs
+    ]
+    if assessment_reference.get(
+        "input_source_evidence"
+    ) != expected_input_source_evidence:
+        raise CoverageAuditError(
+            "Coverage semantic verification found source-reference contradictions"
+        )
+    if not isinstance(database_fingerprints, Mapping):
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid database fingerprints"
+        )
+    database_files = database_fingerprints.get("files")
+    if database_fingerprints.get("provided") is True and (
+        not isinstance(database_files, list)
+        or not any(
+            isinstance(item, Mapping)
+            and item.get("label") == "database"
+            and isinstance(item.get("size_bytes"), int)
+            and not isinstance(item.get("size_bytes"), bool)
+            and item["size_bytes"] >= 0
+            for item in database_files
+        )
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found incomplete database evidence"
+        )
+    incomplete_run_ids = sorted(
+        str(reference["run_id"])
+        for reference in news_runs
+        if not bool(reference.get("ingestion_complete", False))
+    )
+    expected_ingestion_evidence = {
+        "passed": not incomplete_run_ids,
+        "incomplete_run_ids": incomplete_run_ids,
+        "provider_error_count": sum(
+            _coverage_int(
+                reference.get("provider_error_count", 0),
+                field_name="provider error count",
+            )
+            for reference in news_runs
+        ),
+        "rejected_record_count": sum(
+            _coverage_int(
+                reference.get("rejected_record_count", 0),
+                field_name="rejected record count",
+            )
+            for reference in news_runs
+        ),
+    }
+    if quality.get("ingestion_completeness") != expected_ingestion_evidence:
+        raise CoverageAuditError(
+            "Coverage semantic verification found ingestion-evidence contradictions"
+        )
+    database_fingerprinted = bool(
+        database_fingerprints.get("provided")
+        and isinstance(database_files, list)
+        and any(
+            isinstance(item, Mapping) and item.get("label") == "database"
+            for item in database_files
+        )
+    )
+    unsealed_run_ids = sorted(
+        str(reference["run_id"])
+        for reference in news_runs
+        if reference.get("verification_basis")
+        != "CURRENT_COMPLETION_REPLAY_AND_DATABASE_SEAL"
+    )
+    database_bound = database_fingerprinted and not unsealed_run_ids
+    expected_database_evidence = {
+        "passed": database_bound,
+        "authoritative_completion_seal_available": database_bound,
+        "database_fingerprinted": database_fingerprinted,
+        "unsealed_run_ids": unsealed_run_ids,
+        "reason": (
+            "Every selected news pack replayed against the fingerprinted SQLite seal."
+            if database_bound
+            else (
+                "The SQLite database was fingerprinted, but one or more legacy packs "
+                "have no current database-bound completion seal."
+                if database_fingerprinted
+                else "No SQLite database fingerprint was supplied; this is artifact-only replay."
+            )
+        ),
+    }
+    if quality.get("database_provenance") != expected_database_evidence:
+        raise CoverageAuditError(
+            "Coverage semantic verification found database-evidence contradictions"
+        )
+    permission_decisions = [
+        reference.get("source_permission_decision") for reference in news_runs
+    ]
+    if all(isinstance(decision, Mapping) for decision in permission_decisions):
+        if not all(
+            isinstance(decision.get("passed"), bool)
+            and isinstance(decision.get("status"), str)
+            and isinstance(decision.get("reason"), str)
+            for decision in permission_decisions
+            if isinstance(decision, Mapping)
+        ):
+            raise CoverageAuditError(
+                "Coverage semantic verification found invalid permission decisions"
+            )
+        expected_permission_notes = sorted(
+            f"{reference['run_id']}: "
+            f"{reference['source_permission_decision']['status']}: "
+            f"{reference['source_permission_decision']['reason']}"
+            for reference in news_runs
+            if not reference["source_permission_decision"].get("passed", False)
+        )
+        expected_permission_evidence = {
+            "passed": not expected_permission_notes,
+            "review_required": bool(expected_permission_notes),
+            "notes": expected_permission_notes,
+        }
+        if quality.get("source_permission_evidence") != expected_permission_evidence:
+            raise CoverageAuditError(
+                "Coverage semantic verification found permission-evidence contradictions"
+            )
+
+    for population in POPULATIONS:
+        prefix = population.removesuffix("_news")
+        if not population_support[population]:
+            unsupported_mapping_fields = (
+                "occurrence_in_population",
+                "occurrence_assigned_trading_date",
+                "occurrence_mapping_status",
+                "occurrence_arrival_class",
+                "canonical_representative_article_id",
+                "canonical_representative_ingestion_run_id",
+                "is_population_canonical_representative",
+                "canonical_available_at",
+                "canonical_source_observed_at",
+                "canonical_assigned_trading_date",
+                "canonical_mapping_status",
+                "canonical_arrival_class",
+            )
+            if any(
+                row[field] != ""
+                for row in mappings
+                if row["population"] == population
+                for field in unsupported_mapping_fields
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found measured values for an "
+                    "unsupported population"
+                )
+            for row in trading_rows:
+                if (
+                    row[f"{prefix}_occurrence_count"] != ""
+                    or row[f"{prefix}_canonical_article_count"] != ""
+                ):
+                    raise CoverageAuditError(
+                        "Coverage semantic verification found trading metrics for an "
+                        "unsupported population"
+                    )
+            continue
+        occurrence_by_date = Counter(
+            row["occurrence_assigned_trading_date"]
+            for row in mappings
+            if row["population"] == population
+            and _coverage_bool(
+                row["occurrence_in_population"],
+                field_name="occurrence_in_population",
+            )
+            and row["occurrence_assigned_trading_date"]
+        )
+        canonical_by_date = Counter(
+            row["canonical_assigned_trading_date"]
+            for row in mappings
+            if row["population"] == population
+            and _coverage_bool(
+                row["is_population_canonical_representative"],
+                field_name="is_population_canonical_representative",
+            )
+            and row["canonical_assigned_trading_date"]
+        )
+        for trading_date, row in trading_by_date.items():
+            observed_occurrences = _coverage_int(
+                row[f"{prefix}_occurrence_count"],
+                field_name=f"{population} trading occurrence count",
+            )
+            observed_canonicals = _coverage_int(
+                row[f"{prefix}_canonical_article_count"],
+                field_name=f"{population} trading canonical count",
+            )
+            if (
+                observed_occurrences != occurrence_by_date[trading_date]
+                or observed_canonicals != canonical_by_date[trading_date]
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found trading-day/mapping contradictions"
+                )
+
+    split_lookup: dict[tuple[str, str], dict[str, str]] = {}
+    for row in split_rows:
+        key = (row["population"], row["split"])
+        if key in split_lookup:
+            raise CoverageAuditError(
+                "Coverage semantic verification found duplicate split rows"
+            )
+        split_lookup[key] = row
+    expected_split_keys = {
+        (population, split)
+        for population in POPULATIONS
+        for split in (*SPLITS, "full_price_period")
+    }
+    if set(split_lookup) != expected_split_keys:
+        raise CoverageAuditError(
+            "Coverage semantic verification found incomplete split coverage"
+        )
+
+    def rows_for_split(split: str) -> list[dict[str, str]]:
+        if split == "full_price_period":
+            return trading_rows
+        return [row for row in trading_rows if row["split"] == split]
+
+    for population, split in sorted(expected_split_keys):
+        rows = rows_for_split(split)
+        prefix = population.removesuffix("_news")
+        expected = split_lookup[(population, split)]
+        supported = population_support[population]
+        if _coverage_bool(
+            expected["population_supported"],
+            field_name="split population_supported",
+        ) is not supported:
+            raise CoverageAuditError(
+                "Coverage semantic verification found split support contradictions"
+            )
+        if not supported:
+            if _coverage_int(
+                expected["trading_days"], field_name="unsupported split trading days"
+            ) != len(rows) or any(
+                expected[field] != ""
+                for field in (
+                    "trading_days_with_articles",
+                    "coverage_percent",
+                    "article_occurrences",
+                    "canonical_articles",
+                    "articles_per_trading_day",
+                    "zero_article_trading_days",
+                    "longest_missing_gap_sessions",
+                )
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found measured split metrics for "
+                    "an unsupported population"
+                )
+            if split == "full_price_period":
+                full = summary.get("full_price_coverage", {}).get(population, {})
+                if full != {
+                    "supported": False,
+                    "trading_days_with_articles": None,
+                    "coverage_percent": None,
+                }:
+                    raise CoverageAuditError(
+                        "Coverage semantic verification found unsupported full-period "
+                        "summary metrics"
+                    )
+            elif summary.get("split_coverage", {}).get(split, {}).get(
+                population
+            ) is not None:
+                raise CoverageAuditError(
+                    "Coverage semantic verification found unsupported split summary metrics"
+                )
+            continue
+        canonical_values = [
+            _coverage_int(
+                row[f"{prefix}_canonical_article_count"],
+                field_name=f"{population} canonical count",
+            )
+            for row in rows
+        ]
+        occurrence_values = [
+            _coverage_int(
+                row[f"{prefix}_occurrence_count"],
+                field_name=f"{population} occurrence count",
+            )
+            for row in rows
+        ]
+        days = len(rows)
+        days_with = sum(value > 0 for value in canonical_values)
+        expected_coverage = round(100.0 * days_with / days, 6) if days else 0.0
+        expected_per_day = round(sum(canonical_values) / days, 8) if days else 0.0
+        observed = (
+            _coverage_int(expected["trading_days"], field_name="split trading days"),
+            _coverage_int(
+                expected["trading_days_with_articles"],
+                field_name="split covered days",
+            ),
+            _coverage_float(expected["coverage_percent"], field_name="split coverage"),
+            _coverage_int(
+                expected["article_occurrences"],
+                field_name="split occurrences",
+            ),
+            _coverage_int(
+                expected["canonical_articles"], field_name="split canonicals"
+            ),
+            _coverage_float(
+                expected["articles_per_trading_day"],
+                field_name="split articles per day",
+            ),
+            _coverage_int(
+                expected["zero_article_trading_days"],
+                field_name="split zero days",
+            ),
+            _coverage_int(
+                expected["longest_missing_gap_sessions"],
+                field_name="split longest missing gap",
+            ),
+        )
+        selected_dates = tuple(
+            _parse_date(row["trading_date"], field_name="split trading date")
+            for row in rows
+        )
+        covered_dates = {
+            selected_dates[index]
+            for index, value in enumerate(canonical_values)
+            if value > 0
+        }
+        calculated = (
+            days,
+            days_with,
+            expected_coverage,
+            sum(occurrence_values),
+            sum(canonical_values),
+            expected_per_day,
+            days - days_with,
+            _longest_gap(selected_dates, covered_dates),
+        )
+        if observed != calculated:
+            raise CoverageAuditError(
+                "Coverage semantic verification found split/trading-day contradictions"
+            )
+        if split == "full_price_period":
+            full = summary.get("full_price_coverage", {}).get(population, {})
+            if full not in (
+                {
+                    "trading_days_with_articles": days_with,
+                    "coverage_percent": expected_coverage,
+                },
+                {
+                    "supported": True,
+                    "trading_days_with_articles": days_with,
+                    "coverage_percent": expected_coverage,
+                },
+            ):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found a summary/full-period contradiction"
+                )
+        else:
+            if summary.get("split_coverage", {}).get(split, {}).get(
+                population
+            ) != expected_coverage:
+                raise CoverageAuditError(
+                    "Coverage semantic verification found a summary/split contradiction"
+                )
+
+    expected_month_keys = {
+        (value.strftime("%Y-%m"), population)
+        for value in trading_dates
+        for population in POPULATIONS
+    }
+    month_keys = [(row["month"], row["population"]) for row in monthly_rows]
+    if len(month_keys) != len(set(month_keys)) or set(month_keys) != expected_month_keys:
+        raise CoverageAuditError(
+            "Coverage semantic verification found incomplete monthly coverage"
+        )
+
+    for row in monthly_rows:
+        population = row["population"]
+        supported = population_support[population]
+        if _coverage_bool(
+            row["population_supported"],
+            field_name="monthly population_supported",
+        ) is not supported:
+            raise CoverageAuditError(
+                "Coverage semantic verification found monthly support contradictions"
+            )
+        selected_rows = [
+            trading
+            for trading in trading_rows
+            if trading["trading_date"].startswith(f"{row['month']}-")
+        ]
+        if _coverage_int(
+            row["trading_days"], field_name="monthly trading days"
+        ) != len(selected_rows):
+            raise CoverageAuditError(
+                "Coverage semantic verification found monthly trading-day contradictions"
+            )
+        measured_fields = (
+            "trading_days_with_articles",
+            "coverage_percent",
+            "article_occurrences",
+            "canonical_articles",
+            "articles_per_trading_day",
+            "zero_article_trading_days",
+        )
+        if not supported:
+            if any(row[field] != "" for field in measured_fields):
+                raise CoverageAuditError(
+                    "Coverage semantic verification found monthly metrics for an "
+                    "unsupported population"
+                )
+            continue
+        prefix = population.removesuffix("_news")
+        canonical_values = [
+            _coverage_int(
+                trading[f"{prefix}_canonical_article_count"],
+                field_name="monthly canonical count",
+            )
+            for trading in selected_rows
+        ]
+        occurrence_values = [
+            _coverage_int(
+                trading[f"{prefix}_occurrence_count"],
+                field_name="monthly occurrence count",
+            )
+            for trading in selected_rows
+        ]
+        days = len(selected_rows)
+        days_with = sum(value > 0 for value in canonical_values)
+        observed_month = (
+            _coverage_int(
+                row["trading_days_with_articles"],
+                field_name="monthly covered days",
+            ),
+            _coverage_float(
+                row["coverage_percent"], field_name="monthly coverage"
+            ),
+            _coverage_int(
+                row["article_occurrences"], field_name="monthly occurrences"
+            ),
+            _coverage_int(
+                row["canonical_articles"], field_name="monthly canonicals"
+            ),
+            _coverage_float(
+                row["articles_per_trading_day"],
+                field_name="monthly articles per day",
+            ),
+            _coverage_int(
+                row["zero_article_trading_days"],
+                field_name="monthly zero days",
+            ),
+        )
+        calculated_month = (
+            days_with,
+            round(100.0 * days_with / days, 6),
+            sum(occurrence_values),
+            sum(canonical_values),
+            round(sum(canonical_values) / days, 8),
+            days - days_with,
+        )
+        if observed_month != calculated_month:
+            raise CoverageAuditError(
+                "Coverage semantic verification found monthly/trading-day contradictions"
+            )
+
+    normalized_missing_rows: list[dict[str, Any]] = []
+    for row in missing_rows:
+        if row["population"] not in POPULATIONS or row["split"] not in {
+            *SPLITS,
+            "full_price_period",
+        }:
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid missing interval"
+            )
+        start = _parse_date(row["start_date"], field_name="missing interval start")
+        end = _parse_date(row["end_date"], field_name="missing interval end")
+        interval_size = _coverage_int(
+            row["missing_trading_sessions"],
+            field_name="missing interval sessions",
+        )
+        if start > end or interval_size < 1:
+            raise CoverageAuditError(
+                "Coverage semantic verification found an invalid missing interval"
+            )
+        if not population_support[row["population"]]:
+            raise CoverageAuditError(
+                "Coverage semantic verification found missing intervals for an "
+                "unsupported population"
+            )
+        normalized_missing_rows.append(
+            {
+                "population": row["population"],
+                "split": row["split"],
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "missing_trading_sessions": interval_size,
+            }
+        )
+    expected_missing_rows: list[dict[str, Any]] = []
+    for population in POPULATIONS:
+        if not population_support[population]:
+            continue
+        prefix = population.removesuffix("_news")
+        for split in (*SPLITS, "full_price_period"):
+            selected = rows_for_split(split)
+            selected_dates = tuple(
+                _parse_date(row["trading_date"], field_name="missing trading date")
+                for row in selected
+            )
+            covered = {
+                selected_dates[index]
+                for index, row in enumerate(selected)
+                if _coverage_int(
+                    row[f"{prefix}_canonical_article_count"],
+                    field_name="missing canonical count",
+                )
+                > 0
+            }
+            expected_missing_rows.extend(
+                _missing_intervals(
+                    selected_dates,
+                    covered,
+                    population=population,
+                    split=split,
+                )
+            )
+
+    def missing_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            row["population"],
+            row["split"],
+            row["start_date"],
+            row["end_date"],
+        )
+    if sorted(normalized_missing_rows, key=missing_sort_key) != sorted(
+        expected_missing_rows, key=missing_sort_key
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found missing-interval contradictions"
+        )
+
+    readiness_rows: list[dict[str, Any]] = []
+    for (population, split), row in split_lookup.items():
+        if not population_support[population]:
+            continue
+        readiness_rows.append(
+            {
+                "population": population,
+                "split": split,
+                "trading_days_with_articles": _coverage_int(
+                    row["trading_days_with_articles"],
+                    field_name="readiness covered days",
+                ),
+                "coverage_percent": _coverage_float(
+                    row["coverage_percent"], field_name="readiness coverage"
+                ),
+                "longest_missing_gap_sessions": _coverage_int(
+                    row["longest_missing_gap_sessions"],
+                    field_name="readiness missing gap",
+                ),
+            }
+        )
+    publication_overlap = summary.get("publication_calendar_overlap_with_prices")
+    if not isinstance(publication_overlap, Mapping):
+        raise CoverageAuditError(
+            "Coverage semantic verification found invalid publication overlap evidence"
+        )
+    recalculated_readiness, _ = calculate_readiness(
+        readiness_rows,
+        thresholds=reconstructed_config.thresholds,
+        publication_completeness_percent=expected_publication_completeness,
+        available_at_completeness_percent=expected_availability_completeness,
+        distinct_sources=len(
+            {row["source_name"] for row in first_by_occurrence.values()}
+        ),
+        publication_overlap_exists=publication_overlap.get("start") is not None,
+    )
+    if recalculated_readiness == "READY_FOR_AGGREGATION" and any(
+        not bool(quality.get(field, {}).get("passed", False))
+        for field in (
+            "source_permission_evidence",
+            "ingestion_completeness",
+            "database_provenance",
+        )
+    ):
+        recalculated_readiness = "PARTIALLY_COVERED"
+    if summary.get("readiness_status") != recalculated_readiness:
+        raise CoverageAuditError(
+            "Coverage semantic verification found a readiness-status contradiction"
+        )
+
+    if (
+        summary.get("readiness_status") != quality.get("readiness_status")
+        or summary.get("readiness_evaluation") != quality.get("readiness_evaluation")
+        or summary.get("readiness_thresholds") != quality.get("readiness_thresholds")
+        or summary.get("source_count")
+        != len({row["source_name"] for row in first_by_occurrence.values()})
+    ):
+        raise CoverageAuditError(
+            "Coverage semantic verification found summary/quality contradictions"
+        )
+
+
+def verify_coverage_pack(run_directory: str | Path) -> CoverageRunVerification:
+    """Reconcile one sealed pack without claiming its source files were reopened.
+
+    This mode proves byte integrity and internal semantic consistency.  Call
+    :func:`verify_coverage_run` when the original news, SQLite, price, split,
+    assessment, and permission evidence is available for a source-bound replay.
+    """
 
     supplied = Path(run_directory)
     try:
@@ -2379,6 +4480,337 @@ def verify_coverage_run(run_directory: str | Path) -> CoverageRunVerification:
         raise CoverageAuditError("Coverage run root must be a real directory")
     root = supplied.resolve(strict=True)
     return _verify_coverage_root(root, expected_run_id=root.name)
+
+
+def _config_from_coverage_manifest(manifest: Mapping[str, Any]) -> CoverageConfig:
+    serialized = manifest.get("config")
+    if not isinstance(serialized, Mapping):
+        raise CoverageAuditError("Coverage manifest configuration is invalid")
+    thresholds = serialized.get("readiness_thresholds")
+    if not isinstance(thresholds, Mapping):
+        raise CoverageAuditError("Coverage manifest readiness configuration is invalid")
+    try:
+        config = CoverageConfig(
+            market_timezone=str(serialized["market_timezone"]),
+            decision_cutoff=parse_cutoff(str(serialized["decision_cutoff"])),
+            thresholds=ReadinessThresholds.from_mapping(thresholds),
+        )
+    except (KeyError, TypeError) as exc:
+        raise CoverageAuditError("Coverage manifest configuration is invalid") from exc
+    if config.to_dict() != dict(serialized):
+        raise CoverageAuditError("Coverage manifest configuration is not canonical")
+    return config
+
+
+def _coverage_csv_scalar(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _assert_source_bound_csv(
+    root: Path,
+    filename: str,
+    expected_rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str],
+) -> None:
+    observed = _coverage_csv_rows(
+        root,
+        filename,
+        required_fields=set(fields),
+    )
+    if observed and tuple(observed[0]) != tuple(fields):
+        raise CoverageAuditError(
+            f"Source-bound verification found a non-canonical {filename} schema"
+        )
+    expected = [
+        {field: _coverage_csv_scalar(row.get(field)) for field in fields}
+        for row in expected_rows
+    ]
+    if observed != expected:
+        raise CoverageAuditError(
+            f"Source-bound verification found {filename} differs from source replay"
+        )
+
+
+def verify_coverage_run(
+    run_directory: str | Path,
+    *,
+    news_run_directories: Iterable[str | Path],
+    vertical_slice_directory: str | Path,
+    model_training_directory: str | Path,
+    source_assessment_path: str | Path,
+    database_path: str | Path | None = None,
+    source_permission_policy_path: str | Path | None = None,
+    energy_sector_link_contract_path: str | Path | None = None,
+    real_mode: bool = True,
+    allow_legacy_unsealed: bool = False,
+) -> CoverageRunVerification:
+    """Verify a pack and replay it from the exact referenced source evidence."""
+
+    pack_result = verify_coverage_pack(run_directory)
+    root = Path(run_directory).resolve(strict=True)
+    manifest = _read_json(
+        root / _COVERAGE_MANIFEST,
+        root=root,
+        label="coverage run manifest",
+    )
+    config = _config_from_coverage_manifest(manifest)
+    actual_news_reference = _read_json(
+        root / "imported_or_acquired_news_reference.json",
+        root=root,
+        label="coverage news reference",
+    )
+    actual_assessment_reference = _read_json(
+        root / "source_assessment_reference.json",
+        root=root,
+        label="coverage source-assessment reference",
+    )
+    sealed_database = actual_news_reference.get("database_fingerprints")
+    if (
+        isinstance(sealed_database, Mapping)
+        and sealed_database.get("provided") is True
+        and database_path is None
+    ):
+        raise CoverageAuditError(
+            "Source-bound verification requires the referenced SQLite database"
+        )
+    sealed_permission_policy = actual_assessment_reference.get(
+        "permission_policy"
+    )
+    if sealed_permission_policy and source_permission_policy_path is None:
+        raise CoverageAuditError(
+            "Source-bound verification requires the referenced permission policy"
+        )
+    serialized_energy_contract = actual_news_reference.get(
+        "energy_sector_link_contract"
+    )
+    if serialized_energy_contract is not None and energy_sector_link_contract_path is None:
+        raise CoverageAuditError(
+            "Source-bound verification requires the external energy-sector link contract"
+        )
+    if serialized_energy_contract is None and energy_sector_link_contract_path is not None:
+        raise CoverageAuditError(
+            "An energy-sector link contract was supplied for an unsupported sealed population"
+        )
+    assessment_candidate = Path(source_assessment_path)
+    if assessment_candidate.is_symlink():
+        raise CoverageAuditError(
+            "Historical-news source assessment must not be a symlink"
+        )
+    assessment_path = assessment_candidate.resolve()
+    permission_policy = (
+        load_source_permission_policy(
+            source_permission_policy_path,
+            assessment_path,
+        )
+        if source_permission_policy_path is not None
+        else None
+    )
+    run_directories = tuple(news_run_directories)
+    news = load_news_evidence(
+        run_directories,
+        real_mode=real_mode,
+        database_path=database_path,
+        allow_legacy_unsealed=allow_legacy_unsealed,
+        source_permission_policy=permission_policy,
+    )
+    stock = load_stock_evidence(
+        vertical_slice_directory,
+        model_training_directory,
+        symbol="OGDC",
+    )
+
+    if serialized_energy_contract is not None:
+        contract_candidate = Path(str(energy_sector_link_contract_path))
+        if contract_candidate.is_symlink():
+            raise CoverageAuditError(
+                "Energy-sector link contract must not be a symlink"
+            )
+        external_energy_contract = _read_json(
+            contract_candidate.resolve(),
+            label="energy-sector link contract",
+        )
+        if (
+            not isinstance(serialized_energy_contract, Mapping)
+            or external_energy_contract != serialized_energy_contract
+        ):
+            raise CoverageAuditError("Coverage energy-sector contract is invalid")
+        try:
+            energy_contract = EnergySectorLinkContract(
+                **dict(external_energy_contract)
+            )
+        except TypeError as exc:
+            raise CoverageAuditError(
+                "Coverage energy-sector contract is invalid"
+            ) from exc
+        news = replace(news, energy_sector_link_contract=energy_contract)
+
+    expected_news_reference = {
+        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "news_runs": list(news.run_references),
+        "database_fingerprints": news.database_fingerprints,
+        "energy_sector_link_contract": (
+            news.energy_sector_link_contract.to_dict()
+            if news.energy_sector_link_contract is not None
+            else None
+        ),
+        "occurrence_count": len(news.occurrences),
+        "canonical_count": len(
+            {item.canonical_article_id for item in news.occurrences}
+        ),
+        "provider_modes": sorted(
+            {item.provider_mode for item in news.occurrences}
+        ),
+        "data_classes": sorted({item.data_class for item in news.occurrences}),
+    }
+    if actual_news_reference != expected_news_reference:
+        raise CoverageAuditError(
+            "Source-bound verification found the news/SQLite reference differs"
+        )
+
+    actual_stock_reference = _read_json(
+        root / "stock_artifact_reference.json",
+        root=root,
+        label="coverage stock reference",
+    )
+    if actual_stock_reference != stock.reference:
+        raise CoverageAuditError(
+            "Source-bound verification found the price/split reference differs"
+        )
+
+    expected_assessment_reference = _portable_source_assessment_reference(
+        assessment_path
+    )
+    expected_assessment_reference["input_source_evidence"] = [
+        {
+            "run_id": reference["run_id"],
+            "provider": reference.get("provider"),
+            "provider_mode": reference.get("provider_mode"),
+            "licensing_usage_note": reference.get("licensing_usage_note"),
+            "source_permission_decision": reference.get(
+                "source_permission_decision"
+            ),
+        }
+        for reference in news.run_references
+    ]
+    expected_assessment_reference["permission_policy"] = dict(
+        news.permission_policy_reference
+    )
+    if actual_assessment_reference != expected_assessment_reference:
+        raise CoverageAuditError(
+            "Source-bound verification found the assessment/policy reference differs"
+        )
+
+    computation = compute_coverage(news, stock, config)
+    actual_quality = _read_json(
+        root / "quality_report.json", root=root, label="coverage quality report"
+    )
+    if actual_quality != computation.quality_report:
+        raise CoverageAuditError(
+            "Source-bound verification found quality metrics differ from source replay"
+        )
+    effective_policy_sha256 = _sha256_bytes(
+        _canonical_json_bytes(config.to_dict())
+    )
+    expected_summary = {
+        **dict(computation.final_summary),
+        "run_id": pack_result.run_id,
+        "artifact_directory": f"news_coverage/{pack_result.run_id}",
+        "finalization_state": "COMMITTED",
+        "config": config.to_dict(),
+        "effective_readiness_policy_sha256": effective_policy_sha256,
+    }
+    actual_summary = _read_json(
+        root / "final_summary.json", root=root, label="coverage final summary"
+    )
+    if actual_summary != expected_summary:
+        raise CoverageAuditError(
+            "Source-bound verification found final summary differs from source replay"
+        )
+
+    csv_contracts: tuple[
+        tuple[str, Sequence[Mapping[str, Any]], tuple[str, ...]], ...
+    ] = (
+        (
+            "overlap_by_trading_day.csv",
+            computation.trading_day_rows,
+            (
+                "trading_date", "split", "decision_cutoff_utc",
+                "all_financial_occurrence_count",
+                "all_financial_canonical_article_count",
+                "ogdc_linked_occurrence_count",
+                "ogdc_linked_canonical_article_count",
+                "energy_sector_occurrence_count",
+                "energy_sector_canonical_article_count",
+            ),
+        ),
+        (
+            "overlap_by_month.csv",
+            computation.monthly_rows,
+            (
+                "month", "population", "population_supported", "trading_days",
+                "trading_days_with_articles", "coverage_percent",
+                "article_occurrences", "canonical_articles",
+                "articles_per_trading_day", "zero_article_trading_days",
+            ),
+        ),
+        (
+            "split_coverage.csv",
+            computation.split_rows,
+            (
+                "population", "population_supported", "split", "trading_days",
+                "trading_days_with_articles", "coverage_percent",
+                "article_occurrences", "canonical_articles",
+                "articles_per_trading_day", "zero_article_trading_days",
+                "longest_missing_gap_sessions",
+            ),
+        ),
+        (
+            "missing_intervals.csv",
+            computation.missing_interval_rows,
+            (
+                "population", "split", "start_date", "end_date",
+                "missing_trading_sessions",
+            ),
+        ),
+        (
+            "article_session_mappings.csv",
+            computation.article_session_rows,
+            (
+                "occurrence_key", "ingestion_run_id", "article_id",
+                "canonical_article_id", "provider", "source_name", "source_url",
+                "publisher_document_key", "mentioned_sectors", "data_class",
+                "population", "population_supported", "occurrence_in_population",
+                "is_duplicate_occurrence", "published_at", "source_observed_at",
+                "available_at", "fetched_at", "occurrence_assigned_trading_date",
+                "occurrence_mapping_status", "occurrence_arrival_class",
+                "canonical_representative_article_id",
+                "canonical_representative_ingestion_run_id",
+                "is_population_canonical_representative", "canonical_available_at",
+                "canonical_source_observed_at", "canonical_assigned_trading_date",
+                "canonical_mapping_status", "canonical_arrival_class",
+                "content_sha256", "raw_artifact_reference",
+            ),
+        ),
+        (
+            "ogdc_linked_articles.csv",
+            computation.ogdc_article_rows,
+            (
+                "canonical_article_id", "representative_article_id", "source_name",
+                "source_url", "title", "published_at", "source_observed_at",
+                "available_at", "assigned_trading_date", "mapping_status",
+                "arrival_class", "occurrence_count", "sources", "link_basis",
+                "link_evidence", "content_sha256",
+            ),
+        ),
+    )
+    for filename, rows, fields in csv_contracts:
+        _assert_source_bound_csv(root, filename, rows, fields)
+
+    return replace(pack_result, verification_basis="SOURCE_EVIDENCE_BOUND")
 
 
 def _verify_coverage_root(
@@ -2402,6 +4834,21 @@ def _verify_coverage_root(
     completion = _read_json(
         completion_path, root=root, label="coverage completion marker"
     )
+
+    declared_schema_versions = {
+        manifest.get("schema_version"),
+        summary.get("schema_version"),
+        completion.get("coverage_schema_version"),
+    }
+    if declared_schema_versions != {COVERAGE_SCHEMA_VERSION}:
+        if declared_schema_versions == {"1.0"}:
+            raise CoverageAuditError(
+                "Coverage schema 1.0 is historical and lacks the current semantic "
+                "verification contract; regenerate the coverage pack as schema 1.1"
+            )
+        raise CoverageAuditError(
+            "Coverage artifact schema versions are unsupported or inconsistent"
+        )
 
     expected_completion_keys = {
         "schema_version",
@@ -2496,11 +4943,16 @@ def _verify_coverage_root(
         raise CoverageAuditError("Coverage artifact inventory seal differs")
     if "final_summary.json" not in {item["path"] for item in inventory}:
         raise CoverageAuditError("Coverage final summary is not payload-inventoried")
+    if {item["path"] for item in inventory} != _COVERAGE_PAYLOAD_FILES:
+        raise CoverageAuditError(
+            "Coverage artifact inventory does not contain the complete payload contract"
+        )
     observed = _artifact_inventory(root, exclude=set(_COVERAGE_SEAL_FILES))
     if observed != inventory:
         raise CoverageAuditError(
             "Coverage artifacts are missing, extra, changed, or unsafe"
         )
+    _verify_coverage_semantics(root, manifest=manifest, summary=summary)
 
     return CoverageRunVerification(
         run_id=run_id,
@@ -2663,6 +5115,11 @@ def publish_coverage_run(
     run_id: str | None = None,
     created_at: datetime | None = None,
 ) -> Path:
+    recomputed = compute_coverage(news, stock, config)
+    if computation != recomputed:
+        raise CoverageAuditError(
+            "Coverage computation does not match recomputed input evidence"
+        )
     selected_id = validate_coverage_run_id(run_id or make_coverage_run_id(created_at))
     root_candidate = Path(output_root)
     if root_candidate.is_symlink():
@@ -2718,6 +5175,11 @@ def publish_coverage_run(
             "schema_version": COVERAGE_SCHEMA_VERSION,
             "news_runs": list(news.run_references),
             "database_fingerprints": news.database_fingerprints,
+            "energy_sector_link_contract": (
+                news.energy_sector_link_contract.to_dict()
+                if news.energy_sector_link_contract is not None
+                else None
+            ),
             "occurrence_count": len(news.occurrences),
             "canonical_count": len(
                 {item.canonical_article_id for item in news.occurrences}
@@ -2748,6 +5210,7 @@ def publish_coverage_run(
             (
                 "month",
                 "population",
+                "population_supported",
                 "trading_days",
                 "trading_days_with_articles",
                 "coverage_percent",
@@ -2762,6 +5225,7 @@ def publish_coverage_run(
             computation.split_rows,
             (
                 "population",
+                "population_supported",
                 "split",
                 "trading_days",
                 "trading_days_with_articles",
@@ -2794,12 +5258,16 @@ def publish_coverage_run(
                 "canonical_article_id",
                 "provider",
                 "source_name",
+                "source_url",
+                "publisher_document_key",
+                "mentioned_sectors",
                 "data_class",
                 "population",
                 "population_supported",
                 "occurrence_in_population",
                 "is_duplicate_occurrence",
                 "published_at",
+                "source_observed_at",
                 "available_at",
                 "fetched_at",
                 "occurrence_assigned_trading_date",
@@ -2809,6 +5277,7 @@ def publish_coverage_run(
                 "canonical_representative_ingestion_run_id",
                 "is_population_canonical_representative",
                 "canonical_available_at",
+                "canonical_source_observed_at",
                 "canonical_assigned_trading_date",
                 "canonical_mapping_status",
                 "canonical_arrival_class",
@@ -2826,6 +5295,7 @@ def publish_coverage_run(
                 "source_url",
                 "title",
                 "published_at",
+                "source_observed_at",
                 "available_at",
                 "assigned_trading_date",
                 "mapping_status",
@@ -2862,6 +5332,11 @@ def publish_coverage_run(
                 {
                     "news_runs": list(news.run_references),
                     "database": news.database_fingerprints,
+                    "energy_sector_link_contract": (
+                        news.energy_sector_link_contract.to_dict()
+                        if news.energy_sector_link_contract is not None
+                        else None
+                    ),
                     "stock": stock.reference,
                     "source_assessment": assessment_reference,
                     "config": config.to_dict(),
@@ -2933,7 +5408,21 @@ def publish_coverage_run(
         except OSError:
             pass
         raise
-    reservation.unlink(missing_ok=True)
+    try:
+        reservation.unlink(missing_ok=True)
+    except OSError:
+        # Publication has crossed its atomic commit point. Warning policy (for
+        # example ``PYTHONWARNINGS=error``) must not turn housekeeping telemetry
+        # into a false publication failure after the immutable run is visible.
+        try:
+            warnings.warn(
+                "Coverage run is already committed; reservation cleanup failed and "
+                "requires a later housekeeping retry.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        except Exception:
+            pass
     return destination
 
 
@@ -2993,6 +5482,7 @@ __all__ = [
     "CoverageConfig",
     "CoverageRunCollisionError",
     "CoverageRunVerification",
+    "EnergySectorLinkContract",
     "NewsEvidence",
     "NewsOccurrence",
     "ReadinessThresholds",
@@ -3010,6 +5500,7 @@ __all__ = [
     "make_coverage_run_id",
     "parse_cutoff",
     "publish_coverage_run",
+    "verify_coverage_pack",
     "verify_coverage_run",
     "validate_coverage_run_id",
 ]

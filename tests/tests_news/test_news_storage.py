@@ -18,9 +18,16 @@ def storage(tmp_path):
     return NewsStorage(tmp_path / "nested" / "paisa_news.sqlite3").initialize()
 
 
-def _begin(storage: NewsStorage, run_id: str, *, data_kind: str = "real") -> None:
+def _begin(
+    storage: NewsStorage,
+    run_id: str,
+    *,
+    data_kind: str = "real",
+    schema_version: str = "1.0",
+) -> None:
     storage.begin_run(
         run_id=run_id,
+        schema_version=schema_version,
         provider_id="permitted-rss",
         provider_mode="rss",
         configured_source="https://news.example.test/feed.xml",
@@ -239,11 +246,105 @@ def test_initialize_creates_versioned_schema_and_enables_wal(storage: NewsStorag
             "SELECT version, name FROM schema_migrations ORDER BY version DESC"
         ).fetchone()
     assert latest["version"] == DATABASE_SCHEMA_VERSION
-    assert latest["name"] == "sentiment_run_certification"
+    assert latest["name"] == "source_observation_provenance"
 
 
-@pytest.mark.parametrize("prior_version", [1, 2, 3, 4, 5])
-def test_initialize_migrates_each_verified_prior_schema_to_v6(
+def test_source_observation_is_first_class_and_never_replaces_availability(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-100000-source-observed"
+    _begin(storage, run_id, schema_version="1.1")
+    raw_id = _raw(storage, run_id)
+    article = _article(run_id, raw_id)
+    article["schema_version"] = "1.1"
+    article["source_observed_at"] = "2025-12-20T10:30:00Z"
+
+    storage.save_article(article)
+
+    with storage.connection() as connection:
+        canonical = connection.execute(
+            """
+            SELECT source_observed_at, available_at
+            FROM normalized_articles WHERE article_id = ?
+            """,
+            (article["article_id"],),
+        ).fetchone()
+        occurrence = connection.execute(
+            """
+            SELECT source_observed_at, available_at
+            FROM article_ingestions WHERE ingestion_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+    assert canonical["source_observed_at"] == "2025-12-20T10:30:00Z"
+    assert occurrence["source_observed_at"] == "2025-12-20T10:30:00Z"
+    assert canonical["available_at"] == NOW
+    assert occurrence["available_at"] == NOW
+
+
+def test_schema_1_0_storage_rejects_source_observation_provenance(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-100000-invalid-source-observed-version"
+    _begin(storage, run_id)
+    raw_id = _raw(storage, run_id)
+    article = _article(run_id, raw_id)
+    article["source_observed_at"] = "2025-12-20T10:30:00Z"
+
+    with pytest.raises(ValueError, match="schema 1.1"):
+        storage.save_article(article)
+
+    with storage.connection() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM normalized_articles"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM article_ingestions"
+        ).fetchone()[0] == 0
+
+
+def test_schema_1_0_storage_omits_explicit_null_source_observation_payload(
+    storage: NewsStorage,
+):
+    run_id = "NEWS-20261022-100000-legacy-source-observed-null"
+    _begin(storage, run_id, schema_version="1.0")
+    raw_id = _raw(storage, run_id)
+    article = _article(run_id, raw_id)
+    article["source_observed_at"] = None
+
+    storage.save_article(article)
+
+    with storage.connection() as connection:
+        canonical = connection.execute(
+            "SELECT source_observed_at FROM normalized_articles"
+        ).fetchone()
+        occurrence = connection.execute(
+            """
+            SELECT source_observed_at, normalized_payload_json
+            FROM article_ingestions WHERE ingestion_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+    assert canonical["source_observed_at"] is None
+    assert occurrence["source_observed_at"] is None
+    serialized = json.loads(occurrence["normalized_payload_json"])
+    assert "source_observed_at" not in serialized
+    assert serialized["schema_version"] == "1.0"
+
+
+def test_article_schema_must_match_its_ingestion_run(storage: NewsStorage):
+    run_id = "NEWS-20261022-100000-record-schema-mismatch"
+    _begin(storage, run_id, schema_version="1.1")
+    raw_id = _raw(storage, run_id)
+
+    with pytest.raises(ValueError, match="match its ingestion run"):
+        storage.save_article(_article(run_id, raw_id))
+
+
+@pytest.mark.parametrize("prior_version", [1, 2, 3, 4, 5, 6])
+def test_initialize_migrates_each_verified_prior_schema_to_v7(
     tmp_path, prior_version
 ):
     database = tmp_path / f"prior-v{prior_version}.sqlite3"
@@ -261,9 +362,33 @@ def test_initialize_migrates_each_verified_prior_schema_to_v6(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             )
         ]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
     assert "sealed_manifest_sha256" in columns
-    assert versions[-1] == (6, "sentiment_run_certification")
+    assert versions[-1] == (7, "source_observation_provenance")
+
+
+def test_v6_migration_preserves_legacy_rows_with_unknown_source_observation(
+    tmp_path,
+):
+    database = tmp_path / "legacy-v6-source-observed.sqlite3"
+    _create_versioned_database(database, 6)
+    legacy = NewsStorage(database)
+    run_id = "NEWS-20261022-100000-legacy-v6"
+    _begin(legacy, run_id)
+    raw_id = _raw(legacy, run_id)
+    legacy.save_article(_article(run_id, raw_id))
+
+    migrated = NewsStorage(database).initialize()
+
+    with migrated.connection() as connection:
+        canonical = connection.execute(
+            "SELECT source_observed_at FROM normalized_articles"
+        ).fetchone()
+        occurrence = connection.execute(
+            "SELECT source_observed_at FROM article_ingestions"
+        ).fetchone()
+    assert canonical["source_observed_at"] is None
+    assert occurrence["source_observed_at"] is None
 
 
 def test_initialize_rejects_malformed_stamped_schema_without_advancing(tmp_path):
@@ -379,7 +504,11 @@ def test_repeat_ingestion_preserves_raw_and_occurrence_evidence(storage: NewsSto
         available_at="2026-10-22T11:00:00Z",
         fetched_at="2026-10-22T11:00:00Z",
         raw_artifact_reference="raw/shared-source-id.json",
-        normalized_payload={"article_id": "article-1"},
+        normalized_payload={
+            "schema_version": "1.0",
+            "article_id": "article-1",
+            "source_observed_at": None,
+        },
     )
 
     assert first_raw != second_raw
@@ -394,10 +523,15 @@ def test_repeat_ingestion_preserves_raw_and_occurrence_evidence(storage: NewsSto
             "SELECT count(*) FROM article_ingestions"
         ).fetchone()[0] == 2
         row = connection.execute(
-            "SELECT duplicate_of FROM article_ingestions WHERE occurrence_id = ?",
+            """
+            SELECT duplicate_of, source_observed_at, normalized_payload_json
+            FROM article_ingestions WHERE occurrence_id = ?
+            """,
             (second_occurrence,),
         ).fetchone()
     assert row["duplicate_of"] is None
+    assert row["source_observed_at"] is None
+    assert "source_observed_at" not in json.loads(row["normalized_payload_json"])
 
 
 def test_cross_run_evidence_associations_are_rejected_by_api_and_triggers(
@@ -1278,6 +1412,7 @@ def test_subsecond_timestamps_are_preserved_exactly(storage: NewsStorage):
     started = "2026-10-22T10:00:00.123456Z"
     storage.begin_run(
         run_id=run_id,
+        schema_version="1.0",
         provider_id="permitted-rss",
         provider_mode="rss",
         data_kind="real",
@@ -1939,7 +2074,7 @@ def test_schema_migration_locks_before_validating_data_preconditions(
     assert not writer.is_alive()
     assert writer_result == ["locked"]
     with migrated.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         duplicate_of = connection.execute(
             """
             SELECT duplicate_of FROM normalized_articles

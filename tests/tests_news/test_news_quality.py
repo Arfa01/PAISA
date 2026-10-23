@@ -86,6 +86,17 @@ def _link(article_id: str = "article-1", ticker: str = "OGDC") -> ArticleEntityL
     )
 
 
+def test_news_schema_1_0_cannot_claim_schema_1_1_observation_provenance() -> None:
+    legacy = replace(_article(), schema_version="1.0")
+
+    assert "source_observed_at" not in legacy.to_dict()
+    with pytest.raises(ValueError, match="schema 1.1"):
+        replace(
+            legacy,
+            source_observed_at=datetime(2026, 1, 2, 8, 30, tzinfo=UTC),
+        )
+
+
 def test_quality_report_calculates_all_metrics_deterministically() -> None:
     assert calculate_quality_report is calculate_quality
     articles = [

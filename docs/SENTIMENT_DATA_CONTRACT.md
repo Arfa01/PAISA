@@ -184,6 +184,10 @@ original sentiment tables. Migration `6`, `sentiment_run_certification`, adds
 hash-bound model identity, post-truncation evidence, explicit run-input/output
 associations, recovery seals, and database-enforced completion checks:
 
+Migration `7`, `source_observation_provenance`, then adds nullable
+`source_observed_at` columns to news canonical/occurrence storage. It does not
+alter sentiment ownership or make source observation time eligible input.
+
 | Table | Ownership |
 |---|---|
 | `sentiment_model_revisions` | Immutable repository/tokenizer revision, license, label mapping, and model metadata. |
@@ -213,9 +217,10 @@ existing rows satisfied the later time/raw-evidence/status constraints,
 transactionally rebuilt the three affected tables without changing their
 values, verified integrity, and applied migrations 4 and 5. That retained run
 was produced at schema version `5`. Current code then advances a verified
-database to schema version `6`; unknown drift and invalid legacy rows fail
-closed, and migration validation occurs only after the SQLite write lock is
-held.
+database through schema version `6` sentiment certification to current schema
+version `7`, which adds nullable audit-only `source_observed_at`; unknown drift
+and invalid legacy rows fail closed, and migration validation occurs only after
+the SQLite write lock is held.
 
 Migration does not invent file hashes for a version-5 model row. That legacy
 row and every run that references it remain explicitly unverified. The first
@@ -227,8 +232,8 @@ A version-5 `RUNNING` owner and its output remain explicitly discardable and
 are not backfilled as completed associations. Migration fails closed if a
 version-5 `FAIL` owner still contains output: that globally unique result cannot
 be certified for reuse or deleted without rewriting finalized historical
-evidence. Preserve such a database for audit and start a clean schema-6 working
-database rather than weakening immutability.
+evidence. Preserve such a database for audit and start a clean current-schema
+working database rather than weakening immutability.
 
 The ignored, uncommitted pre-migration copy at
 `data/news/backups/paisa_news_schema3_before_sentiment.sqlite3` was verified at

@@ -38,6 +38,39 @@ def raw_record(**overrides) -> RawNewsRecord:
     return RawNewsRecord(**values)
 
 
+def test_raw_record_preserves_the_original_positional_argument_order():
+    record = RawNewsRecord(
+        "record-1",
+        "rss",
+        "https://example.com/feed.xml",
+        "Example Business",
+        "rss",
+        FETCHED_AT,
+        "real",
+        "https://example.com/article",
+        "OGDC update",
+        "Summary",
+        None,
+        "2026-10-22T10:00:00Z",
+        "UTC",
+        "2026-10-22T12:00:00Z",
+        "en",
+        "provider-record-1",
+        "capture-1",
+        200,
+        "application/rss+xml",
+        "a" * 64,
+        {"provider": "payload"},
+        ("body_missing",),
+    )
+
+    assert record.language == "en"
+    assert record.provider_record_id == "provider-record-1"
+    assert record.raw_payload == {"provider": "payload"}
+    assert record.provider_warnings == ("body_missing",)
+    assert record.source_observed_at_raw is None
+
+
 def test_timestamp_parsing_supports_rfc_and_iso_timezone_conversion():
     rfc, warnings = parse_timestamp("Thu, 22 Oct 2026 16:30:00 +0500")
     iso, iso_warnings = parse_timestamp("2026-10-22T16:30:00+05:00")

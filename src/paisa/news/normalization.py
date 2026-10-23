@@ -267,6 +267,7 @@ def normalize_record(
     *,
     ingestion_run_id: str,
     raw_artifact_reference: str,
+    schema_version: str = NEWS_SCHEMA_VERSION,
 ) -> NormalizedNewsArticle:
     title = normalize_text(record.title)
     summary = normalize_text(record.summary)
@@ -284,6 +285,19 @@ def normalize_record(
         field_name="published_at",
     )
     warnings.extend(published_warnings)
+
+    source_observed_at: datetime | None = None
+    if record.source_observed_at_raw:
+        observed_timezone_evidence = (
+            infer_timezone_evidence(record.source_observed_at_raw)
+            or timezone_evidence
+        )
+        source_observed_at, observed_warnings = parse_timestamp(
+            record.source_observed_at_raw,
+            timezone_evidence=observed_timezone_evidence,
+            field_name="source_observed_at",
+        )
+        warnings.extend(observed_warnings)
 
     source_available_at: datetime | None = None
     if record.available_at_raw:
@@ -322,7 +336,7 @@ def normalize_record(
         language = language.casefold().replace("_", "-")
 
     return NormalizedNewsArticle(
-        schema_version=NEWS_SCHEMA_VERSION,
+        schema_version=schema_version,
         article_id=make_article_id(ingestion_run_id, record),
         raw_record_id=record.raw_record_id,
         provider=record.provider_id,
@@ -356,6 +370,7 @@ def normalize_record(
         raw_artifact_reference=raw_artifact_reference,
         normalization_warnings=tuple(dict.fromkeys(warnings)),
         data_class=record.data_class,
+        source_observed_at=source_observed_at,
     )
 
 

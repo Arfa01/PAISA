@@ -1,15 +1,22 @@
 # PAISA news data contract
 
-Schema version: `1.0`
+Schema version: `1.1` (news-run read compatibility retained for `1.0`; this is
+separate from the coverage-audit schema)
 
 This contract describes acquisition evidence for later NLP research. It does
 not contain sentiment, predictions, signals, trades, or financial advice.
+
+New ingestion artifacts bind `news-availability-v1` at the top level of
+`provider_config.json`, `run_manifest.json`, and `completion.json`. Coverage
+artifacts repeat it for every selected input run and in the top-level quality
+report and final summary, so verification can reject a policy mismatch instead
+of inferring eligibility rules from the data-schema number.
 
 ## Normalized article record
 
 | Field | Type | Contract |
 |---|---|---|
-| `schema_version` | string | Exactly `1.0` for this implementation. |
+| `schema_version` | string | `1.1` for newly generated artifacts; the news-ingestion verifier (`verify_news_run`) retains explicit compatibility for sealed `1.0` news runs. This does not make schema-`1.0` coverage-audit packs acceptable to the current coverage verifier. |
 | `article_id` | string | Immutable occurrence identity derived from the run, provider, and raw evidence identity. |
 | `provider` | string | Adapter identifier such as `rss`, `gdelt-doc`, or `manual-csv`. |
 | `source_name` | string | Publisher/source display name supplied by configuration or input. |
@@ -21,6 +28,7 @@ not contain sentiment, predictions, signals, trades, or financial advice.
 | `body` | string or null | Body only when it was present in the permitted feed/import. PAISA does not fetch linked article pages. |
 | `published_at` | UTC timestamp or null | Complete source publication time converted to UTC. Missing, invalid, date-only, or unjustifiably timezone-naive values remain null. |
 | `published_timezone` | string or null | Original offset/name evidence from the record or the configured source timezone applied to a naive clock time. |
+| `source_observed_at` | UTC timestamp or null | When an upstream index/provider reports observing the item, such as GDELT `seendate`. It is audit provenance only and is never cutoff eligibility under availability policy `news-availability-v1`; using it for eligibility requires a new reviewed policy version. Schema `1.0` records must omit this field; they cannot carry it with either a value or an explicit null. |
 | `available_at` | UTC timestamp | Earliest defensible PAISA availability under the rule in `NEWS_TIME_ALIGNMENT.md`. |
 | `fetched_at` | UTC timestamp | When PAISA acquired or imported the record. |
 | `language` | string or null | Lowercase BCP-47-like source evidence, when supplied; no language detection is performed. |
@@ -33,7 +41,10 @@ not contain sentiment, predictions, signals, trades, or financial advice.
 | `raw_artifact_reference` | string | Safe POSIX path relative to the run directory. |
 | `normalization_warnings` | JSON list | Explicit missing/invalid evidence; values are never silently fabricated. |
 
-The CSV also carries `raw_record_id` and `data_class` (`real`, `imported`, or
+Every normalized article's `schema_version` must equal the schema declared by
+its owning ingestion run. Verification and SQLite insertion fail closed on a
+mismatch; a record cannot opt itself into fields that its run schema does not
+own. The CSV also carries `raw_record_id` and `data_class` (`real`, `imported`, or
 `fixture`) so every normalized occurrence remains traceable and test data can
 never be mistaken for acquired news.
 
@@ -47,6 +58,12 @@ has a JSON evidence file; normalization never replaces that evidence. The raw
 directory is owner-only (`0700`) and every retained capture/index/record file
 is owner-readable and owner-writable only (`0600`); checksums bind content,
 while these filesystem modes limit accidental local disclosure.
+
+GDELT provider errors carry a structured request context: capture/attempt ID,
+split path, target and request bounds, attempt number, and SHA-256 fingerprints
+of the sanitized query and effective request parameters. Retry responses also
+record parsed requested and actually applied wait durations; raw
+`Retry-After` text is not persisted.
 
 Historical API/manual-import raw evidence also carries the reviewed provider
 subtype and licensing/usage note. GDELT evidence carries the permission basis,
@@ -136,7 +153,10 @@ does not erase evidence or weaken canonical URL uniqueness. It stores:
 - provider errors; and
 - quality reports.
 
-Schema version 6 is advanced one version at a time in transactions. Every open
+Database schema version 7 is advanced one version at a time in transactions.
+Version 7 adds nullable `source_observed_at` columns to canonical and occurrence
+storage; legacy rows migrate with null values rather than inferring observation
+time from a different timestamp. Every open
 verifies `user_version`, the ordered migration ledger, and the expected table,
 index, and trigger definitions; malformed, unversioned nonempty, or newer
 databases are refused rather than stamped as current. Only one `RUNNING` run is

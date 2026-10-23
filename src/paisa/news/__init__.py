@@ -6,6 +6,7 @@ outside this boundary.
 """
 
 from paisa.news.models import (
+    NEWS_AVAILABILITY_POLICY_VERSION,
     NEWS_SCHEMA_VERSION,
     ArticleEntityLink,
     DuplicateRelationship,
@@ -17,6 +18,7 @@ from paisa.news.models import (
 )
 
 __all__ = [
+    "NEWS_AVAILABILITY_POLICY_VERSION",
     "NEWS_SCHEMA_VERSION",
     "ArticleEntityLink",
     "DuplicateRelationship",

@@ -1,6 +1,6 @@
 {
   "assessment_document": "docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md",
-  "assessment_sha256": "a387f05d6c60fee734e04e9657a6a757444699c8767f8832e90b8e3362a40d98",
+  "assessment_sha256": "a68592c0e9d7e627db9311cb6711587d96f56f27ee3ba295435ff28ac8857f88",
   "decisions": [
     {
       "allowed_run_ids": [

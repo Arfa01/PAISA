@@ -6,12 +6,15 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import time as wall_time
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
 from paisa.news.normalization import normalize_record
 from paisa.news.pipeline import _sanitize_provider_result
+from paisa.news.providers import gdelt_doc as gdelt_module
 from paisa.news.providers.gdelt_doc import (
     GDELT_DOC_ENDPOINT,
     GdeltDocNewsProvider,
@@ -166,7 +169,8 @@ def test_gdelt_fetch_is_exact_bounded_metadata_only_evidence():
     assert record.body is None
     assert record.published_at_raw is None
     assert record.published_timezone is None
-    assert record.available_at_raw == "2025-12-20T10:30:00Z"
+    assert record.source_observed_at_raw == "2025-12-20T10:30:00Z"
+    assert record.available_at_raw is None
     assert record.provider_record_id.startswith("GDELT-")
     assert record.raw_payload["seendate"] == "20251220T103000Z"
     assert record.raw_payload["permission_basis"] == PERMISSION
@@ -223,6 +227,24 @@ def test_response_with_seendate_outside_inclusive_target_is_quarantined():
     assert result.captures[0].content == payload
 
 
+@pytest.mark.parametrize("seendate", [None, "not-a-timestamp"])
+def test_historical_response_without_valid_seendate_is_quarantined(seendate):
+    article = {
+        "url": "https://publisher.example/unprovable",
+        "title": "Historical membership cannot be proven",
+    }
+    if seendate is not None:
+        article["seendate"] = seendate
+    payload = json.dumps({"articles": [article]}).encode()
+
+    result = _provider(FakeSession([FakeResponse(payload)])).fetch()
+
+    assert result.records == ()
+    assert result.errors[0].error_type == "invalid_source_observation_time"
+    assert "response quarantined" in result.errors[0].message
+    assert result.captures[0].content == payload
+
+
 def test_seendate_never_becomes_publication_time_or_backdated_availability():
     result = _provider(FakeSession([FakeResponse(_payload())])).fetch()
     raw = result.records[0]
@@ -234,8 +256,12 @@ def test_seendate_never_becomes_publication_time_or_backdated_availability():
     )
 
     assert normalized.published_at is None
+    assert normalized.schema_version == "1.1"
+    assert normalized.source_observed_at == datetime(
+        2025, 12, 20, 10, 30, tzinfo=timezone.utc
+    )
     assert normalized.available_at == NOW
-    assert "gdelt_seendate_is_source_availability_not_publication" in (
+    assert "gdelt_seendate_is_source_observation_not_publication_or_eligibility" in (
         normalized.normalization_warnings
     )
     assert "published_at_missing" in normalized.normalization_warnings
@@ -499,7 +525,7 @@ def test_soft_deadline_clips_operation_timeouts_and_rejects_larger_values():
 
     assert result.errors == ()
     assert session.calls[0][1]["timeout"] == (3.0, 3.0)
-    assert "OS resolver latency" in provider.effective_config[
+    assert "DNS resolution" in provider.effective_config[
         "soft_total_timeout_semantics"
     ]
 
@@ -509,6 +535,118 @@ def test_soft_deadline_clips_operation_timeouts_and_rejects_larger_values():
             connect_timeout_seconds=6,
             soft_total_timeout_seconds=5,
         )
+
+
+def test_dns_resolution_is_bounded_by_the_end_to_end_request_deadline():
+    def blocked_resolver(_host, _port):
+        wall_time.sleep(2)
+        return ("93.184.216.34",)
+
+    started = wall_time.monotonic()
+    result = _provider(
+        FakeSession([]),
+        resolver=blocked_resolver,
+        connect_timeout_seconds=0.05,
+        read_timeout_seconds=0.05,
+        soft_total_timeout_seconds=0.05,
+    ).fetch()
+    elapsed = wall_time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert result.errors[0].error_type == "soft_total_timeout"
+    assert result.errors[0].details["capture_id"].endswith("-t000-a1")
+    assert result.errors[0].details["attempt_number"] == 1
+
+
+def test_response_header_wait_cannot_exceed_the_end_to_end_deadline():
+    class SlowHeaderSession(FakeSession):
+        def get(self, url, **kwargs):
+            wall_time.sleep(0.3)
+            return super().get(url, **kwargs)
+
+    started = wall_time.monotonic()
+    result = _provider(
+        SlowHeaderSession([FakeResponse(_payload())]),
+        connect_timeout_seconds=0.05,
+        read_timeout_seconds=0.05,
+        soft_total_timeout_seconds=0.05,
+    ).fetch()
+    elapsed = wall_time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert result.records == ()
+    assert result.errors[0].error_type == "soft_total_timeout"
+
+
+def test_slow_timeout_cleanup_cannot_extend_the_end_to_end_deadline():
+    class SlowHeaderAndCloseSession(FakeSession):
+        def get(self, url, **kwargs):
+            wall_time.sleep(0.3)
+            return super().get(url, **kwargs)
+
+        def close(self):
+            wall_time.sleep(0.3)
+
+    started = wall_time.monotonic()
+    result = _provider(
+        SlowHeaderAndCloseSession([FakeResponse(_payload())]),
+        connect_timeout_seconds=0.05,
+        read_timeout_seconds=0.05,
+        soft_total_timeout_seconds=0.05,
+    ).fetch()
+    elapsed = wall_time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert result.records == ()
+    assert result.errors[0].error_type == "soft_total_timeout"
+
+
+def test_stalled_stream_read_cannot_exceed_the_end_to_end_deadline():
+    class SlowRawStream(FakeRawStream):
+        def stream(self, chunk_size, *, decode_content):
+            wall_time.sleep(0.3)
+            yield from super().stream(chunk_size, decode_content=decode_content)
+
+    response = FakeResponse(_payload())
+    response.raw = SlowRawStream(response.content)
+    started = wall_time.monotonic()
+    result = _provider(
+        FakeSession([response]),
+        connect_timeout_seconds=0.05,
+        read_timeout_seconds=0.05,
+        soft_total_timeout_seconds=0.05,
+    ).fetch()
+    elapsed = wall_time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert result.records == ()
+    assert result.errors[0].error_type == "soft_total_timeout"
+
+
+def test_default_dns_resolution_uses_a_cancellable_process(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    observed: dict[str, object] = {}
+
+    def timeout_process(command, **kwargs):
+        observed["command"] = command
+        observed["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(gdelt_module.subprocess, "run", timeout_process)
+
+    with pytest.raises(
+        gdelt_module._GdeltRejected,
+        match="DNS resolution exceeded",
+    ) as captured:
+        gdelt_module._validated_addresses(
+            gdelt_module._resolve_addresses,
+            timeout_seconds=0.125,
+        )
+
+    assert captured.value.error_type == "soft_total_timeout"
+    assert observed["command"][0]  # type: ignore[index]
+    assert observed["timeout"] == 0.125
 
 
 def test_exact_compressed_response_bytes_are_captured_but_decoded_for_parsing():
@@ -660,14 +798,20 @@ def test_saturated_minimum_window_fails_closed():
 
 
 @pytest.mark.parametrize(
-    ("status", "headers", "expected_delay"),
+    ("status", "headers", "expected_delay", "expected_requested"),
     [
-        (429, {"Retry-After": "10"}, 10.0),
-        (503, None, 1.0),
+        (429, {"Retry-After": "10"}, 10.0, 10.0),
+        (
+            429,
+            {"Retry-After": "Fri, 23 Oct 2026 10:00:12 GMT"},
+            12.0,
+            12.0,
+        ),
+        (503, None, 1.0, None),
     ],
 )
 def test_recovered_retryable_response_is_capture_warning_not_terminal_error(
-    status, headers, expected_delay
+    status, headers, expected_delay, expected_requested
 ):
     delays: list[float] = []
     session = FakeSession(
@@ -695,6 +839,77 @@ def test_recovered_retryable_response_is_capture_warning_not_terminal_error(
     assert result.records[0].title == "OGDC announces a gas discovery"
     assert result.errors == ()
     assert "bounded_retry_scheduled" in result.captures[0].warnings
+    requested_marker = f"retry_after_requested_seconds={expected_requested}"
+    assert (requested_marker in result.captures[0].warnings) is (
+        expected_requested is not None
+    )
+    assert f"retry_delay_applied_seconds={expected_delay}" in (
+        result.captures[0].warnings
+    )
+    retry_after_applied = f"retry_after_applied_seconds={expected_delay}"
+    assert (retry_after_applied in result.captures[0].warnings) is (
+        expected_requested is not None
+    )
+
+
+def test_retry_after_above_approved_wait_ceiling_fails_without_early_retry():
+    session = FakeSession(
+        [
+            FakeResponse(
+                b'{"message":"slow down"}',
+                status_code=429,
+                headers={"Retry-After": "600"},
+            ),
+            FakeResponse(_payload()),
+        ]
+    )
+    delays: list[float] = []
+
+    result = _provider(
+        session,
+        max_retries=1,
+        backoff_max_seconds=30,
+        sleeper=delays.append,
+    ).fetch()
+
+    assert len(session.calls) == 1
+    assert delays == []
+    assert result.records == ()
+    assert result.errors[0].error_type == "retry_after_exceeds_policy"
+    assert result.errors[0].details["retry_after_requested_seconds"] == 600.0
+    assert result.errors[0].details["retry_after_applied_seconds"] is None
+    assert "retry_after_requested_seconds=600.0" in result.captures[0].warnings
+    assert "retry_after_refused_above_wait_ceiling" in result.captures[0].warnings
+
+
+def test_network_error_carries_exact_sanitized_request_attempt_context():
+    result = _provider(
+        FakeSession([TimeoutError("network token=private")]),
+        max_retries=0,
+    ).fetch()
+
+    assert result.records == ()
+    error = result.errors[0]
+    assert error.configured_source == "gdelt-doc:ogdc-december"
+    assert error.details == {
+        "capture_id": (
+            "gdelt-ogdc-december-20251216000000-20251231235959-t000-a1"
+        ),
+        "split_path": "t000",
+        "target_start_datetime": "2025-12-16T00:00:00Z",
+        "target_end_datetime": "2025-12-31T23:59:59Z",
+        "request_start_datetime": "2025-12-15T23:59:59Z",
+        "request_end_datetime": "2026-01-01T00:00:00Z",
+        "attempt_number": 1,
+        "query_sha256": hashlib.sha256(
+            '(OGDC OR OGDCL OR "Oil and Gas Development Company")'.encode()
+        ).hexdigest(),
+        "request_parameters_sha256": error.details[
+            "request_parameters_sha256"
+        ],
+    }
+    assert len(error.details["request_parameters_sha256"]) == 64
+    assert "private" not in json.dumps(error.to_dict())
 
 
 def test_committed_gdelt_example_config_loads_and_carries_usage_evidence():

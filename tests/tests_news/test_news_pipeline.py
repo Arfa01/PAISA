@@ -15,6 +15,7 @@ import pytest
 
 import paisa.news.pipeline as news_pipeline
 from paisa.news.models import (
+    NEWS_AVAILABILITY_POLICY_VERSION,
     NEWS_SCHEMA_VERSION,
     NormalizedNewsArticle,
     ProviderFetchResult,
@@ -147,6 +148,11 @@ class StaticRealProvider:
                     error_type="network_error",
                     message="secondary source unavailable",
                     occurred_at=acquired,
+                    details={
+                        "capture_id": "secondary-capture-a1",
+                        "attempt_number": 1,
+                        "request_parameters_sha256": "a" * 64,
+                    },
                 ),
             )
         return ProviderFetchResult(
@@ -446,10 +452,27 @@ def test_complete_artifact_tree_inventory_and_raw_preservation(tmp_path):
 
     provider_config = _read_json(run_dir / "provider_config.json")
     assert provider_config["configured_sources"][0]["api_token"] == "[REDACTED]"
+    assert (
+        provider_config["availability_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+    )
     manifest = _read_json(run_dir / "run_manifest.json")
+    assert manifest["schema_version"] == "1.1"
+    assert (
+        manifest["availability_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+    )
+    assert (
+        _read_json(run_dir / "completion.json")["availability_policy_version"]
+        == NEWS_AVAILABILITY_POLICY_VERSION
+    )
     assert manifest["status"] == "PASS"
     assert manifest["finalization_state"] == "COMMITTED"
     assert manifest["database"]["schema_version"] == DATABASE_SCHEMA_VERSION
+    normalized_header = (run_dir / "normalized_articles.csv").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    assert "source_observed_at" in normalized_header.split(",")
     inventory = manifest["artifact_inventory"]
     assert [entry["path"] for entry in inventory] == sorted(
         actual - {"run_manifest.json", "final_summary.json", "completion.json"}
@@ -972,6 +995,14 @@ def test_provider_error_with_usable_records_is_partial_and_recorded(tmp_path):
     assert summary.run_status == "PARTIAL"
     assert summary.quality_status == "WARN"
     assert _read_json(output / run_id / "run_manifest.json")["status"] == "PARTIAL"
+    artifact_error = _read_json(output / run_id / "provider_errors.json")[
+        "errors"
+    ][0]
+    assert artifact_error["details"] == {
+        "capture_id": "secondary-capture-a1",
+        "attempt_number": 1,
+        "request_parameters_sha256": "a" * 64,
+    }
     connection = sqlite3.connect(database)
     try:
         status = connection.execute(
@@ -981,10 +1012,15 @@ def test_provider_error_with_usable_records_is_partial_and_recorded(tmp_path):
             "SELECT count(*) FROM provider_errors WHERE ingestion_run_id = ?",
             (run_id,),
         ).fetchone()[0]
+        details_json = connection.execute(
+            "SELECT details_json FROM provider_errors WHERE ingestion_run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
     finally:
         connection.close()
     assert status == "PARTIAL"
     assert error_count == 1
+    assert json.loads(details_json) == artifact_error["details"]
 
 
 def test_database_finalization_failure_can_never_leave_pass_artifacts(

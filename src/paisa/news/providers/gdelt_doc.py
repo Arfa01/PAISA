@@ -24,6 +24,9 @@ import math
 from pathlib import Path
 import re
 import socket
+import subprocess
+import sys
+import threading
 import time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -33,6 +36,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from paisa.news.models import (
+    NEWS_AVAILABILITY_POLICY_VERSION,
     ProviderError,
     ProviderFetchResult,
     RawCapture,
@@ -247,6 +251,48 @@ def _resolve_addresses(host: str, port: int) -> tuple[str, ...]:
     return tuple(sorted(addresses))
 
 
+def _resolve_addresses_in_cancellable_subprocess(
+    host: str,
+    port: int,
+    *,
+    timeout_seconds: float,
+) -> tuple[str, ...]:
+    """Resolve with an OS process that can be terminated at the deadline."""
+
+    program = (
+        "import json,socket,sys;"
+        "host=sys.argv[1];port=int(sys.argv[2]);"
+        "values=sorted({row[4][0] for row in "
+        "socket.getaddrinfo(host,port,type=socket.SOCK_STREAM)});"
+        "print(json.dumps(values,separators=(',',':')))"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program, host, str(port)],
+            capture_output=True,
+            text=True,
+            timeout=max(0.001, timeout_seconds),
+            check=True,
+        )
+        value = json.loads(completed.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise _GdeltRejected(
+            "soft_total_timeout",
+            "GDELT DNS resolution exceeded the end-to-end request deadline",
+        ) from exc
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise _GdeltRejected(
+            "unsafe_destination",
+            "GDELT hostname could not be resolved safely",
+        ) from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _GdeltRejected(
+            "unsafe_destination",
+            "GDELT hostname resolver returned invalid evidence",
+        )
+    return tuple(value)
+
+
 def _response_peer_address(response: Any) -> str:
     raw = getattr(response, "raw", None)
     for connection in (
@@ -315,12 +361,27 @@ class _PinnedAddressAdapter(HTTPAdapter):
 
 def _validated_addresses(
     resolver: Callable[[str, int], Sequence[str]],
+    *,
+    timeout_seconds: float,
 ) -> tuple[str, ...]:
     host = urlsplit(GDELT_DOC_ENDPOINT).hostname
     assert host is not None
+    if resolver is _resolve_addresses:
+        resolved = _resolve_addresses_in_cancellable_subprocess(
+            host,
+            443,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        resolved = _bounded_custom_resolution(
+            resolver,
+            host=host,
+            port=443,
+            timeout_seconds=timeout_seconds,
+        )
     try:
         addresses = tuple(
-            sorted({str(_normalized_ip(value)) for value in resolver(host, 443)})
+            sorted({str(_normalized_ip(value)) for value in resolved})
         )
     except (OSError, ValueError) as exc:
         raise _GdeltRejected(
@@ -333,6 +394,117 @@ def _validated_addresses(
             "GDELT endpoint did not resolve exclusively to public addresses",
         )
     return addresses
+
+
+def _bounded_custom_resolution(
+    resolver: Callable[[str, int], Sequence[str]],
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: float,
+) -> Sequence[str]:
+    """Bound injected/test resolvers without letting them block acquisition."""
+
+    result: list[Sequence[str]] = []
+    failure: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            result.append(resolver(host, port))
+        except BaseException as exc:  # propagated on the acquisition thread
+            failure.append(exc)
+
+    worker = threading.Thread(
+        target=resolve,
+        name="paisa-gdelt-dns",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(max(0.0, timeout_seconds))
+    if worker.is_alive():
+        raise _GdeltRejected(
+            "soft_total_timeout",
+            "GDELT DNS resolution exceeded the end-to-end request deadline",
+        )
+    if failure:
+        exc = failure[0]
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise exc
+        raise _GdeltRejected(
+            "unsafe_destination",
+            "GDELT hostname could not be resolved safely",
+        ) from exc
+    return result[0]
+
+
+def _call_before_deadline(
+    action: Callable[[], Any],
+    *,
+    deadline: float,
+    monotonic_clock: Callable[[], float],
+    timeout_cleanup: Callable[[], Any] | None = None,
+) -> Any:
+    """Run one potentially blocking network operation within the shared deadline.
+
+    Requests exposes separate connect/read timeouts and streamed reads can block
+    between yielded chunks.  A daemon worker lets the acquisition caller fail at
+    the single end-to-end deadline; best-effort cleanup closes the live session
+    so the abandoned operation does not remain usable.
+    """
+
+    remaining = deadline - monotonic_clock()
+    if remaining <= 0:
+        raise _GdeltRejected(
+            "soft_total_timeout",
+            "GDELT acquisition exceeded the configured end-to-end deadline",
+        )
+    result: list[Any] = []
+    failure: list[BaseException] = []
+    finished = threading.Event()
+
+    def invoke() -> None:
+        try:
+            result.append(action())
+        except BaseException as exc:  # propagated on the acquisition thread
+            failure.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="paisa-gdelt-request",
+        daemon=True,
+    )
+    worker.start()
+    wait_budget = max(0.0, deadline - monotonic_clock())
+    if not finished.wait(wait_budget):
+        if timeout_cleanup is not None:
+            def cleanup() -> None:
+                try:
+                    timeout_cleanup()
+                except Exception:
+                    pass
+
+            # Cleanup is advisory after the hard acquisition deadline.  Never
+            # wait for a provider/session close implementation that can itself
+            # block; the abandoned request worker is already daemonized.
+            threading.Thread(
+                target=cleanup,
+                name="paisa-gdelt-timeout-cleanup",
+                daemon=True,
+            ).start()
+        raise _GdeltRejected(
+            "soft_total_timeout",
+            "GDELT acquisition exceeded the configured end-to-end deadline",
+        )
+    if failure:
+        raise failure[0]
+    if monotonic_clock() > deadline:
+        raise _GdeltRejected(
+            "soft_total_timeout",
+            "GDELT acquisition exceeded the configured end-to-end deadline",
+        )
+    return result[0]
 
 
 def _validate_peer(
@@ -628,6 +800,14 @@ def _tile_root_window(root: GdeltQueryWindow) -> tuple[_RequestWindow, ...]:
         index += 1
     return tuple(tiles)
 
+@dataclass(frozen=True)
+class _RetryDelay:
+    requested_seconds: float | None
+    applied_seconds: float | None
+    header_valid: bool
+    exceeds_wait_ceiling: bool
+
+
 def _retry_delay_seconds(
     *,
     attempt: int,
@@ -635,10 +815,10 @@ def _retry_delay_seconds(
     occurred_at: datetime,
     initial_seconds: float,
     maximum_seconds: float,
-) -> float:
+) -> _RetryDelay:
     delay = min(initial_seconds * (2**attempt), maximum_seconds)
     if retry_after is None:
-        return delay
+        return _RetryDelay(None, delay, False, False)
     suggested: float | None = None
     try:
         numeric = float(retry_after)
@@ -655,9 +835,12 @@ def _retry_delay_seconds(
     else:
         if math.isfinite(numeric) and numeric >= 0:
             suggested = numeric
-    if suggested is not None:
-        delay = max(delay, min(suggested, maximum_seconds))
-    return min(delay, maximum_seconds)
+    if suggested is None:
+        return _RetryDelay(None, delay, False, False)
+    if suggested > maximum_seconds:
+        return _RetryDelay(suggested, None, True, True)
+    delay = max(delay, suggested)
+    return _RetryDelay(suggested, delay, True, False)
 
 
 def _load_config(path: str | Path) -> tuple[Mapping[str, Any], tuple[GdeltQueryWindow, ...]]:
@@ -849,27 +1032,29 @@ def _parse_articles(
         raw_seendate = _bounded_text(
             item.get("seendate"), field="seendate", maximum=64
         )
-        available_at = _normalized_seendate(raw_seendate)
+        source_observed_at = _normalized_seendate(raw_seendate)
         record_warnings = [
             "missing_publication_time",
-            "gdelt_seendate_is_source_availability_not_publication",
+            "gdelt_seendate_is_source_observation_not_publication_or_eligibility",
         ]
         if title is None:
             record_warnings.append("missing_title")
         if source_url is None:
             record_warnings.append("missing_source_url")
-        if raw_seendate is None:
-            record_warnings.append("missing_source_availability_time")
-        elif available_at is None:
-            record_warnings.append("invalid_source_availability_time")
-        else:
-            seen = datetime.fromisoformat(available_at.replace("Z", "+00:00"))
-            if not target_start <= seen <= target_end:
-                raise _GdeltRejected(
-                    "record_outside_target_window",
-                    "GDELT response contained seendate outside the inclusive "
-                    "target window; response quarantined",
-                )
+        if raw_seendate is None or source_observed_at is None:
+            raise _GdeltRejected(
+                "invalid_source_observation_time",
+                "GDELT historical response contains a missing or malformed "
+                "seendate; response quarantined because target-window "
+                "membership cannot be proven",
+            )
+        seen = datetime.fromisoformat(source_observed_at.replace("Z", "+00:00"))
+        if not target_start <= seen <= target_end:
+            raise _GdeltRejected(
+                "record_outside_target_window",
+                "GDELT response contained seendate outside the inclusive "
+                "target window; response quarantined",
+            )
 
         provider_record_id = _provider_record_id(
             source_url=raw_url,
@@ -890,7 +1075,7 @@ def _parse_articles(
             "language": language,
             "sourcecountry": source_country,
             "seendate": raw_seendate,
-            "seendate_normalized_utc": available_at,
+            "seendate_normalized_utc": source_observed_at,
             "original_timezone_evidence": raw_seendate,
             "request_query": query,
             "provider_match_mode": "full_text_query",
@@ -927,7 +1112,8 @@ def _parse_articles(
                 body=None,
                 published_at_raw=None,
                 published_timezone=None,
-                available_at_raw=available_at,
+                available_at_raw=None,
+                source_observed_at_raw=source_observed_at,
                 language=language,
                 provider_record_id=provider_record_id,
                 capture_id=capture_id,
@@ -1123,8 +1309,8 @@ class GdeltDocNewsProvider(NewsProvider):
             "read_timeout_seconds": self.read_timeout_seconds,
             "soft_total_timeout_seconds": self.soft_total_timeout_seconds,
             "soft_total_timeout_semantics": (
-                "checked around blocking operations and while reading; OS resolver "
-                "latency and blocking-call overshoot cannot be interrupted"
+                "one end-to-end request deadline covers bounded DNS resolution, "
+                "connect, response headers, and bounded payload reading"
             ),
             "max_compressed_bytes": self.max_compressed_bytes,
             "max_decoded_bytes": self.max_decoded_bytes,
@@ -1141,8 +1327,16 @@ class GdeltDocNewsProvider(NewsProvider):
             "article_page_fetching": "disabled",
             "environment_authentication": "disabled",
             "saturation_policy": "deterministic_bisection_or_fail_closed",
+            "source_observed_at_eligibility_policy": (
+                "audit_only_never_eligibility_without_new_versioned_policy"
+            ),
+            "availability_policy_version": NEWS_AVAILABILITY_POLICY_VERSION,
             "out_of_target_seendate_policy": "quarantine_response",
-            "retry_policy": "bounded_exponential_backoff_429_and_5xx",
+            "missing_or_invalid_seendate_policy": "quarantine_response",
+            "retry_policy": (
+                "bounded_exponential_backoff_429_and_5xx_honor_retry_after_"
+                "within_wait_ceiling_else_fail_window"
+            ),
         }
         self._owns_session = session is None
         self.session = session or requests.Session()
@@ -1232,17 +1426,52 @@ class GdeltDocNewsProvider(NewsProvider):
             "sort": "dateasc",
         }
 
+    def _request_context(
+        self,
+        window: _RequestWindow,
+        attempt: int,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        parameters = self._request_parameters(window)
+        encoded = json.dumps(
+            parameters,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        context: dict[str, Any] = {
+            "capture_id": window.capture_id(attempt),
+            "split_path": window.split_path,
+            "target_start_datetime": _utc_iso(window.start_datetime),
+            "target_end_datetime": _utc_iso(window.end_datetime),
+            "request_start_datetime": _utc_iso(window.request_start_datetime),
+            "request_end_datetime": _utc_iso(window.request_end_datetime),
+            "attempt_number": attempt + 1,
+            "query_sha256": hashlib.sha256(self.query.encode("utf-8")).hexdigest(),
+            "request_parameters_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+        context.update(extra)
+        return context
+
     def _acquire(
         self,
         window: _RequestWindow,
         *,
         fetched_at: datetime | None,
     ) -> tuple[bytes, bytes, int, Mapping[str, Any], datetime]:
-        response: Any | None = None
         pinned_adapter: _PinnedAddressAdapter | None = None
         deadline = self.monotonic_clock() + self.soft_total_timeout_seconds
         try:
-            allowed_addresses = _validated_addresses(self.resolver)
+            resolver_budget = deadline - self.monotonic_clock()
+            if resolver_budget <= 0:
+                raise _GdeltRejected(
+                    "soft_total_timeout",
+                    "GDELT acquisition exceeded the configured end-to-end deadline",
+                )
+            allowed_addresses = _validated_addresses(
+                self.resolver,
+                timeout_seconds=resolver_budget,
+            )
             if self.monotonic_clock() > deadline:
                 raise _GdeltRejected(
                     "soft_total_timeout",
@@ -1262,54 +1491,71 @@ class GdeltDocNewsProvider(NewsProvider):
                     "soft_total_timeout",
                     "GDELT acquisition exceeded the configured soft deadline",
                 )
-            response = self.session.get(
-                GDELT_DOC_ENDPOINT,
-                params=self._request_parameters(window),
-                timeout=(
-                    min(self.connect_timeout_seconds, remaining_seconds),
-                    min(self.read_timeout_seconds, remaining_seconds),
-                ),
-                allow_redirects=False,
-                stream=True,
-                proxies={},
-                headers={
-                    "User-Agent": self.user_agent,
-                    "Accept": "application/json",
-                },
-            )
-            if self.monotonic_clock() > deadline:
-                raise _GdeltRejected(
-                    "soft_total_timeout",
-                    "GDELT acquisition exceeded the configured soft deadline",
+            def request_and_read() -> tuple[bytes, bytes, int, Mapping[str, Any]]:
+                response: Any | None = None
+                try:
+                    response = self.session.get(
+                        GDELT_DOC_ENDPOINT,
+                        params=self._request_parameters(window),
+                        timeout=(
+                            min(self.connect_timeout_seconds, remaining_seconds),
+                            min(self.read_timeout_seconds, remaining_seconds),
+                        ),
+                        allow_redirects=False,
+                        stream=True,
+                        proxies={},
+                        headers={
+                            "User-Agent": self.user_agent,
+                            "Accept": "application/json",
+                        },
+                    )
+                    _validate_peer(
+                        response,
+                        allowed_addresses=allowed_addresses,
+                        peer_address_getter=self.peer_address_getter,
+                    )
+                    wire_payload, decoded_payload = _read_bounded_payload(
+                        response,
+                        max_compressed_bytes=self.max_compressed_bytes,
+                        max_decoded_bytes=self.max_decoded_bytes,
+                        deadline=deadline,
+                        monotonic_clock=self.monotonic_clock,
+                    )
+                    return (
+                        wire_payload,
+                        decoded_payload,
+                        int(response.status_code),
+                        {
+                            str(key).casefold(): value
+                            for key, value in response.headers.items()
+                        },
+                    )
+                finally:
+                    if response is not None:
+                        close = getattr(response, "close", None)
+                        if callable(close):
+                            close()
+
+            close_session = getattr(self.session, "close", None)
+            wire_payload, decoded_payload, status_code, headers = (
+                _call_before_deadline(
+                    request_and_read,
+                    deadline=deadline,
+                    monotonic_clock=self.monotonic_clock,
+                    timeout_cleanup=(
+                        close_session if callable(close_session) else None
+                    ),
                 )
-            _validate_peer(
-                response,
-                allowed_addresses=allowed_addresses,
-                peer_address_getter=self.peer_address_getter,
-            )
-            wire_payload, decoded_payload = _read_bounded_payload(
-                response,
-                max_compressed_bytes=self.max_compressed_bytes,
-                max_decoded_bytes=self.max_decoded_bytes,
-                deadline=deadline,
-                monotonic_clock=self.monotonic_clock,
             )
             acquisition_time = utc_datetime(fetched_at or self.clock())
             return (
                 wire_payload,
                 decoded_payload,
-                int(response.status_code),
-                {
-                    str(key).casefold(): value
-                    for key, value in response.headers.items()
-                },
+                status_code,
+                headers,
                 acquisition_time,
             )
         finally:
-            if response is not None:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
             session_cookies = getattr(self.session, "cookies", None)
             clear_cookies = getattr(session_cookies, "clear", None)
             if callable(clear_cookies):
@@ -1353,6 +1599,7 @@ class GdeltDocNewsProvider(NewsProvider):
                                 "budget before all windows were complete"
                             ),
                             occurred_at=occurred_at,
+                            details=self._request_context(request_window, 0),
                         )
                     )
                     request_budget_exhausted = True
@@ -1372,6 +1619,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                     "request budget during retry"
                                 ),
                                 occurred_at=occurred_at,
+                                details=self._request_context(
+                                    request_window, attempt
+                                ),
                             )
                         )
                         request_budget_exhausted = True
@@ -1399,6 +1649,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                 error_type=exc.error_type,
                                 message=exc.safe_message,
                                 occurred_at=acquisition_time,
+                                details=self._request_context(
+                                    request_window, attempt
+                                ),
                             )
                         )
                         break
@@ -1415,6 +1668,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                     f"({type(exc).__name__})"
                                 ),
                                 occurred_at=acquisition_time,
+                                details=self._request_context(
+                                    request_window, attempt
+                                ),
                             )
                         )
                         break
@@ -1477,29 +1733,67 @@ class GdeltDocNewsProvider(NewsProvider):
 
                     retryable = status == 429 or 500 <= status <= 599
                     if retryable:
+                        retry_delay = _retry_delay_seconds(
+                            attempt=attempt,
+                            retry_after=retry_after,
+                            occurred_at=acquisition_time,
+                            initial_seconds=self.backoff_initial_seconds,
+                            maximum_seconds=self.backoff_max_seconds,
+                        )
+                        if retry_after is not None:
+                            if retry_delay.header_valid:
+                                capture_warnings.append(
+                                    "retry_after_requested_seconds="
+                                    f"{retry_delay.requested_seconds}"
+                                )
+                            else:
+                                capture_warnings.append(
+                                    "retry_after_invalid_ignored"
+                                )
                         can_retry = (
                             attempt < self.max_retries
                             and request_count < self.max_requests_per_run
+                            and not retry_delay.exceeds_wait_ceiling
                         )
                         if can_retry:
                             capture_warnings.append("bounded_retry_scheduled")
+                            capture_warnings.append(
+                                "retry_delay_applied_seconds="
+                                f"{retry_delay.applied_seconds}"
+                            )
+                            if retry_delay.header_valid:
+                                capture_warnings.append(
+                                    "retry_after_applied_seconds="
+                                    f"{retry_delay.applied_seconds}"
+                                )
+                        elif retry_delay.exceeds_wait_ceiling:
+                            capture_warnings.append(
+                                "retry_after_refused_above_wait_ceiling"
+                            )
                         else:
                             capture_warnings.append("retry_limit_reached")
                         captures.append(make_capture())
                         error_type = (
-                            "rate_limit_error" if status == 429 else "server_error"
+                            "retry_after_exceeds_policy"
+                            if retry_delay.exceeds_wait_ceiling
+                            else "rate_limit_error"
+                            if status == 429
+                            else "server_error"
                         )
                         if can_retry:
-                            self.sleeper(
-                                _retry_delay_seconds(
-                                    attempt=attempt,
-                                    retry_after=retry_after,
-                                    occurred_at=acquisition_time,
-                                    initial_seconds=self.backoff_initial_seconds,
-                                    maximum_seconds=self.backoff_max_seconds,
-                                )
-                            )
+                            assert retry_delay.applied_seconds is not None
+                            self.sleeper(retry_delay.applied_seconds)
                             continue
+                        retry_details = {
+                            "retry_after_requested_seconds": (
+                                retry_delay.requested_seconds
+                            ),
+                            "retry_after_applied_seconds": None,
+                            "retry_wait_ceiling_seconds": (
+                                self.backoff_max_seconds
+                            ),
+                            "retry_after_header_valid": retry_delay.header_valid,
+                        }
                         errors.append(
                             ProviderError(
                                 provider_id=self.provider_id,
@@ -1507,10 +1801,20 @@ class GdeltDocNewsProvider(NewsProvider):
                                 error_type=error_type,
                                 message=(
                                     f"GDELT DOC returned HTTP {status}; "
-                                    "retry limit reached"
+                                    + (
+                                        "Retry-After exceeds the approved wait "
+                                        "ceiling"
+                                        if retry_delay.exceeds_wait_ceiling
+                                        else "retry limit reached"
+                                    )
                                 ),
                                 occurred_at=acquisition_time,
                                 http_status=status,
+                                details=self._request_context(
+                                    request_window,
+                                    attempt,
+                                    **retry_details,
+                                ),
                             )
                         )
                         break
@@ -1524,6 +1828,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                 message=f"GDELT DOC returned HTTP {status}",
                                 occurred_at=acquisition_time,
                                 http_status=status,
+                                details=self._request_context(
+                                    request_window, attempt
+                                ),
                             )
                         )
                         break
@@ -1559,6 +1866,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                 message=exc.safe_message,
                                 occurred_at=acquisition_time,
                                 http_status=status,
+                                details=self._request_context(
+                                    request_window, attempt
+                                ),
                             )
                         )
                         break
@@ -1588,6 +1898,9 @@ class GdeltDocNewsProvider(NewsProvider):
                                     ),
                                     occurred_at=acquisition_time,
                                     http_status=status,
+                                    details=self._request_context(
+                                        request_window, attempt
+                                    ),
                                 )
                             )
                         else:

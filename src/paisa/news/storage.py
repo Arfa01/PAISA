@@ -24,8 +24,11 @@ import sqlite3
 from typing import Any
 
 
-DATABASE_SCHEMA_VERSION = 6
-NEWS_RECORD_SCHEMA_VERSION = "1.0"
+DATABASE_SCHEMA_VERSION = 7
+NEWS_RECORD_SCHEMA_VERSION = "1.1"
+_SUPPORTED_NEWS_RECORD_SCHEMA_VERSIONS = frozenset(
+    {"1.0", NEWS_RECORD_SCHEMA_VERSION}
+)
 QUALITY_REPORT_SCHEMA_VERSION = "2.0"
 SENTIMENT_RUN_SUMMARY_SCHEMA_VERSION = "2.0"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -2011,6 +2014,22 @@ END;
 """
 
 
+_SCHEMA_V7_SQL = """
+-- Provider observation time is audit provenance, not cutoff eligibility.
+-- Legacy rows remain explicitly unknown (NULL); no historical value is
+-- inferred from available_at or publication time during migration.
+ALTER TABLE normalized_articles
+ADD COLUMN source_observed_at TEXT CHECK (
+    source_observed_at IS NULL OR julianday(source_observed_at) IS NOT NULL
+);
+
+ALTER TABLE article_ingestions
+ADD COLUMN source_observed_at TEXT CHECK (
+    source_observed_at IS NULL OR julianday(source_observed_at) IS NOT NULL
+);
+"""
+
+
 # The retained PR #12 database was produced by a short-lived version-3 schema
 # immediately before the final constraint hardening landed.  Its object set,
 # indexes, and triggers match version 3 exactly; only these three table
@@ -2141,6 +2160,29 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _news_record_schema(
+    value: Any, *, source_observed_at: str | None = None
+) -> str:
+    schema_version = str(value or "").strip()
+    if schema_version not in _SUPPORTED_NEWS_RECORD_SCHEMA_VERSIONS:
+        raise ValueError(f"Unsupported news record schema: {schema_version}")
+    if schema_version == "1.0" and source_observed_at is not None:
+        raise ValueError("source_observed_at requires news record schema 1.1")
+    return schema_version
+
+
+def _normalized_payload_for_schema(value: Any, *, schema_version: str) -> Any:
+    """Return serialized normalized evidence in its declared record schema."""
+
+    if schema_version != "1.0" or not isinstance(value, Mapping):
+        return value
+    payload = dict(value)
+    if payload.get("source_observed_at") is not None:
+        raise ValueError("source_observed_at requires news record schema 1.1")
+    payload.pop("source_observed_at", None)
+    return payload
 
 
 def _positive_integer(value: Any, *, field: str) -> int:
@@ -2450,6 +2492,7 @@ _MIGRATION_NAMES = {
     4: "news_storage_sealed_finalization",
     5: "financial_sentiment_foundation",
     6: "sentiment_run_certification",
+    7: "source_observation_provenance",
 }
 
 
@@ -2478,6 +2521,8 @@ def _schema_stage_sql(version: int) -> str:
         return _SCHEMA_V5_SQL
     elif version == 6:
         return _SCHEMA_V6_SQL
+    elif version == 7:
+        return _SCHEMA_V7_SQL
     raise ValueError(f"Unsupported news schema stage: {version}")
 
 
@@ -3279,6 +3324,9 @@ class NewsStorage:
         provider_id = _required_text(data, "provider_id", "provider")
         provider_mode = _required_text(data, "provider_mode", "provider_type")
         data_kind = _required_text(data, "data_kind", "record_kind").lower()
+        schema_version = _news_record_schema(
+            data.get("schema_version", NEWS_RECORD_SCHEMA_VERSION)
+        )
         with self.transaction() as connection:
             active = connection.execute(
                 "SELECT run_id FROM ingestion_runs WHERE status = 'RUNNING'"
@@ -3298,7 +3346,7 @@ class NewsStorage:
                 """,
                 (
                     run_id,
-                    str(data.get("schema_version", NEWS_RECORD_SCHEMA_VERSION)),
+                    schema_version,
                     provider_id,
                     provider_mode,
                     _optional_text(data.get("configured_source")),
@@ -3409,6 +3457,19 @@ class NewsStorage:
         published_at = _timestamp(
             data.get("published_at"), field="published_at", nullable=True
         )
+        source_observed_at = _timestamp(
+            data.get("source_observed_at"),
+            field="source_observed_at",
+            nullable=True,
+        )
+        declared_schema = data.get("schema_version")
+        schema_version = (
+            None
+            if declared_schema is None
+            else _news_record_schema(
+                declared_schema, source_observed_at=source_observed_at
+            )
+        )
         assert available_at is not None and fetched_at is not None
         _validate_availability(
             available_at=available_at,
@@ -3459,77 +3520,115 @@ class NewsStorage:
                     "article ingestion raw evidence must belong to the same "
                     "ingestion run"
                 )
+            run_schema = connection.execute(
+                "SELECT schema_version FROM ingestion_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_schema is None:
+                raise ValueError("article ingestion run does not exist")
+            run_schema_version = _news_record_schema(
+                run_schema["schema_version"],
+                source_observed_at=source_observed_at,
+            )
+            if schema_version is None:
+                schema_version = run_schema_version
+            elif run_schema_version != schema_version:
+                raise ValueError(
+                    "article schema_version must match its ingestion run"
+                )
             if duplicate_of is None:
                 title = _optional_text(data.get("title"))
-                connection.execute(
-                    """
-                    INSERT INTO normalized_articles(
-                        article_id, schema_version, provider, source_name,
-                        source_type, source_url, canonical_url, title,
-                        normalized_title, summary, body, published_at,
-                        published_timezone, available_at, fetched_at, language,
-                        mentioned_tickers_json, mentioned_companies_json,
-                        mentioned_sectors_json, content_sha256, duplicate_of,
-                        first_ingestion_run_id, raw_artifact_reference,
-                        normalization_warnings_json, created_at
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        NULL, ?, ?, ?, ?
-                    )
-                    """,
-                    (
-                        candidate_id,
-                        str(data.get("schema_version", NEWS_RECORD_SCHEMA_VERSION)),
-                        _required_text(data, "provider"),
-                        _required_text(data, "source_name"),
-                        _required_text(data, "source_type"),
-                        _optional_text(data.get("source_url")),
-                        _optional_text(data.get("canonical_url")),
-                        title,
-                        _normalized_title(data.get("normalized_title", title)),
-                        _optional_text(data.get("summary")),
-                        _optional_text(data.get("body")),
-                        published_at,
-                        _optional_text(data.get("published_timezone")),
-                        available_at,
-                        fetched_at,
-                        _optional_text(data.get("language")),
-                        _json_text(data.get("mentioned_tickers"), default=[]),
-                        _json_text(data.get("mentioned_companies"), default=[]),
-                        _json_text(data.get("mentioned_sectors"), default=[]),
-                        _sha256(data.get("content_sha256"), field="content_sha256"),
-                        run_id,
-                        raw_reference,
-                        _json_text(data.get("normalization_warnings"), default=[]),
-                        created_at,
-                    ),
-                )
-
-            connection.execute(
-                """
-                INSERT INTO article_ingestions(
-                    occurrence_id, ingestion_run_id, raw_evidence_id,
-                    candidate_article_id, canonical_article_id, duplicate_of,
-                    deduplication_rule, available_at, fetched_at,
-                    raw_artifact_reference, normalized_payload_json,
-                    normalization_warnings_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    occurrence_id,
-                    run_id,
-                    raw_evidence_id,
+                article_columns = [
+                    "article_id", "schema_version", "provider", "source_name",
+                    "source_type", "source_url", "canonical_url", "title",
+                    "normalized_title", "summary", "body", "published_at",
+                    "published_timezone", "available_at", "fetched_at", "language",
+                    "mentioned_tickers_json", "mentioned_companies_json",
+                    "mentioned_sectors_json", "content_sha256", "duplicate_of",
+                    "first_ingestion_run_id", "raw_artifact_reference",
+                    "normalization_warnings_json", "created_at",
+                ]
+                article_values: list[Any] = [
                     candidate_id,
-                    canonical_id,
-                    canonical_id if duplicate_of is not None else None,
-                    deduplication_rule,
+                    schema_version,
+                    _required_text(data, "provider"),
+                    _required_text(data, "source_name"),
+                    _required_text(data, "source_type"),
+                    _optional_text(data.get("source_url")),
+                    _optional_text(data.get("canonical_url")),
+                    title,
+                    _normalized_title(data.get("normalized_title", title)),
+                    _optional_text(data.get("summary")),
+                    _optional_text(data.get("body")),
+                    published_at,
+                    _optional_text(data.get("published_timezone")),
                     available_at,
                     fetched_at,
+                    _optional_text(data.get("language")),
+                    _json_text(data.get("mentioned_tickers"), default=[]),
+                    _json_text(data.get("mentioned_companies"), default=[]),
+                    _json_text(data.get("mentioned_sectors"), default=[]),
+                    _sha256(data.get("content_sha256"), field="content_sha256"),
+                    None,
+                    run_id,
                     raw_reference,
-                    _json_text(data, default={}),
                     _json_text(data.get("normalization_warnings"), default=[]),
                     created_at,
+                ]
+                supports_source_observed = any(
+                    str(row[1]) == "source_observed_at"
+                    for row in connection.execute(
+                        "PRAGMA table_info(normalized_articles)"
+                    )
+                )
+                if supports_source_observed:
+                    article_columns.append("source_observed_at")
+                    article_values.append(source_observed_at)
+                elif source_observed_at is not None:
+                    raise RuntimeError(
+                        "source_observed_at requires news storage schema version 7"
+                    )
+                connection.execute(
+                    f"INSERT INTO normalized_articles({', '.join(article_columns)}) "
+                    f"VALUES ({', '.join('?' for _ in article_columns)})",
+                    tuple(article_values),
+                )
+
+            occurrence_columns = [
+                "occurrence_id", "ingestion_run_id", "raw_evidence_id",
+                "candidate_article_id", "canonical_article_id", "duplicate_of",
+                "deduplication_rule", "available_at", "fetched_at",
+                "raw_artifact_reference", "normalized_payload_json",
+                "normalization_warnings_json", "created_at",
+            ]
+            occurrence_values: list[Any] = [
+                occurrence_id, run_id, raw_evidence_id, candidate_id, canonical_id,
+                canonical_id if duplicate_of is not None else None,
+                deduplication_rule, available_at, fetched_at, raw_reference,
+                _json_text(
+                    _normalized_payload_for_schema(
+                        data, schema_version=schema_version
+                    ),
+                    default={},
                 ),
+                _json_text(data.get("normalization_warnings"), default=[]),
+                created_at,
+            ]
+            supports_occurrence_source_observed = any(
+                str(row[1]) == "source_observed_at"
+                for row in connection.execute("PRAGMA table_info(article_ingestions)")
+            )
+            if supports_occurrence_source_observed:
+                occurrence_columns.append("source_observed_at")
+                occurrence_values.append(source_observed_at)
+            elif source_observed_at is not None:
+                raise RuntimeError(
+                    "source_observed_at requires news storage schema version 7"
+                )
+            connection.execute(
+                f"INSERT INTO article_ingestions({', '.join(occurrence_columns)}) "
+                f"VALUES ({', '.join('?' for _ in occurrence_columns)})",
+                tuple(occurrence_values),
             )
         return canonical_id
 
@@ -3560,6 +3659,19 @@ class NewsStorage:
         duplicate = candidate_id != canonical_id or bool(data.get("duplicate_of"))
         available_at = _timestamp(data.get("available_at"), field="available_at")
         fetched_at = _timestamp(data.get("fetched_at"), field="fetched_at")
+        source_observed_at = _timestamp(
+            data.get("source_observed_at"),
+            field="source_observed_at",
+            nullable=True,
+        )
+        declared_schema = data.get("schema_version")
+        schema_version = (
+            None
+            if declared_schema is None
+            else _news_record_schema(
+                declared_schema, source_observed_at=source_observed_at
+            )
+        )
         assert available_at is not None and fetched_at is not None
         _validate_availability(
             available_at=available_at,
@@ -3601,36 +3713,69 @@ class NewsStorage:
                     "article ingestion raw evidence must belong to the same "
                     "ingestion run"
                 )
-            connection.execute(
-                """
-                INSERT INTO article_ingestions(
-                    occurrence_id, ingestion_run_id, raw_evidence_id,
-                    candidate_article_id, canonical_article_id, duplicate_of,
-                    deduplication_rule, available_at, fetched_at,
-                    raw_artifact_reference, normalized_payload_json,
-                    normalization_warnings_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    occurrence_id,
-                    run_id,
-                    raw_evidence_id,
-                    candidate_id,
-                    canonical_id,
-                    canonical_id if duplicate else None,
-                    deduplication_rule,
-                    available_at,
-                    fetched_at,
-                    raw_reference,
-                    _json_text(
-                        _value(data, "normalized_payload", "payload", default=data),
-                        default={},
+            run_schema = connection.execute(
+                "SELECT schema_version FROM ingestion_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_schema is None:
+                raise ValueError("article ingestion run does not exist")
+            run_schema_version = _news_record_schema(
+                run_schema["schema_version"],
+                source_observed_at=source_observed_at,
+            )
+            if schema_version is None:
+                schema_version = run_schema_version
+            elif run_schema_version != schema_version:
+                raise ValueError(
+                    "article schema_version must match its ingestion run"
+                )
+            occurrence_columns = [
+                "occurrence_id", "ingestion_run_id", "raw_evidence_id",
+                "candidate_article_id", "canonical_article_id", "duplicate_of",
+                "deduplication_rule", "available_at", "fetched_at",
+                "raw_artifact_reference", "normalized_payload_json",
+                "normalization_warnings_json", "created_at",
+            ]
+            occurrence_values: list[Any] = [
+                occurrence_id,
+                run_id,
+                raw_evidence_id,
+                candidate_id,
+                canonical_id,
+                canonical_id if duplicate else None,
+                deduplication_rule,
+                available_at,
+                fetched_at,
+                raw_reference,
+                _json_text(
+                    _normalized_payload_for_schema(
+                        _value(
+                            data, "normalized_payload", "payload", default=data
+                        ),
+                        schema_version=schema_version,
                     ),
-                    _json_text(data.get("normalization_warnings"), default=[]),
-                    _timestamp(
-                        data.get("created_at", utc_now_z()), field="created_at"
-                    ),
+                    default={},
                 ),
+                _json_text(data.get("normalization_warnings"), default=[]),
+                _timestamp(
+                    data.get("created_at", utc_now_z()), field="created_at"
+                ),
+            ]
+            supports_source_observed = any(
+                str(row[1]) == "source_observed_at"
+                for row in connection.execute("PRAGMA table_info(article_ingestions)")
+            )
+            if supports_source_observed:
+                occurrence_columns.append("source_observed_at")
+                occurrence_values.append(source_observed_at)
+            elif source_observed_at is not None:
+                raise RuntimeError(
+                    "source_observed_at requires news storage schema version 7"
+                )
+            connection.execute(
+                f"INSERT INTO article_ingestions({', '.join(occurrence_columns)}) "
+                f"VALUES ({', '.join('?' for _ in occurrence_columns)})",
+                tuple(occurrence_values),
             )
         return occurrence_id
 

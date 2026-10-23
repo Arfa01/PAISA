@@ -6,6 +6,11 @@ does not aggregate sentiment, train a price-plus-sentiment model, change a
 decision policy or portfolio, or claim that news improves prediction. All
 outputs are academic data-engineering evidence and are not financial advice.
 
+Newly generated packs use coverage schema `1.1` and
+`news-price-coverage-v3`. The independent readiness configuration remains
+schema `1.0`. Retained schema-`1.0` coverage packs are historical and require
+regeneration before the current semantic verifier will certify them.
+
 ## Permission comes before acquisition
 
 Review [`HISTORICAL_NEWS_SOURCE_ASSESSMENT.md`](HISTORICAL_NEWS_SOURCE_ASSESSMENT.md)
@@ -99,9 +104,14 @@ split safely fails closed instead of being presented as complete coverage.
 The completed metadata-only acquisition `NEWS-20261023-060000-gdelt-ogdc2` is
 a sealed `PARTIAL` pack with `WARN` quality. Offline verification against the
 database and artifact seals returns `PASS (DATABASE_AND_ARTIFACT_BOUND)`. It
-preserves `656` raw records and `656` normalized unique canonicals, including
-`42` exact checksum-bound OGDC-linked canonicals across `93` returned source
-domains. There are no duplicates and no rejected records.
+preserves `656` raw rows and `656` normalized canonical rows unique under the
+current exact URL/content/title-source-time rules, including `42` exact
+checksum-bound OGDC-linked rows across `93` returned source domains. There are
+no exact-rule duplicate relationships and no rejected records. This is not an
+article-level uniqueness claim: the conservative reviewed-publisher document-ID
+diagnostic flags `17` candidate groups (`36` rows, or `19` beyond one per
+group) for later adjudication. Candidate reporting does not silently rewrite
+the immutable retained rows, and the `42` OGDC links are unaffected.
 
 All `656` canonicals preserve missing `published_at`; GDELT `seendate` is not
 relabeled as publisher publication time. The raw source-observation evidence
@@ -111,6 +121,15 @@ spans `2023-06-18T12:15:00Z` through `2024-06-14T15:00:00Z`, while conservative
 provider errors: `15` `ReadTimeout` failures, `4` out-of-window responses quarantined
 rather than accepted, and `3` exhausted HTTP 429 responses. A valid seal proves
 the retained pack's integrity; it does not erase incomplete acquisition.
+This retained schema-`1.0` pack preserves the observation range in raw
+evidence. New schema-`1.1` runs expose it as nullable `source_observed_at` in
+normalized SQLite/CSV and coverage artifacts. The field remains audit-only and
+cannot change an eligibility mapping under `news-availability-v1`.
+The retained provider-error rows also predate schema-`1.1` request contexts and
+therefore identify only their configured root window. Regenerate the GDELT run
+to obtain exact capture/attempt, split-path, request-bound, fingerprint, and
+retry-delay evidence for failures; the old `22`-error pack is not retroactively
+certified with facts it did not retain.
 
 ### Historical publication is not historical availability
 
@@ -149,6 +168,12 @@ trading-day coverage. Prefer an explicit run list for a reproducible retained
 audit; `--news-root` is a convenience for exploratory audits and will also
 discover future `PASS`/`PARTIAL` children.
 
+**Artifact-present retained example:** the command below requires the ignored
+news/database evidence and retained `VSL-...`/`TRN-...` pair. They are not in a
+Git-only clone. Restore a checksum-verified custodian export as documented in
+[`TEAM_HANDOFF.md`](TEAM_HANDOFF.md), or substitute regenerated inputs and a
+fresh coverage run ID.
+
 ```bash
 python scripts/audit_news_price_overlap.py \
   --news-run-dir artifacts/news_ingestion/NEWS-20261022-115232-03d0fc4c \
@@ -172,9 +197,14 @@ python scripts/audit_news_price_overlap.py \
 Use `python scripts/audit_news_price_overlap.py --help` for the authoritative
 option syntax. The decision cutoff is a local market clock time interpreted in
 the named IANA timezone; all persisted comparison timestamps remain UTC.
+Cutoffs accept `HH:MM` or `HH:MM:SS` at whole-second precision. Fractional
+seconds are rejected so serialized and hashed configuration never loses
+assignment-relevant precision.
 
-The retained RSS and live-GDELT packs now have separate sealed official audits.
-Verify them instead of rerunning either immutable identity:
+The retained RSS and live-GDELT packs have separate sealed schema-`1.0`
+historical audits. These artifact-present commands document their original
+verification entrypoints, but current schema-`1.1` code intentionally rejects
+them and requires regeneration under new run IDs:
 
 ```bash
 python scripts/verify_news_coverage.py \
@@ -183,7 +213,7 @@ python scripts/verify_news_coverage.py \
   --run-dir artifacts/news_coverage/COVERAGE-20261023-130000-gdelt0001
 ```
 
-Both verifiers return `PASS`. Both runs were generated from clean commit
+At their producing revision, both verifiers returned `PASS`. Both runs were generated from clean commit
 `041c557edf5b15660fd2f02d47ed7f9b8b4152a7` with `dirty_tree=false`, contain
 `11` payload artifacts, and retain `NO_OVERLAP`:
 
@@ -307,20 +337,60 @@ never overwritten; publication uses a per-run exclusive reservation and an
 atomic no-replace staging rename. Generated coverage packs remain ignored by
 Git. Public artifacts must not contain host-specific absolute paths, API keys,
 authorization headers, query credentials, or article text that the source did
-not permit PAISA to store.
+not permit PAISA to store. Coverage CSV publication also neutralizes
+spreadsheet-formula prefixes (`=`, `+`, `-`, `@`, tab, or carriage return) in
+untrusted cells with a reversible leading apostrophe; semantic verification
+decodes that representation before comparison.
 
-Verify the complete published pack without provider or database access:
+Current verification is offline but source-bound by default. It reopens the
+exact captured news packs, SQLite database, stock prices, split manifest,
+assessment, and permission policy; recomputes coverage; and compares every
+result artifact. Repeat `--news-run-dir` for the exact ordered set used by the
+audit (or use `--news-root` for deliberate discovery). Replace these valid
+example IDs with the immutable IDs produced or restored in your checkout:
+
+```bash
+PAISA_COVERAGE_RUN_DIR="artifacts/news_coverage/COVERAGE-20261023-190000-example-v3"
+PAISA_NEWS_RUN_DIR="artifacts/news_ingestion/NEWS-20261023-180000-example-source"
+PAISA_VERTICAL_RUN_DIR="artifacts/vertical_slice/VSL-20261020-OGDC-main-02"
+PAISA_TRAINING_RUN_DIR="artifacts/model_training/TRN-20261020-191815-624662-nogit"
+python scripts/verify_news_coverage.py \
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --news-run-dir "$PAISA_NEWS_RUN_DIR" \
+  --news-database data/news/paisa_news.sqlite3 \
+  --vertical-slice-dir "$PAISA_VERTICAL_RUN_DIR" \
+  --model-training-dir "$PAISA_TRAINING_RUN_DIR" \
+  --source-assessment docs/HISTORICAL_NEWS_SOURCE_ASSESSMENT.md \
+  --source-permission-policy configs/news/historical_source_permissions.json
+```
+
+The source-bound API is `paisa.news.coverage.verify_coverage_run(...)`; its
+required keyword arguments identify the exact news, vertical-slice, training,
+assessment, database, and policy evidence. A successful result reports
+`verification_basis=SOURCE_EVIDENCE_BOUND` and
+`source_evidence_bound=true`.
+If the sealed references declare a SQLite database or permission policy,
+source-bound verification fails unless that exact input is supplied. If the
+pack measures the optional energy population, also pass the exact external
+versioned contract with `--energy-sector-link-contract`; supplying one for an
+unsupported pack, or omitting one for a supported pack, fails closed.
+
+When source evidence is genuinely unavailable, the deliberately weaker
+sealed-pack check must be requested explicitly:
 
 ```bash
 python scripts/verify_news_coverage.py \
-  --run-dir artifacts/news_coverage/<run_id>
+  --run-dir "$PAISA_COVERAGE_RUN_DIR" \
+  --pack-only
 ```
 
-The same check is available as
-`paisa.news.coverage.verify_coverage_run(run_directory)`. It rejects changed,
-missing, extra, or unsafe files and cross-file identity/configuration drift.
-The seal is an integrity/completion check, not a digital signature or producer
-authentication mechanism.
+Its API is `paisa.news.coverage.verify_coverage_pack(run_directory)`. It checks
+bytes and internal semantic reconciliation, but reports
+`verification_basis=PACK_SEMANTIC` and `source_evidence_bound=false`; it must
+not be described as source-bound correctness or accepted in place of source
+replay. Both modes reject historical schema-`1.0` / v2 packs under current
+code. Neither mode is a digital signature or producer-authentication
+mechanism.
 
 Use the recorded input fingerprints and effective configuration to reproduce
 the same audit from captured evidence without another provider request. A
@@ -337,7 +407,13 @@ The report keeps these populations separate:
 
 General financial news is never reported as OGDC-specific news. The current
 news contract does not infer sectors, so energy-sector coverage is explicitly
-`UNSUPPORTED` rather than guessed from broad keywords.
+`UNSUPPORTED` rather than guessed from broad keywords. A populated
+`mentioned_sectors` field alone cannot enable support: a checksum-bound,
+explicit versioned `EnergySectorLinkContract` is required. Unsupported energy
+counts, percentages, gaps, and readiness inputs are serialized as `null`/empty
+CSV cells, not as measured zeroes. The contract digest covers the exact
+occurrence/article/canonical identities, content hashes, and normalized sector
+lists and is replayed by offline verification.
 
 The final readiness status is one of:
 
@@ -348,8 +424,15 @@ The final readiness status is one of:
 
 The thresholds are explicit configuration for engineering and data-coverage
 gating. They are not proof of sample size, sentiment quality, predictive value,
-or statistical sufficiency. A small amount of overlap must not automatically
-produce `READY_FOR_AGGREGATION`.
+or statistical sufficiency. Configuration validation rejects booleans and
+non-integers for integer fields, requires positive percentage thresholds,
+requires ready thresholds to be at least as strict as partial thresholds, and
+enforces ready floors of `5%` all-news coverage, `1%` OGDC coverage, `1%`
+timestamp completeness, and two distinct sources. A non-configurable guard also
+requires at least two cutoff-eligible covered sessions in every model split for
+both all-news and OGDC. These are engineering sanity floors, not statistical
+power claims; a small amount of overlap cannot be configured as
+`READY_FOR_AGGREGATION`.
 
 Source permission is a separate prerequisite, reported in
 `source_permission_evidence`. Evidence still marked for permission review
@@ -371,22 +454,27 @@ ending September 15, 2026, the existing preflight
 `COVERAGE-20261023-100000-preflight003` correctly reports `NO_OVERLAP`. It
 predates the current coverage completion seal and is descriptive rather than
 the official final. The sealed official RSS audit
-`COVERAGE-20261023-120000-real0002` verifies `PASS` and retains `NO_OVERLAP`; it
-remains separate even if a later permitted historical dataset produces
-publication overlap.
+`COVERAGE-20261023-120000-real0002` verified `PASS` at its producing revision
+and retains `NO_OVERLAP`; it remains separate even if a later permitted
+historical dataset produces publication overlap.
 
-The `news-price-coverage-v2` preflight
+The historical schema-`1.0` / `news-price-coverage-v2` preflight
 `COVERAGE-20261023-110000-gdeltpre1` for
 `NEWS-20261023-060000-gdelt-ogdc2` is also `NO_OVERLAP`, for a different evidence
 profile. Source permission and database
 provenance pass, but ingestion completeness fails because the selected pack is
 `PARTIAL` and records `22` provider errors. With all `published_at` values
 missing and every conservative `available_at` after the price period, the
-publication and availability calendar-overlap ranges are both `null`; all
-all-news, OGDC-linked, and unsupported energy split/population coverage values
-are `0%`. This preflight remains descriptive historical evidence. The sealed
-official `COVERAGE-20261023-130000-gdelt0001` artifact verifies `PASS`, retains
-the same `NO_OVERLAP` readiness result, and does not unblock aggregation.
+publication and availability calendar-overlap ranges are both `null`; all-news
+and OGDC-linked coverage values are `0%`. That historical schema-`1.0` pack also
+stored unsupported energy as `0%`; regeneration under schema `1.1` instead
+emits `null`/`N/A`. This preflight remains descriptive historical evidence. The
+sealed official `COVERAGE-20261023-130000-gdelt0001` artifact verified `PASS`
+at its producing revision, retains the same `NO_OVERLAP` readiness result, and
+does not unblock aggregation. Both retained official packs are schema `1.0` /
+`news-price-coverage-v2`; the current schema-`1.1` /
+`news-price-coverage-v3` semantic verifier requires recomputation under new run
+IDs and intentionally does not certify them.
 
 ## Explicitly out of scope
 

@@ -72,6 +72,22 @@ class, or a disallowed precision is rejected during record reconstruction. GKG
 and PSX records then undergo their additional source-specific provenance
 checks; a label alone cannot opt a record into a more permissive profile.
 
+Profile membership is derived only after those checks. A GKG row is fixed to
+the controlled OGDC ticker and company identity and its source record ID must
+agree with the preserved GKG identity. A PSX row must retain the exact PSX
+source identity, an official `psx.com.pk` URL, the controlled OGDC company and
+ticker, and matching source/contemporaneous IDs. Publisher records use only
+`GENERAL` or `OGDC`: the latter requires a positive OGDC occurrence count and
+complete deterministic entity-link evidence, while a general record must have
+neither. The representative publisher occurrence and raw reference must name
+the same checksum-verified ingestion run. When a canonical article first
+appears as general news and only a later duplicate carries an OGDC entity link,
+the OGDC record uses the earliest OGDC-linked occurrence for its source,
+content, permission, and availability timestamps; it cannot borrow the earlier
+general-news timestamp. Coverage rejects a duplicate
+`(provider_id, provider_mode, source_record_id)` even if it is assigned a new
+PAISA `evidence_id`.
+
 ## Coverage and leakage boundary
 
 Timed records map to the first observed session whose configured market cutoff
@@ -93,6 +109,46 @@ from that recomputation, including any record mapped earlier than its precision
 interval permits. This ECOV check is record-and-calendar replay; the source ZIP
 semantic replay is performed offline by `verify_evidence_run` when it verifies
 the upstream GKG EVID pack.
+
+For every non-empty EVID source, the coverage input reference also carries an
+ordered, checksum-bound record-identity inventory. Each entry records its
+source ordinal and the digest of the full canonical normalized row. Publication
+and portable verification reconstruct the complete canonical JSONL in source
+order and require its digest to equal the upstream EVID
+`normalized_evidence_sha256`; changing even a non-identity field such as a title
+therefore breaks the binding. A zero-record GKG or PSX source must always use
+the SHA-256 of the empty byte stream, whether or not it includes an explicit
+empty identity inventory. Publisher inputs carry the complete canonical
+NEWS artifact inventory whose digest must equal the upstream
+`artifact_inventory_sha256`, plus bounded base64url snapshots of the exact
+`normalized_articles.csv` and `article_entity_links.csv` bytes. Each snapshot's
+size and SHA-256 must match its inventory entry, and the normalized-article
+snapshot must also match `normalized_articles_sha256`. The reference also
+embeds the exact bounded `run_manifest.json` bytes: their digest must equal
+`run_manifest_sha256`, and the manifest's run, provider, mode, status, committed
+state, inventory, and inventory digest must equal the reference. Consequently,
+a resealer cannot replace both CSV snapshots and their inventory while retaining
+the claimed upstream manifest identity.
+
+The portable verifier parses those exact source snapshots, reconstructs NEWS
+occurrences, reruns the shared publisher adapter, and requires the resulting
+records to equal the sealed ECOV publisher records. Representatives are also
+reconciled to their referenced NEWS run, permission decision and occurrence
+counts. Their source metadata includes an ordered identity for every canonical
+occurrence, and every entity link must name the referenced ingestion run and
+article for an OGDC-linked occurrence. This permits legitimate cross-run
+canonical duplicates without allowing a synthetic link, title, or label to opt
+into OGDC coverage even if an attacker reseals the adapted-record inventory.
+The retained demonstration pack predates these bindings; portable verification
+upgrades only its exact known run/manifest hash in memory. All newly published
+packs must carry the strengthened contract. These checks are portable
+identity/provenance replay, not a replacement for verifying the upstream raw
+NEWS artifact at initial ingestion.
+
+These larger portable snapshots are opt-in at the NEWS loader boundary and are
+enabled by the contemporaneous-evidence audit only. Ordinary news coverage
+continues to use its existing run-reference schema, avoiding an unrelated
+artifact-schema change for existing coverage packs.
 
 Coverage is reported independently for GKG OGDC metadata, PSX OGDC
 announcements, their combined OGDC union, and general publisher news when

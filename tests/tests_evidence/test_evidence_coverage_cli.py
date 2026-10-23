@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -34,11 +35,18 @@ def _occurrence(
     fetched_at: datetime,
     available_at: datetime,
     ogdc: bool,
+    run_id: str = "NEWS-20260101-000000-test0001",
 ) -> NewsOccurrence:
+    article_id = f"ARTICLE-{key}"
+    link_id = "NEWSLINK-" + hashlib.sha256(
+        "\0".join((article_id, "OGDC", "OGDC", "title", "exact")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
     return NewsOccurrence(
-        occurrence_key=key,
-        ingestion_run_id="NEWS-20260101-000000-test0001",
-        article_id=f"ARTICLE-{key}",
+        occurrence_key=f"{run_id}:{article_id}",
+        ingestion_run_id=run_id,
+        article_id=article_id,
         canonical_article_id=canonical,
         provider="gdelt-doc",
         provider_mode="real",
@@ -60,9 +68,14 @@ def _occurrence(
         entity_links=(
             (
                 {
+                    "link_id": link_id,
+                    "article_id": article_id,
                     "ticker": "OGDC",
-                    "article_id": f"ARTICLE-{key}",
-                    "link_id": f"LINK-{key}",
+                    "company_name": "Oil and Gas Development Company Limited",
+                    "matched_alias": "OGDC",
+                    "match_method": "exact",
+                    "match_location": "title",
+                    "confidence": "exact",
                 },
             )
             if ogdc
@@ -72,16 +85,18 @@ def _occurrence(
 
 
 def _news(*occurrences: NewsOccurrence) -> NewsEvidence:
+    run_ids = sorted({item.ingestion_run_id for item in occurrences})
     return NewsEvidence(
         occurrences=occurrences,
-        run_references=(
+        run_references=tuple(
             {
-                "run_id": "NEWS-20260101-000000-test0001",
+                "run_id": run_id,
                 "source_permission_decision": {
                     "passed": True,
                     "decision_id": "fixture-permission-v1",
                 },
-            },
+            }
+            for run_id in run_ids
         ),
         database_fingerprints={"provided": False, "files": []},
     )
@@ -115,6 +130,75 @@ def test_publisher_adapter_deduplicates_and_preserves_ogdc_link() -> None:
     assert records[0].source_metadata["occurrence_count"] == 2
     assert records[0].source_metadata["ogdc_occurrence_count"] == 1
     assert records[0].entity_match_evidence[0]["ticker"] == "OGDC"
+    assert records[0].entity_match_evidence[0]["ingestion_run_id"] == (
+        "NEWS-20260101-000000-test0001"
+    )
+    assert records[0].available_at == instant + timedelta(minutes=1)
+    assert records[0].fetched_at == instant + timedelta(minutes=1)
+    assert records[0].content_sha256 == "b" * 64
+    assert records[0].raw_evidence_reference.endswith("raw/second.json")
+    assert records[0].source_metadata["representative_occurrence_key"].endswith(
+        ":ARTICLE-second"
+    )
+
+
+def test_publisher_adapter_preserves_cross_run_occurrence_link_identity() -> None:
+    module = _load_audit_module()
+    instant = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+    first_run = "NEWS-20260101-000000-test0001"
+    linked_run = "NEWS-20260102-000000-test0002"
+    news = _news(
+        _occurrence(
+            key="first",
+            canonical="CANONICAL-CROSS-RUN",
+            fetched_at=instant,
+            available_at=instant,
+            ogdc=False,
+            run_id=first_run,
+        ),
+        _occurrence(
+            key="linked",
+            canonical="CANONICAL-CROSS-RUN",
+            fetched_at=instant + timedelta(minutes=1),
+            available_at=instant + timedelta(minutes=1),
+            ogdc=True,
+            run_id=linked_run,
+        ),
+    )
+    news = NewsEvidence(
+        occurrences=news.occurrences,
+        run_references=(
+            {
+                "run_id": first_run,
+                "source_permission_decision": {
+                    "passed": True,
+                    "decision_id": "general-run-permission",
+                },
+            },
+            {
+                "run_id": linked_run,
+                "source_permission_decision": {
+                    "passed": True,
+                    "decision_id": "linked-run-permission",
+                },
+            },
+        ),
+        database_fingerprints=news.database_fingerprints,
+    )
+
+    record = module.adapt_publisher_news(news)[0]
+
+    assert record.source_metadata["representative_occurrence_key"].startswith(
+        f"{linked_run}:"
+    )
+    assert record.available_at == instant + timedelta(minutes=1)
+    assert record.raw_evidence_reference.startswith(f"news_ingestion/{linked_run}/")
+    assert record.permission_policy_id == "linked-run-permission"
+    assert record.entity_match_evidence[0]["ingestion_run_id"] == linked_run
+    assert {
+        item["ingestion_run_id"]
+        for item in record.source_metadata["occurrence_identities"]
+    } == {first_run, linked_run}
 
 
 def test_publisher_adapter_rejects_historical_backdating() -> None:

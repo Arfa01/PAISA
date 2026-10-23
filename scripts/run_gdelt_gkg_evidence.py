@@ -18,6 +18,7 @@ from paisa.evidence.artifacts import (  # noqa: E402
     publish_evidence_run,
     verify_evidence_run,
 )
+from paisa.evidence.artifact_security import prepare_output_root  # noqa: E402
 from paisa.evidence.gdelt_gkg import GdeltGkgArchiveProvider  # noqa: E402
 from paisa.evidence.policy import load_evidence_permission_policy  # noqa: E402
 from paisa.sentiment.artifacts import logical_storage_label  # noqa: E402
@@ -30,6 +31,21 @@ def _artifact_directory_label(destination: Path) -> str:
         kind="evidence",
     )
     return f"{parent}/{destination.name}"
+
+
+def _prepare_checkpoint_directory(
+    directory: str | Path,
+    *,
+    repository_root: str | Path = REPOSITORY_ROOT,
+) -> Path:
+    """Require repository-local raw checkpoints to be ignored and untracked."""
+
+    return prepare_output_root(
+        directory,
+        repository_root=repository_root,
+        error_type=ValueError,
+        label="GDELT GKG checkpoint root",
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -97,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
             / "gdelt_gkg_checkpoints"
             / config_path.stem
         )
+    if checkpoint_directory is not None:
+        checkpoint_directory = _prepare_checkpoint_directory(checkpoint_directory)
     provider = GdeltGkgArchiveProvider.from_config(
         config_path,
         permission_policy=policy,

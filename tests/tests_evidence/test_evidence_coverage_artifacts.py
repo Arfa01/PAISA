@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import csv
 from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -19,11 +21,13 @@ from paisa.evidence.coverage_artifacts import (
     EvidenceCoverageRunCollisionError,
     EvidenceCoverageVerificationError,
     _git_provenance,
+    adapt_publisher_occurrences,
+    make_record_identity_inventory,
     publish_evidence_coverage_run,
     verify_evidence_coverage_pack,
 )
 from paisa.evidence.models import EvidenceRecord
-from paisa.news.coverage import CoverageConfig, StockEvidence
+from paisa.news.coverage import CoverageConfig, NewsOccurrence, StockEvidence
 from paisa.sentiment.artifacts import regular_file_inventory
 
 
@@ -119,6 +123,18 @@ def _permission_reference() -> dict[str, object]:
 def _input_references(
     *, include_sensitive_extras: bool = False, gdelt_record_count: int = 3
 ):
+    if gdelt_record_count == 0:
+        identity_records: tuple[EvidenceRecord, ...] = ()
+    else:
+        identity_records = _computation().source_records
+        if gdelt_record_count == 4:
+            identity_records = (
+                *identity_records,
+                _gkg("gkg-extra-reference", _at("2024-01-08")),
+            )
+        elif gdelt_record_count != 3:
+            raise AssertionError("Unsupported fixture GDELT record count")
+    identity_inventory = make_record_identity_inventory(identity_records)
     gdelt = {
         "input_kind": "gdelt_gkg",
         "run_id": "EVID-20261023-110000-feedface",
@@ -130,9 +146,12 @@ def _input_references(
         "capture_count": 1,
         "manifest_sha256": "8" * 64,
         "payload_inventory_sha256": "9" * 64,
-        "normalized_evidence_sha256": "a" * 64,
+        "normalized_evidence_sha256": identity_inventory[
+            "canonical_jsonl_sha256"
+        ],
         "artifact_reference": "evidence/EVID-20261023-110000-feedface",
         "permission_policy_reference": _permission_reference(),
+        "record_identity_inventory": identity_inventory,
     }
     if include_sensitive_extras:
         gdelt.update(
@@ -228,6 +247,326 @@ def _gkg(identifier: str, available_at: datetime) -> EvidenceRecord:
     )
 
 
+def _general_publisher(identifier: str, available_at: datetime) -> EvidenceRecord:
+    run_id = "NEWS-20240101-000000-coverage"
+    article_id = f"ARTICLE-{identifier}"
+    evidence_identity = hashlib.sha256(
+        (identifier + "\0" + f"{run_id}:{article_id}").encode("utf-8")
+    ).hexdigest()[:24]
+    return EvidenceRecord(
+        evidence_id=f"EVID-NEWS-{evidence_identity}",
+        evidence_type="publisher_news",
+        provider_id="rss",
+        provider_mode="real",
+        data_class="real",
+        source_name="Example News",
+        source_url="https://example.com/news",
+        source_record_id=identifier,
+        ticker="GENERAL",
+        company_name="General financial news",
+        title="Financial news",
+        source_published_at=available_at,
+        source_published_date=None,
+        available_at=available_at,
+        fetched_at=available_at,
+        imported_at=available_at,
+        historical_availability_basis="news-availability-v1-conservative-acquisition",
+        time_precision="second",
+        contemporaneous_source_id=identifier,
+        contemporaneous_batch_at=None,
+        permission_policy_id="publisher-permission-v1",
+        raw_evidence_reference=f"news_ingestion/{run_id}/feed.xml#{identifier}",
+        content_sha256="d" * 64,
+        source_metadata={
+            "canonical_article_id": identifier,
+            "representative_occurrence_key": f"{run_id}:{article_id}",
+            "occurrence_count": 1,
+            "ogdc_occurrence_count": 0,
+            "occurrence_identities": [
+                {
+                    "occurrence_ordinal": 0,
+                    "occurrence_key": f"{run_id}:{article_id}",
+                    "ingestion_run_id": run_id,
+                    "article_id": article_id,
+                    "canonical_article_id": identifier,
+                    "content_sha256": "d" * 64,
+                    "is_ogdc": False,
+                }
+            ],
+            "source_observed_at": None,
+        },
+    )
+
+
+def _publisher_input_reference(
+    records: tuple[EvidenceRecord, ...] | None = None,
+    *,
+    source_occurrences: tuple[NewsOccurrence, ...] = (),
+) -> dict[str, object]:
+    adapted_records = records or (
+        _general_publisher("publisher-general", _at("2024-01-05")),
+    )
+    inventory = make_record_identity_inventory(adapted_records)
+    sources_by_key = {item.occurrence_key: item for item in source_occurrences}
+    occurrences_by_run: dict[
+        str,
+        list[tuple[EvidenceRecord, dict[str, object], NewsOccurrence | None]],
+    ] = {}
+    for record in adapted_records:
+        for occurrence in record.source_metadata["occurrence_identities"]:
+            run_id = str(occurrence["ingestion_run_id"])
+            key = str(occurrence["occurrence_key"])
+            source = sources_by_key.get(key)
+            if source_occurrences and source is None:
+                raise AssertionError("Missing source occurrence for publisher fixture")
+            occurrences_by_run.setdefault(run_id, []).append(
+                (record, occurrence, source)
+            )
+
+    article_fields = (
+        "schema_version",
+        "article_id",
+        "raw_record_id",
+        "provider",
+        "source_name",
+        "source_type",
+        "source_url",
+        "canonical_url",
+        "title",
+        "summary",
+        "body",
+        "published_at",
+        "published_timezone",
+        "source_observed_at",
+        "available_at",
+        "fetched_at",
+        "language",
+        "mentioned_tickers",
+        "mentioned_companies",
+        "mentioned_sectors",
+        "content_sha256",
+        "duplicate_of",
+        "ingestion_run_id",
+        "raw_artifact_reference",
+        "normalization_warnings",
+        "data_class",
+    )
+    link_fields = (
+        "link_id",
+        "article_id",
+        "ticker",
+        "company_name",
+        "matched_alias",
+        "match_method",
+        "match_location",
+        "confidence",
+    )
+
+    def csv_payload(fields, rows):
+        stream = io.StringIO(newline="")
+        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        return stream.getvalue().encode("utf-8")
+
+    run_references: list[dict[str, object]] = []
+    for run_id, occurrence_records in sorted(occurrences_by_run.items()):
+        article_rows = []
+        link_rows = []
+        raw_references: set[str] = set()
+        for record, occurrence, source in occurrence_records:
+            article_id = str(occurrence["article_id"])
+            if source is not None:
+                row_links = [dict(link) for link in source.entity_links]
+            else:
+                row_links = [
+                    dict(link)
+                    for link in record.entity_match_evidence
+                    if link.get("ingestion_run_id") == run_id
+                    and link.get("article_id") == article_id
+                ]
+            link_rows.extend(
+                {field: link[field] for field in link_fields} for link in row_links
+            )
+            prefix = f"news_ingestion/{run_id}/"
+            if source is not None:
+                raw_reference = source.raw_artifact_reference
+            elif record.raw_evidence_reference.startswith(prefix):
+                raw_reference = record.raw_evidence_reference[len(prefix) :]
+            else:
+                raw_reference = f"raw/{article_id}.json"
+            raw_references.add(raw_reference)
+            article_rows.append(
+                {
+                    "schema_version": "1.1",
+                    "article_id": article_id,
+                    "raw_record_id": f"RAW-{article_id}",
+                    "provider": source.provider if source else record.provider_id,
+                    "source_name": source.source_name if source else record.source_name,
+                    "source_type": "publisher",
+                    "source_url": (
+                        source.source_url if source else record.source_url
+                    ) or "",
+                    "canonical_url": (
+                        source.source_url if source else record.source_url
+                    ) or "",
+                    "title": (source.title if source else record.title) or "",
+                    "summary": "",
+                    "body": "",
+                    "published_at": (
+                        (source.published_at if source else record.source_published_at).isoformat()
+                        if (source.published_at if source else record.source_published_at)
+                        else ""
+                    ),
+                    "published_timezone": (
+                        source.published_timezone if source else "UTC"
+                    ) or "",
+                    "source_observed_at": (
+                        source.source_observed_at.isoformat()
+                        if source is not None and source.source_observed_at
+                        else record.source_metadata.get("source_observed_at") or ""
+                    ),
+                    "available_at": (
+                        (source.available_at if source else record.available_at).isoformat()
+                        if (source.available_at if source else record.available_at)
+                        else ""
+                    ),
+                    "fetched_at": (
+                        source.fetched_at.isoformat()
+                        if source is not None and source.fetched_at
+                        else record.fetched_at.isoformat()
+                    ),
+                    "language": (source.language if source else record.language) or "",
+                    "mentioned_tickers": json.dumps(
+                        sorted(source.tickers)
+                        if source is not None
+                        else sorted({link["ticker"] for link in row_links})
+                    ),
+                    "mentioned_companies": json.dumps(
+                        sorted(source.companies)
+                        if source is not None
+                        else sorted({link["company_name"] for link in row_links})
+                    ),
+                    "mentioned_sectors": json.dumps(
+                        sorted(source.sectors) if source is not None else []
+                    ),
+                    "content_sha256": (
+                        source.content_sha256
+                        if source is not None
+                        else str(occurrence["content_sha256"])
+                    ),
+                    "duplicate_of": (
+                        source.duplicate_of
+                        if source is not None
+                        else str(occurrence["canonical_article_id"])
+                    ) or "",
+                    "ingestion_run_id": run_id,
+                    "raw_artifact_reference": raw_reference,
+                    "normalization_warnings": "[]",
+                    "data_class": source.data_class if source else record.data_class,
+                }
+            )
+        article_payload = csv_payload(article_fields, article_rows)
+        link_payload = csv_payload(link_fields, link_rows)
+        payloads = {
+            "article_entity_links.csv": link_payload,
+            "normalized_articles.csv": article_payload,
+            **{raw: b"fixture raw evidence\n" for raw in raw_references},
+        }
+        artifact_inventory = [
+            {
+                "path": path,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+            for path, payload in sorted(payloads.items())
+        ]
+        inventory_sha256 = hashlib.sha256(
+            json.dumps(
+                artifact_inventory,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        source_snapshots = [
+            {
+                "path": path,
+                "encoding": "base64url",
+                "sha256": hashlib.sha256(payloads[path]).hexdigest(),
+                "size_bytes": len(payloads[path]),
+                "content_base64": base64.urlsafe_b64encode(payloads[path]).decode(
+                    "ascii"
+                ),
+            }
+            for path in ("article_entity_links.csv", "normalized_articles.csv")
+        ]
+        record = occurrence_records[0][0]
+        run_manifest_payload = (
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "run_id": run_id,
+                    "status": "PASS",
+                    "provider": record.provider_id,
+                    "provider_mode": record.provider_mode,
+                    "finalization_state": "COMMITTED",
+                    "completion_marker": "completion.json",
+                    "artifact_inventory": artifact_inventory,
+                    "artifact_inventory_sha256": inventory_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        run_manifest_sha256 = hashlib.sha256(run_manifest_payload).hexdigest()
+        run_references.append(
+            {
+                "run_id": run_id,
+                "status": "PASS",
+                "provider": record.provider_id,
+                "provider_mode": record.provider_mode,
+                "run_manifest_sha256": run_manifest_sha256,
+                "artifact_inventory_sha256": inventory_sha256,
+                "normalized_articles_sha256": hashlib.sha256(
+                    article_payload
+                ).hexdigest(),
+                "occurrence_count": len(occurrence_records),
+                "artifact_reference": f"news_ingestion/{run_id}",
+                "artifact_inventory": artifact_inventory,
+                "source_snapshots": source_snapshots,
+                "run_manifest_snapshot": {
+                    "path": "run_manifest.json",
+                    "encoding": "base64url",
+                    "sha256": run_manifest_sha256,
+                    "size_bytes": len(run_manifest_payload),
+                    "content_base64": base64.urlsafe_b64encode(
+                        run_manifest_payload
+                    ).decode("ascii"),
+                },
+                "source_permission_decision": {
+                    "passed": True,
+                    "status": "PERMITTED",
+                    "decision_id": record.permission_policy_id,
+                },
+            }
+        )
+    return {
+        "input_kind": "publisher_news",
+        "status": "LOADED",
+        "record_count": len(adapted_records),
+        "run_references": run_references,
+        "database_fingerprints": {"provided": False, "files": []},
+        "permission_policy_reference": _permission_reference(),
+        "adapted_records_sha256": inventory["canonical_jsonl_sha256"],
+        "adapted_record_inventory": inventory,
+    }
+
+
 def _computation():
     records = (
         _gkg("gkg-train", _at("2024-01-01")),
@@ -302,6 +641,35 @@ def _reseal_payload(pack: Path) -> None:
     completion["summary_size_bytes"] = summary_path.stat().st_size
     completion["payload_artifact_inventory_sha256"] = inventory_digest
     _rewrite_json(completion_path, completion)
+
+
+def _reseal_input_reference(pack: Path) -> None:
+    reference_path = pack / "input_evidence_reference.json"
+    stock_path = pack / "stock_artifact_reference.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    stock = json.loads(stock_path.read_text(encoding="utf-8"))
+    reference_sha256 = sha256_file(reference_path)
+    fingerprint_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "input_references": reference,
+                "stock_reference": stock,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    summary_path = pack / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["input_evidence_reference_sha256"] = reference_sha256
+    _rewrite_json(summary_path, summary)
+    manifest_path = pack / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["input_evidence_reference_sha256"] = reference_sha256
+    manifest["input_fingerprint_sha256"] = fingerprint_sha256
+    _rewrite_json(manifest_path, manifest)
 
 
 def test_publish_verify_private_flat_pack_and_redact_references(
@@ -438,6 +806,328 @@ def test_resealed_source_reference_without_checksum_is_rejected(
         match="manifest_sha256",
     ):
         verify_evidence_coverage_pack(pack)
+
+
+def test_publication_rejects_unbound_upstream_record_identity_inventory(
+    tmp_path: Path,
+) -> None:
+    references = list(_input_references())
+    gdelt = dict(references[0])
+    empty_records: list[dict[str, str]] = []
+    gdelt["record_identity_inventory"] = {
+        "schema_version": "1.0",
+        "algorithm": "sha256",
+        "records": empty_records,
+        "sha256": hashlib.sha256(
+            json.dumps(
+                empty_records,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    references[0] = gdelt
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="record identity|identity inventory|record_identity_inventory",
+    ):
+        publish_evidence_coverage_run(
+            _computation(),
+            output_root=tmp_path / "coverage",
+            input_references=references,
+            stock_reference=_stock().reference,
+            repository_root=tmp_path,
+            run_id="ECOV-20261023-120032-unbound1",
+        )
+
+
+@pytest.mark.parametrize("input_kind", ("gdelt_gkg", "psx_announcement_evidence"))
+@pytest.mark.parametrize("inventory_present", (False, True))
+def test_zero_record_source_requires_empty_jsonl_digest_even_with_inventory(
+    tmp_path: Path,
+    input_kind: str,
+    inventory_present: bool,
+) -> None:
+    record = _general_publisher("publisher-empty-source", _at("2024-01-05"))
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = _publisher_input_reference((record,))
+    forged_empty_inventory = make_record_identity_inventory(())
+    forged_empty_inventory["canonical_jsonl_sha256"] = "a" * 64
+    inventory_document = {
+        key: value
+        for key, value in forged_empty_inventory.items()
+        if key != "sha256"
+    }
+    forged_empty_inventory["sha256"] = hashlib.sha256(
+        json.dumps(
+            inventory_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if input_kind == "gdelt_gkg":
+        source = dict(references[0])
+        if inventory_present:
+            source["record_identity_inventory"] = forged_empty_inventory
+        else:
+            source.pop("record_identity_inventory")
+        source["normalized_evidence_sha256"] = "a" * 64
+        references[0] = source
+    else:
+        psx = dict(references[1])
+        psx.update(
+            {
+                "status": "LOADED",
+                "record_count": 0,
+                "run_reference": {
+                    "run_id": "EVID-20261023-110001-psxempty",
+                    "provider_id": "psx-announcement",
+                    "provider_mode": "manual_import",
+                    "status": "PASS",
+                    "record_count": 0,
+                    "capture_count": 1,
+                    "manifest_sha256": "8" * 64,
+                    "payload_inventory_sha256": "9" * 64,
+                    "normalized_evidence_sha256": "a" * 64,
+                    "artifact_reference": (
+                        "evidence/EVID-20261023-110001-psxempty"
+                    ),
+                    **(
+                        {"record_identity_inventory": forged_empty_inventory}
+                        if inventory_present
+                        else {}
+                    ),
+                },
+            }
+        )
+        references[1] = psx
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="empty source",
+    ):
+        publish_evidence_coverage_run(
+            compute_evidence_coverage(
+                (record,),
+                _stock(),
+                CoverageConfig(),
+            ),
+            output_root=tmp_path / "coverage",
+            input_references=references,
+            stock_reference=_stock().reference,
+            repository_root=tmp_path,
+            run_id=(
+                "ECOV-20261023-120036-emptygkg"
+                if input_kind == "gdelt_gkg"
+                else "ECOV-20261023-120037-emptypsx"
+            ),
+        )
+
+
+def test_resealed_title_only_mutation_breaks_upstream_jsonl_binding(
+    tmp_path: Path,
+) -> None:
+    pack = _publish(
+        tmp_path,
+        run_id="ECOV-20261023-120034-title001",
+    )
+    evidence_path = pack / "normalized_evidence.jsonl"
+    rows = [
+        json.loads(line)
+        for line in evidence_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[0]["title"] = "A title absent from the upstream EVID artifact"
+    evidence_path.write_text(
+        "".join(
+            json.dumps(
+                row,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(evidence_path, 0o600)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="identity inventory|checksum-bound source JSONL",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_resealed_record_and_inventory_cannot_rebind_upstream_jsonl(
+    tmp_path: Path,
+) -> None:
+    pack = _publish(
+        tmp_path,
+        run_id="ECOV-20261023-120035-rebind01",
+    )
+    evidence_path = pack / "normalized_evidence.jsonl"
+    rows = [
+        json.loads(line)
+        for line in evidence_path.read_text(encoding="utf-8").splitlines()
+    ]
+    old_id = rows[0]["evidence_id"]
+    rows[0]["evidence_id"] = f"{old_id}-forged"
+    evidence_path.write_text(
+        "".join(
+            json.dumps(
+                row,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(evidence_path, 0o600)
+
+    reference_path = pack / "input_evidence_reference.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    inventory = reference["inputs"][0]["record_identity_inventory"]
+    entry = next(
+        item for item in inventory["records"] if item["evidence_id"] == old_id
+    )
+    entry["evidence_id"] = rows[0]["evidence_id"]
+    canonical_row = json.dumps(
+        rows[0],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    entry["normalized_record_sha256"] = hashlib.sha256(
+        canonical_row
+    ).hexdigest()
+    inventory_document = {
+        key: value for key, value in inventory.items() if key != "sha256"
+    }
+    inventory["sha256"] = hashlib.sha256(
+        json.dumps(
+            inventory_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    _rewrite_json(reference_path, reference)
+    _reseal_input_reference(pack)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="checksum-bound source JSONL",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_publication_rejects_publisher_link_from_unreferenced_run(
+    tmp_path: Path,
+) -> None:
+    general = _general_publisher("publisher-linked", _at("2024-01-05"))
+    article_id = "ARTICLE-linked"
+    link_id = "NEWSLINK-" + hashlib.sha256(
+        "\0".join((article_id, "OGDC", "OGDC", "title", "exact")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    linked = replace(
+        general,
+        ticker="OGDC",
+        company_name="Oil and Gas Development Company Limited",
+        raw_evidence_reference=(
+            "news_ingestion/NEWS-20240103-000000-unreferenced/"
+            "feed.xml#publisher-linked"
+        ),
+        entity_match_evidence=(
+            {
+                "ingestion_run_id": "NEWS-20240103-000000-unreferenced",
+                "link_id": link_id,
+                "article_id": article_id,
+                "ticker": "OGDC",
+                "company_name": "Oil and Gas Development Company Limited",
+                "matched_alias": "OGDC",
+                "match_method": "exact",
+                "match_location": "title",
+                "confidence": "exact",
+            },
+        ),
+        source_metadata={
+            **general.source_metadata,
+            "representative_occurrence_key": (
+                "NEWS-20240103-000000-unreferenced:ARTICLE-linked"
+            ),
+            "occurrence_count": 2,
+            "ogdc_occurrence_count": 1,
+            "occurrence_identities": [
+                {
+                    "occurrence_ordinal": 0,
+                    "occurrence_key": (
+                        "NEWS-20240103-000000-unreferenced:ARTICLE-linked"
+                    ),
+                    "ingestion_run_id": (
+                        "NEWS-20240103-000000-unreferenced"
+                    ),
+                    "article_id": article_id,
+                    "canonical_article_id": "publisher-linked",
+                    "content_sha256": "d" * 64,
+                    "is_ogdc": True,
+                },
+                {
+                    "occurrence_ordinal": 1,
+                    "occurrence_key": (
+                        "NEWS-20240101-000000-coverage:"
+                        "ARTICLE-publisher-linked"
+                    ),
+                    "ingestion_run_id": "NEWS-20240101-000000-coverage",
+                    "article_id": "ARTICLE-publisher-linked",
+                    "canonical_article_id": "publisher-linked",
+                    "content_sha256": "d" * 64,
+                    "is_ogdc": False,
+                },
+            ],
+        },
+    )
+    publisher = _publisher_input_reference((linked,))
+    publisher["run_references"] = [
+        run
+        for run in publisher["run_references"]
+        if run["run_id"] != "NEWS-20240103-000000-unreferenced"
+    ]
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = publisher
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="checksum-bound NEWS snapshots|upstream run identity",
+    ):
+        publish_evidence_coverage_run(
+            compute_evidence_coverage(
+                (linked,),
+                _stock(),
+                CoverageConfig(),
+            ),
+            output_root=tmp_path / "coverage",
+            input_references=references,
+            stock_reference=_stock().reference,
+            repository_root=tmp_path,
+            run_id="ECOV-20261023-120033-linkrun1",
+        )
 
 
 def test_resealed_embedded_private_path_is_rejected(tmp_path: Path) -> None:
@@ -604,7 +1294,10 @@ def test_duplicate_evidence_id_failure_is_unpublished_and_run_id_is_reusable(
 
     with pytest.raises(
         EvidenceCoverageVerificationError,
-        match="identities are not canonical and unique",
+        match=(
+            "identities are not canonical and unique|record identity inventory|"
+            "identities are duplicated"
+        ),
     ):
         publish_evidence_coverage_run(
             duplicated,
@@ -688,6 +1381,12 @@ def test_resealed_mapping_labels_cannot_override_record_calendar_recomputation(
         ),
         ("data_class", "imported", "ECOV-20261023-120022-class001"),
         ("time_precision", "minute", "ECOV-20261023-120023-precis01"),
+        ("ticker", "GENERAL", "ECOV-20261023-120024-ticker01"),
+        (
+            "contemporaneous_source_id",
+            "20240101090000-999",
+            "ECOV-20261023-120025-source01",
+        ),
     ],
 )
 def test_resealed_unknown_or_mismatched_provider_contract_is_rejected(
@@ -721,6 +1420,325 @@ def test_resealed_unknown_or_mismatched_provider_contract_is_rejected(
         EvidenceCoverageVerificationError, match="evidence contract failed"
     ):
         verify_evidence_coverage_pack(pack)
+
+
+def test_resealed_general_publisher_label_cannot_spoof_ogdc_membership(
+    tmp_path: Path,
+) -> None:
+    record = _general_publisher("publisher-general", _at("2024-01-05"))
+    computation = compute_evidence_coverage(
+        (record,),
+        _stock(),
+        CoverageConfig(),
+    )
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = _publisher_input_reference()
+    pack = publish_evidence_coverage_run(
+        computation,
+        output_root=tmp_path / "coverage",
+        input_references=references,
+        stock_reference=_stock().reference,
+        repository_root=tmp_path,
+        run_id="ECOV-20261023-120026-label001",
+    )
+    assert verify_evidence_coverage_pack(pack).mapping_count == 1
+
+    evidence_path = pack / "normalized_evidence.jsonl"
+    row = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert row["source_metadata"]["ogdc_occurrence_count"] == 0
+    assert row["entity_match_evidence"] == []
+    row["ticker"] = "OGDC"
+    row["company_name"] = "Oil and Gas Development Company Limited"
+    evidence_path.write_text(
+        json.dumps(
+            row,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(evidence_path, 0o600)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="evidence contract failed",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_fully_resealed_publisher_link_cannot_rebind_news_source_snapshots(
+    tmp_path: Path,
+) -> None:
+    record = _general_publisher("publisher-general", _at("2024-01-05"))
+    computation = compute_evidence_coverage(
+        (record,),
+        _stock(),
+        CoverageConfig(),
+    )
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = _publisher_input_reference((record,))
+    pack = publish_evidence_coverage_run(
+        computation,
+        output_root=tmp_path / "coverage",
+        input_references=references,
+        stock_reference=_stock().reference,
+        repository_root=tmp_path,
+        run_id="ECOV-20261023-120027-linkseal",
+    )
+
+    evidence_path = pack / "normalized_evidence.jsonl"
+    row = json.loads(evidence_path.read_text(encoding="utf-8"))
+    occurrence = row["source_metadata"]["occurrence_identities"][0]
+    article_id = occurrence["article_id"]
+    run_id = occurrence["ingestion_run_id"]
+    link_id = "NEWSLINK-" + hashlib.sha256(
+        "\0".join((article_id, "OGDC", "OGDC", "title", "exact")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    row["ticker"] = "OGDC"
+    row["company_name"] = "Oil and Gas Development Company Limited"
+    row["source_metadata"]["ogdc_occurrence_count"] = 1
+    occurrence["is_ogdc"] = True
+    row["entity_match_evidence"] = [
+        {
+            "ingestion_run_id": run_id,
+            "link_id": link_id,
+            "article_id": article_id,
+            "ticker": "OGDC",
+            "company_name": "Oil and Gas Development Company Limited",
+            "matched_alias": "OGDC",
+            "match_method": "exact",
+            "match_location": "title",
+            "confidence": "exact",
+        }
+    ]
+    evidence_path.write_text(
+        json.dumps(
+            row,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(evidence_path, 0o600)
+
+    reference_path = pack / "input_evidence_reference.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    publisher = next(
+        item
+        for item in reference["inputs"]
+        if item["input_kind"] == "publisher_news"
+    )
+    forged_inventory = make_record_identity_inventory(
+        (EvidenceRecord.from_dict(row),)
+    )
+    publisher["adapted_records_sha256"] = forged_inventory[
+        "canonical_jsonl_sha256"
+    ]
+    publisher["adapted_record_inventory"] = forged_inventory
+    _rewrite_json(reference_path, reference)
+    _reseal_input_reference(pack)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="checksum-bound NEWS snapshots",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_resealed_news_snapshots_cannot_rebind_original_run_manifest(
+    tmp_path: Path,
+) -> None:
+    record = _general_publisher("publisher-general", _at("2024-01-05"))
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = _publisher_input_reference((record,))
+    pack = publish_evidence_coverage_run(
+        compute_evidence_coverage((record,), _stock(), CoverageConfig()),
+        output_root=tmp_path / "coverage",
+        input_references=references,
+        stock_reference=_stock().reference,
+        repository_root=tmp_path,
+        run_id="ECOV-20261023-120038-manifest",
+    )
+
+    reference_path = pack / "input_evidence_reference.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    publisher = next(
+        item
+        for item in reference["inputs"]
+        if item["input_kind"] == "publisher_news"
+    )
+    run = publisher["run_references"][0]
+    original_manifest_identity = run["run_manifest_sha256"]
+    original_manifest_snapshot = dict(run["run_manifest_snapshot"])
+    snapshot = next(
+        item
+        for item in run["source_snapshots"]
+        if item["path"] == "normalized_articles.csv"
+    )
+    source = base64.urlsafe_b64decode(snapshot["content_base64"])
+    with io.StringIO(source.decode("utf-8"), newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = tuple(reader.fieldnames or ())
+        rows = list(reader)
+    rows[0]["title"] = "Forged title outside the retained NEWS manifest"
+    changed = io.StringIO(newline="")
+    writer = csv.DictWriter(changed, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    changed_payload = changed.getvalue().encode("utf-8")
+    changed_sha = hashlib.sha256(changed_payload).hexdigest()
+    snapshot.update(
+        {
+            "sha256": changed_sha,
+            "size_bytes": len(changed_payload),
+            "content_base64": base64.urlsafe_b64encode(changed_payload).decode(
+                "ascii"
+            ),
+        }
+    )
+    inventory_entry = next(
+        item
+        for item in run["artifact_inventory"]
+        if item["path"] == "normalized_articles.csv"
+    )
+    inventory_entry.update(
+        {"sha256": changed_sha, "size_bytes": len(changed_payload)}
+    )
+    run["normalized_articles_sha256"] = changed_sha
+    run["artifact_inventory_sha256"] = hashlib.sha256(
+        json.dumps(
+            run["artifact_inventory"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert run["run_manifest_sha256"] == original_manifest_identity
+    assert run["run_manifest_snapshot"] == original_manifest_snapshot
+    _rewrite_json(reference_path, reference)
+    _reseal_input_reference(pack)
+    _reseal_payload(pack)
+
+    with pytest.raises(
+        EvidenceCoverageVerificationError,
+        match="not bound to its run manifest",
+    ):
+        verify_evidence_coverage_pack(pack)
+
+
+def test_portable_publisher_link_uses_first_linked_availability_session(
+    tmp_path: Path,
+) -> None:
+    canonical_id = "CANONICAL-DELAYED-OGDC"
+    general_run = "NEWS-20240101-000000-general"
+    linked_run = "NEWS-20240103-000000-linked"
+    linked_article = "ARTICLE-LINKED"
+    link_id = "NEWSLINK-" + hashlib.sha256(
+        "\0".join(
+            (linked_article, "OGDC", "OGDC", "title", "exact")
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    general = NewsOccurrence(
+        occurrence_key=f"{general_run}:ARTICLE-GENERAL",
+        ingestion_run_id=general_run,
+        article_id="ARTICLE-GENERAL",
+        canonical_article_id=canonical_id,
+        provider="rss",
+        provider_mode="real",
+        source_name="Example News",
+        source_url="https://example.com/general",
+        title="General market story",
+        published_at=_at("2024-01-01"),
+        available_at=_at("2024-01-01"),
+        fetched_at=_at("2024-01-01"),
+        published_timezone="UTC",
+        language="english",
+        tickers=(),
+        companies=(),
+        sectors=(),
+        content_sha256="d" * 64,
+        raw_artifact_reference="raw/general.json",
+        data_class="real",
+        duplicate_of=canonical_id,
+        entity_links=(),
+    )
+    linked = NewsOccurrence(
+        occurrence_key=f"{linked_run}:{linked_article}",
+        ingestion_run_id=linked_run,
+        article_id=linked_article,
+        canonical_article_id=canonical_id,
+        provider="rss",
+        provider_mode="real",
+        source_name="Example News",
+        source_url="https://example.com/ogdc",
+        title="OGDC company update",
+        published_at=_at("2024-01-03"),
+        available_at=_at("2024-01-03"),
+        fetched_at=_at("2024-01-03"),
+        published_timezone="UTC",
+        language="english",
+        tickers=("OGDC",),
+        companies=("Oil and Gas Development Company Limited",),
+        sectors=(),
+        content_sha256="e" * 64,
+        raw_artifact_reference="raw/linked.json",
+        data_class="real",
+        duplicate_of=canonical_id,
+        entity_links=(
+            {
+                "link_id": link_id,
+                "article_id": linked_article,
+                "ticker": "OGDC",
+                "company_name": "Oil and Gas Development Company Limited",
+                "matched_alias": "OGDC",
+                "match_method": "exact",
+                "match_location": "title",
+                "confidence": "exact",
+            },
+        ),
+    )
+    permissions = {
+        general_run: "publisher-permission-v1",
+        linked_run: "publisher-permission-v1",
+    }
+    record = adapt_publisher_occurrences((general, linked), permissions)[0]
+    assert record.available_at == _at("2024-01-03")
+    assert record.raw_evidence_reference == (
+        f"news_ingestion/{linked_run}/raw/linked.json"
+    )
+
+    references = list(_input_references(gdelt_record_count=0))
+    references[2] = _publisher_input_reference(
+        (record,),
+        source_occurrences=(general, linked),
+    )
+    pack = publish_evidence_coverage_run(
+        compute_evidence_coverage((record,), _stock(), CoverageConfig()),
+        output_root=tmp_path / "coverage",
+        input_references=references,
+        stock_reference=_stock().reference,
+        repository_root=tmp_path,
+        run_id="ECOV-20261023-120039-linktime",
+    )
+
+    assert verify_evidence_coverage_pack(pack).mapping_count == 1
+    with (pack / "evidence_session_mappings.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        mapping = next(csv.DictReader(handle))
+    assert mapping["ticker"] == "OGDC"
+    assert mapping["assigned_session"] == "2024-01-03"
 
 
 def test_resealed_stock_calendar_cannot_redirect_session_mapping(

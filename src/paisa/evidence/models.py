@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
+import hashlib
 from pathlib import PurePosixPath
 import re
 from typing import Any, Literal, Mapping
@@ -105,6 +106,12 @@ _OGDC_ALIASES = frozenset(
         "OGDCL",
         "OGDC",
     }
+)
+_OGDC_COMPANY_NAME = "Oil and Gas Development Company Limited"
+_GENERAL_FINANCIAL_NEWS_COMPANY_NAME = "General financial news"
+_PSX_SOURCE_NAME = "Pakistan Stock Exchange"
+_NEWS_RUN_ID = re.compile(
+    r"^NEWS-[0-9]{8}-[0-9]{6}-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 )
 _PSX_DATE_ONLY = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _PSX_MINUTE_TIMESTAMP = re.compile(
@@ -222,6 +229,238 @@ def _contains_normalized_alias(value: str, alias: str) -> bool:
     )
 
 
+def _is_controlled_ogdc_company(value: str) -> bool:
+    return _normalized_entity_text(value) == _normalized_entity_text(
+        _OGDC_COMPANY_NAME
+    )
+
+
+def _validate_official_psx_url(value: str | None, *, field_name: str) -> None:
+    if value is None:
+        raise ValueError(f"{field_name} requires an official psx.com.pk URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is not a valid URL") from exc
+    scheme = parsed.scheme.casefold()
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"{field_name} must be an HTTP(S) URL")
+    if host != "psx.com.pk" and not host.endswith(".psx.com.pk"):
+        raise ValueError(f"{field_name} must use the official psx.com.pk domain")
+    expected_port = 443 if scheme == "https" else 80
+    if port is not None and port != expected_port:
+        raise ValueError(f"{field_name} uses an unsupported port")
+    if parsed.fragment:
+        raise ValueError(f"{field_name} must not contain a fragment")
+
+
+def _validate_psx_pdf_reference(value: str | None) -> None:
+    """Validate a PSX PDF reference without treating URI schemes as paths.
+
+    Operator captures may retain either an official PSX HTTP(S) URL or a
+    scheme-free relative reference into the captured evidence.  A URI with
+    any scheme must take the URL-validation path: otherwise values such as
+    ``ftp://...`` or ``https:%2F%2F...`` can masquerade as relative POSIX
+    paths.
+    """
+
+    if value is None:
+        return
+    text = _single_line(value, field_name="PSX pdf_reference", maximum=8_000)
+    try:
+        scheme = urlsplit(text).scheme
+    except ValueError as exc:
+        raise ValueError("PSX pdf_reference is not a valid reference") from exc
+    if scheme:
+        _validate_official_psx_url(text, field_name="PSX pdf_reference")
+    else:
+        _safe_relative(text, field_name="PSX pdf_reference")
+
+
+def _validate_publisher_match_evidence(
+    matches: tuple[Mapping[str, str], ...],
+    *,
+    ogdc_occurrences: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    required = {
+        "ingestion_run_id",
+        "link_id",
+        "article_id",
+        "ticker",
+        "company_name",
+        "matched_alias",
+        "match_method",
+        "match_location",
+        "confidence",
+    }
+    seen_links: set[str] = set()
+    linked_occurrences: set[tuple[str, str]] = set()
+    for match in matches:
+        if not required.issubset(match) or any(
+            not isinstance(match.get(field), str) or not match[field]
+            for field in required
+        ):
+            raise ValueError(
+                "OGDC-linked publisher evidence requires complete "
+                "entity-link provenance"
+            )
+        occurrence_identity = (
+            match["ingestion_run_id"],
+            match["article_id"],
+        )
+        if (
+            occurrence_identity not in ogdc_occurrences
+            or match["ticker"] != "OGDC"
+            or not _is_controlled_ogdc_company(match["company_name"])
+            or match["matched_alias"] not in _OGDC_ALIASES
+            or match["match_method"] not in {"exact", "normalized_exact"}
+            or match["match_location"] not in {"title", "summary", "body"}
+            or match["confidence"] != match["match_method"]
+        ):
+            raise ValueError(
+                "OGDC-linked publisher evidence has contradictory "
+                "entity-link provenance"
+            )
+        expected_id = "NEWSLINK-" + hashlib.sha256(
+            "\0".join(
+                (
+                    match["article_id"],
+                    "OGDC",
+                    match["matched_alias"],
+                    match["match_location"],
+                    match["match_method"],
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        if match["link_id"] != expected_id or match["link_id"] in seen_links:
+            raise ValueError(
+                "OGDC-linked publisher evidence has an invalid entity-link identity"
+            )
+        seen_links.add(match["link_id"])
+        linked_occurrences.add(occurrence_identity)
+    return linked_occurrences
+
+
+def _validate_publisher_source_evidence(record: "EvidenceRecord") -> None:
+    metadata = record.source_metadata
+    canonical_id = metadata.get("canonical_article_id")
+    occurrence_key = metadata.get("representative_occurrence_key")
+    occurrence_count = metadata.get("occurrence_count")
+    ogdc_occurrence_count = metadata.get("ogdc_occurrence_count")
+    occurrence_identities = metadata.get("occurrence_identities")
+    if (
+        not isinstance(canonical_id, str)
+        or not canonical_id
+        or canonical_id != record.source_record_id
+        or canonical_id != record.contemporaneous_source_id
+    ):
+        raise ValueError("Publisher canonical record identities disagree")
+    if not isinstance(occurrence_key, str) or ":" not in occurrence_key:
+        raise ValueError("Publisher representative occurrence identity is missing")
+    run_id, _, article_id = occurrence_key.partition(":")
+    if not _NEWS_RUN_ID.fullmatch(run_id) or not article_id:
+        raise ValueError("Publisher representative occurrence identity is invalid")
+    if not record.raw_evidence_reference.startswith(
+        f"news_ingestion/{run_id}/"
+    ):
+        raise ValueError(
+            "Publisher raw evidence is not bound to its representative run"
+        )
+    if (
+        isinstance(occurrence_count, bool)
+        or not isinstance(occurrence_count, int)
+        or occurrence_count <= 0
+        or isinstance(ogdc_occurrence_count, bool)
+        or not isinstance(ogdc_occurrence_count, int)
+        or not 0 <= ogdc_occurrence_count <= occurrence_count
+    ):
+        raise ValueError("Publisher canonical occurrence counts are invalid")
+    if (
+        not isinstance(occurrence_identities, (list, tuple))
+        or len(occurrence_identities) != occurrence_count
+    ):
+        raise ValueError("Publisher occurrence identity inventory is incomplete")
+    seen_occurrences: set[tuple[str, str]] = set()
+    ogdc_occurrences: set[tuple[str, str]] = set()
+    representative_found = False
+    representative_is_ogdc: bool | None = None
+    occurrence_fields = {
+        "occurrence_ordinal",
+        "occurrence_key",
+        "ingestion_run_id",
+        "article_id",
+        "canonical_article_id",
+        "content_sha256",
+        "is_ogdc",
+    }
+    for ordinal, item in enumerate(occurrence_identities):
+        if not isinstance(item, Mapping) or set(item) != occurrence_fields:
+            raise ValueError("Publisher occurrence identity inventory is malformed")
+        occurrence_run_id = item.get("ingestion_run_id")
+        occurrence_article_id = item.get("article_id")
+        identity = (str(occurrence_run_id), str(occurrence_article_id))
+        if (
+            item.get("occurrence_ordinal") != ordinal
+            or not isinstance(occurrence_run_id, str)
+            or not _NEWS_RUN_ID.fullmatch(occurrence_run_id)
+            or not isinstance(occurrence_article_id, str)
+            or not occurrence_article_id
+            or item.get("occurrence_key")
+            != f"{occurrence_run_id}:{occurrence_article_id}"
+            or item.get("canonical_article_id") != canonical_id
+            or not isinstance(item.get("content_sha256"), str)
+            or not _SHA256.fullmatch(str(item["content_sha256"]))
+            or not isinstance(item.get("is_ogdc"), bool)
+            or identity in seen_occurrences
+        ):
+            raise ValueError("Publisher occurrence identity inventory is invalid")
+        seen_occurrences.add(identity)
+        if item["is_ogdc"]:
+            ogdc_occurrences.add(identity)
+        if item["occurrence_key"] == occurrence_key:
+            representative_found = True
+            representative_is_ogdc = item["is_ogdc"]
+            if item["content_sha256"] != record.content_sha256:
+                raise ValueError(
+                    "Publisher representative content identity disagrees"
+                )
+    if not representative_found or len(ogdc_occurrences) != ogdc_occurrence_count:
+        raise ValueError("Publisher occurrence identity counts disagree")
+
+    if record.ticker == "OGDC":
+        if (
+            not _is_controlled_ogdc_company(record.company_name)
+            or ogdc_occurrence_count <= 0
+            or not record.entity_match_evidence
+            or representative_is_ogdc is not True
+        ):
+            raise ValueError(
+                "OGDC-linked publisher evidence requires a linked representative, "
+                "positive occurrence, and entity-link provenance"
+            )
+        linked_occurrences = _validate_publisher_match_evidence(
+            record.entity_match_evidence,
+            ogdc_occurrences=ogdc_occurrences,
+        )
+        if linked_occurrences != ogdc_occurrences:
+            raise ValueError(
+                "OGDC-linked publisher evidence does not cover its occurrences"
+            )
+    elif record.ticker == "GENERAL":
+        if (
+            record.company_name != _GENERAL_FINANCIAL_NEWS_COMPANY_NAME
+            or ogdc_occurrence_count != 0
+            or record.entity_match_evidence
+        ):
+            raise ValueError(
+                "General publisher evidence cannot claim OGDC entity-link provenance"
+            )
+    else:
+        raise ValueError("Publisher evidence ticker must be GENERAL or OGDC")
+
+
 def _validate_gdelt_match_evidence(
     matches: tuple[Mapping[str, str], ...],
     metadata: Mapping[str, Any],
@@ -260,6 +499,14 @@ def _validate_gdelt_match_evidence(
 
 def _validate_psx_source_evidence(record: "EvidenceRecord") -> None:
     metadata = record.source_metadata
+    if record.source_name != _PSX_SOURCE_NAME:
+        raise ValueError("PSX evidence requires the official source identity")
+    if not _is_controlled_ogdc_company(record.company_name):
+        raise ValueError("PSX evidence requires the controlled company identity")
+    if record.source_record_id != record.contemporaneous_source_id:
+        raise ValueError("PSX source record identities disagree")
+    _validate_official_psx_url(record.source_url, field_name="PSX source_url")
+    _validate_psx_pdf_reference(record.pdf_reference)
     raw_posted = metadata.get("exchange_posted_at_raw")
     if not isinstance(raw_posted, str) or not raw_posted:
         raise ValueError("PSX evidence requires the exact source timestamp text")
@@ -469,8 +716,9 @@ class EvidenceRecord:
         ):
             _single_line(str(getattr(self, name)), field_name=name)
         _validate_public_url(self.source_url, field_name="source_url")
-        if self.pdf_reference is not None and self.pdf_reference.startswith(
-            ("http://", "https://")
+        if (
+            self.pdf_reference is not None
+            and self.pdf_reference.casefold().startswith(("http://", "https://"))
         ):
             _validate_public_url(self.pdf_reference, field_name="pdf_reference")
         elif self.pdf_reference is not None:
@@ -547,6 +795,12 @@ class EvidenceRecord:
                 raise ValueError("GDELT batch timestamp cannot follow imported_at")
             if self.historical_availability_basis != "gdelt_gkg_batch_timestamp":
                 raise ValueError("GDELT availability basis is invalid")
+            if self.ticker != "OGDC":
+                raise ValueError("GDELT OGDC evidence requires ticker OGDC")
+            if not _is_controlled_ogdc_company(self.company_name):
+                raise ValueError(
+                    "GDELT OGDC evidence requires the controlled company identity"
+                )
             record_id = self.source_metadata.get("GKGRECORDID")
             if (
                 not isinstance(record_id, str)
@@ -617,6 +871,8 @@ class EvidenceRecord:
                 )
             if self.ticker.upper() != "OGDC":
                 raise ValueError("The initial PSX announcement slice requires OGDC")
+            if self.ticker != "OGDC":
+                raise ValueError("PSX announcement ticker must exactly equal OGDC")
             if self.contemporaneous_batch_at is not None:
                 raise ValueError("PSX announcements cannot claim a GKG batch")
             if self.event_category is None or self.announcement_type is None:
@@ -651,6 +907,7 @@ class EvidenceRecord:
                 raise ValueError(
                     "Publisher news cannot claim availability before PAISA fetched it"
                 )
+            _validate_publisher_source_evidence(self)
 
     def to_dict(self) -> dict[str, Any]:
         return {

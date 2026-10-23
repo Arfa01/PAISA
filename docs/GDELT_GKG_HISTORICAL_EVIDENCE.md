@@ -105,8 +105,14 @@ routable address. Redirects are disabled. TLS certificate and hostname
 verification remain enabled, and the connected peer must itself be global and
 belong to the approved preflight resolution set. Connect/read bounds are
 combined with one monotonic end-to-end deadline covering DNS, connection,
-headers, and streamed body reads. Failure details are sanitized and do not
-expose credentials. Environment authentication, session credentials, and
+headers, and streamed body reads. On the supported POSIX main-thread CLI path,
+each potentially blocking operation runs synchronously under a repeating
+interruptible process timer. The timer continues after its first interrupt
+until the protected callback unwinds, and response/session cleanup callbacks
+run under a separate short bound. No timed-out worker thread is left running.
+Platforms or non-main-thread contexts that cannot provide this boundary fail
+closed before network I/O. Failure details are sanitized and do not expose
+credentials. Environment authentication, session credentials, and
 publisher-page fetching are disabled.
 
 ZIP handling accepts exactly one expected member whose Unix type is either
@@ -114,6 +120,11 @@ regular or unspecified. Absolute paths, parent traversal, links and special
 file types, duplicate or extra members, basename mismatches, encrypted members,
 unsupported compression, and decompression-limit violations fail closed. A
 validated archive may be checkpointed for bounded, checksum-verified resume.
+Checkpoint roots must be link-free directories with exact mode `0700`; the
+checkpoint document and cached archives must be regular, no-follow-read files
+with exact mode `0600`. Repository-local checkpoint roots must be Git-ignored
+and untracked. Existing checkpoints that do not meet these conditions are
+rejected rather than silently trusted.
 
 ## Immutable pack and replay contract
 

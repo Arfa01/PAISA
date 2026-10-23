@@ -420,6 +420,14 @@ forces a new acquisition rather than reusing an earlier checkpoint:
   --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
 ```
 
+Resume checkpoints contain raw archive bytes and therefore use the same local
+security boundary as generated evidence. The checkpoint directory must be a
+real, link-free `0700` directory, and its checkpoint and cache files must be
+regular `0600` files. A repository-local `--checkpoint-dir` must also be
+Git-ignored and contain no tracked files. PAISA rejects older checkpoints with
+public modes; secure or remove them before retrying. Verification failures are
+reported as generic structured JSON and do not echo host filesystem paths.
+
 The PSX importer is intentionally unusable under the current
 `REVIEW_REQUIRED` decision. Only after the reviewed policy is updated to bind
 the exact authorization attestation and authorization reference hashes may an

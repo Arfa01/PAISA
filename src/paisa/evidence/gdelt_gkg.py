@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -39,6 +38,7 @@ from paisa.evidence.models import (
 from paisa.evidence.network_boundary import (
     MonotonicDeadline,
     NetworkBoundaryError,
+    interruptible_call,
     resolve_global_addresses,
     verify_connected_peer,
 )
@@ -120,6 +120,7 @@ _DEFAULT_USER_AGENT = (
     "PAISA-FYP/0.1 academic GDELT GKG metadata research; contact repository owner"
 )
 _READ_CHUNK_BYTES = 64 * 1024
+_CLEANUP_TIMEOUT_SECONDS = 0.1
 _MAX_FILES_HARD = 512
 _MAX_COMPRESSED_BYTES_HARD = 2 * 1024 * 1024 * 1024
 _MAX_DECOMPRESSED_BYTES_HARD = 8 * 1024 * 1024 * 1024
@@ -555,6 +556,24 @@ def _wire_chunks(response: Any) -> Iterable[bytes]:
     yield bytes(response.content)
 
 
+def _bounded_best_effort_cleanup(callback: Any) -> None:
+    """Run an untrusted transport cleanup callback without blocking shutdown."""
+
+    if not callable(callback):
+        return
+    try:
+        with interruptible_call(
+            _CLEANUP_TIMEOUT_SECONDS,
+            error_type="cleanup_deadline_exceeded",
+            message="GDELT archive transport cleanup exceeded its deadline",
+        ):
+            callback()
+    except Exception:
+        # Cleanup must not replace the sanitized acquisition result.  The
+        # interruptible boundary also fails closed in unsupported contexts.
+        pass
+
+
 def _request_before_deadline(
     session: Any,
     url: str,
@@ -564,42 +583,16 @@ def _request_before_deadline(
 ) -> Any:
     """Bound internal DNS, connect, TLS, and response-header processing."""
 
-    executor = ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="paisa-gdelt-request",
-    )
-    future = executor.submit(session.get, url, **kwargs)
-
-    def close_eventual_response(completed: Any) -> None:
-        try:
-            eventual_response = completed.result()
-        except BaseException:
-            return
-        close = getattr(eventual_response, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-
     try:
-        try:
-            return future.result(timeout=deadline.remaining())
-        except FutureTimeout as exc:
-            future.add_done_callback(close_eventual_response)
-            close_session = getattr(session, "close", None)
-            if callable(close_session):
-                try:
-                    close_session()
-                except Exception:
-                    pass
-            future.cancel()
-            raise NetworkBoundaryError(
-                "request_deadline_exceeded",
-                "GDELT archive request exceeded its total deadline",
-            ) from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        with interruptible_call(
+            deadline.remaining(),
+            error_type="request_deadline_exceeded",
+            message="GDELT archive request exceeded its total deadline",
+        ):
+            return session.get(url, **kwargs)
+    except NetworkBoundaryError:
+        _bounded_best_effort_cleanup(getattr(session, "close", None))
+        raise
 
 
 def _wire_chunks_before_deadline(
@@ -615,34 +608,21 @@ def _wire_chunks_before_deadline(
         except StopIteration:
             return False, b""
 
-    executor = ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="paisa-gdelt-body",
-    )
-    try:
-        while True:
-            remaining = deadline.remaining()
-            future = executor.submit(next_chunk)
-            try:
-                present, chunk = future.result(timeout=remaining)
-            except FutureTimeout as exc:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except OSError:
-                        pass
-                future.cancel()
-                raise NetworkBoundaryError(
-                    "request_deadline_exceeded",
-                    "GDELT archive request exceeded its total deadline",
-                ) from exc
-            if not present:
-                break
-            deadline.check()
-            yield chunk
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    while True:
+        try:
+            with interruptible_call(
+                deadline.remaining(),
+                error_type="request_deadline_exceeded",
+                message="GDELT archive request exceeded its total deadline",
+            ):
+                present, chunk = next_chunk()
+        except NetworkBoundaryError:
+            _bounded_best_effort_cleanup(getattr(response, "close", None))
+            raise
+        if not present:
+            break
+        deadline.check()
+        yield chunk
 
 
 def _read_bounded_response(
@@ -1399,37 +1379,122 @@ def replay_gdelt_gkg_captures(
     )
 
 
+_CHECKPOINT_DIR_FD_SUPPORTED = (
+    hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+)
+
+
+def _open_checkpoint_directory(
+    directory: Path,
+    *,
+    create: bool,
+) -> tuple[Path, int, bool]:
+    """Open one directory without following any component of its path.
+
+    A final ``O_NOFOLLOW`` protects only the basename: an intermediate link can
+    still redirect the lookup after a path-based preflight.  Walk from the
+    filesystem anchor with descriptor-relative opens instead, retaining each
+    parent descriptor until its child has been opened.  Missing components are
+    created relative to the already pinned parent and are immediately made
+    private through their descriptor.
+    """
+
+    if not _CHECKPOINT_DIR_FD_SUPPORTED:
+        raise OSError("descriptor-relative no-follow traversal is unavailable")
+    lexical = Path(os.path.abspath(os.fspath(directory)))
+    if not lexical.is_absolute() or lexical.anchor == "":
+        raise OSError("checkpoint root must be absolute")
+    relative = lexical.relative_to(Path(lexical.anchor))
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    current = os.open(lexical.anchor, flags)
+    final_created = False
+    try:
+        for index, component in enumerate(relative.parts):
+            if component in {"", ".", ".."}:
+                raise OSError("checkpoint root contains an unsafe component")
+            created = False
+            child: int | None = None
+            try:
+                try:
+                    child = os.open(component, flags, dir_fd=current)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current)
+                        created = True
+                    except FileExistsError:
+                        # A concurrent creator is acceptable only if the next
+                        # no-follow open proves that it created a real directory.
+                        pass
+                    child = os.open(component, flags, dir_fd=current)
+                if created:
+                    os.fchmod(child, 0o700)
+            except BaseException:
+                if child is not None:
+                    os.close(child)
+                raise
+            try:
+                os.close(current)
+            except OSError:
+                os.close(child)
+                raise
+            current = child
+            if index == len(relative.parts) - 1:
+                final_created = created
+        metadata = os.fstat(current)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("checkpoint root is not a directory")
+        return lexical, current, final_created
+    except BaseException:
+        try:
+            os.close(current)
+        except OSError:
+            pass
+        raise
+
+
 class _CheckpointStore:
     def __init__(self, directory: Path, *, plan_sha256: str) -> None:
-        self.directory = directory
-        self.plan_sha256 = plan_sha256
+        root_descriptor: int | None = None
         try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory_metadata = directory.lstat()
-        except OSError as exc:
-            raise _GkgRejected(
-                "unsafe_checkpoint", "GDELT GKG checkpoint root is unavailable"
-            ) from exc
-        if not stat.S_ISDIR(directory_metadata.st_mode):
-            raise _GkgRejected(
-                "unsafe_checkpoint",
-                "GDELT GKG checkpoint root must be a regular directory",
+            self.directory, root_descriptor, created = _open_checkpoint_directory(
+                directory,
+                create=True,
             )
-        try:
-            os.chmod(directory, 0o700)
+            directory_metadata = os.fstat(root_descriptor)
+            if created:
+                os.fchmod(root_descriptor, 0o700)
+                directory_metadata = os.fstat(root_descriptor)
+            if stat.S_IMODE(directory_metadata.st_mode) != 0o700:
+                raise OSError("checkpoint root mode must be 0700")
+            self._root_identity = (
+                directory_metadata.st_dev,
+                directory_metadata.st_ino,
+            )
         except OSError as exc:
             raise _GkgRejected(
-                "unsafe_checkpoint", "GDELT GKG checkpoint permissions failed"
+                "unsafe_checkpoint", "GDELT GKG checkpoint root is unsafe"
             ) from exc
-        self.path = directory / "checkpoint.json"
+        finally:
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+        self.plan_sha256 = plan_sha256
         self.entries: dict[str, dict[str, Any]] = {}
-        if os.path.lexists(self.path):
-            if self.path.is_symlink() or not self.path.is_file():
-                raise _GkgRejected(
-                    "unsafe_checkpoint", "GDELT GKG checkpoint must be a regular file"
-                )
+        if self._entry_exists("checkpoint.json"):
             try:
-                value = json.loads(self.path.read_text(encoding="utf-8"))
+                value = json.loads(
+                    self._read_private_file(
+                        "checkpoint.json",
+                        error_type="unsafe_checkpoint",
+                        unavailable_message=(
+                            "GDELT GKG checkpoint must be a private regular file"
+                        ),
+                    ).decode("utf-8")
+                )
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise _GkgRejected(
                     "invalid_checkpoint", "GDELT GKG checkpoint is invalid"
@@ -1450,6 +1515,112 @@ class _CheckpointStore:
                 if isinstance(item, Mapping)
             }
 
+    def _open_root(self) -> int:
+        descriptor: int | None = None
+        try:
+            lexical, descriptor, _created = _open_checkpoint_directory(
+                self.directory,
+                create=False,
+            )
+            if lexical != self.directory:
+                raise OSError("checkpoint root path changed")
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or (metadata.st_dev, metadata.st_ino) != self._root_identity
+            ):
+                os.close(descriptor)
+                descriptor = None
+                raise OSError("checkpoint root mode or type changed")
+            return descriptor
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise _GkgRejected(
+                "unsafe_checkpoint", "GDELT GKG checkpoint root is unsafe"
+            ) from exc
+
+    def _entry_exists(self, filename: str) -> bool:
+        root_descriptor = self._open_root()
+        try:
+            try:
+                os.stat(
+                    filename,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            return True
+        except OSError as exc:
+            raise _GkgRejected(
+                "unsafe_checkpoint", "GDELT GKG checkpoint entry is unsafe"
+            ) from exc
+        finally:
+            os.close(root_descriptor)
+
+    def _read_private_file(
+        self,
+        filename: str,
+        *,
+        error_type: str,
+        unavailable_message: str,
+        maximum_size: int | None = None,
+    ) -> bytes:
+        root_descriptor = self._open_root()
+        descriptor: int | None = None
+        try:
+            before = os.stat(
+                filename,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                raise OSError("checkpoint file mode or type is unsafe")
+            if maximum_size is not None and before.st_size > maximum_size:
+                raise _GkgRejected(
+                    "compressed_byte_limit_exceeded",
+                    "GDELT GKG checkpoint cache exceeds the compressed-byte limit",
+                )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(filename, flags, dir_fd=root_descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise OSError("checkpoint file identity changed")
+            chunks: list[bytes] = []
+            observed_size = 0
+            while True:
+                chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                observed_size += len(chunk)
+                if maximum_size is not None and observed_size > maximum_size:
+                    raise _GkgRejected(
+                        "compressed_byte_limit_exceeded",
+                        "GDELT GKG checkpoint cache exceeds the compressed-byte limit",
+                    )
+                chunks.append(chunk)
+            if observed_size != opened.st_size:
+                raise OSError("checkpoint file changed while being read")
+            return b"".join(chunks)
+        except _GkgRejected:
+            raise
+        except OSError as exc:
+            raise _GkgRejected(error_type, unavailable_message) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(root_descriptor)
+
     def cached(
         self,
         partition: GdeltGkgPartition,
@@ -1465,31 +1636,17 @@ class _CheckpointStore:
             raise _GkgRejected(
                 "invalid_checkpoint", "GDELT GKG checkpoint cache identity is unsafe"
             )
-        path = self.directory / filename
         try:
-            metadata = path.lstat()
-        except OSError as exc:
-            raise _GkgRejected(
-                "checkpoint_cache_invalid",
-                "GDELT GKG checkpoint cache file is missing",
-            ) from exc
-        if not stat.S_ISREG(metadata.st_mode):
-            raise _GkgRejected(
-                "checkpoint_cache_invalid",
-                "GDELT GKG checkpoint cache file is unsafe",
+            payload = self._read_private_file(
+                filename,
+                error_type="checkpoint_cache_invalid",
+                unavailable_message=(
+                    "GDELT GKG checkpoint cache file is missing or unsafe"
+                ),
+                maximum_size=min(per_file_limit, remaining_total_limit),
             )
-        if metadata.st_size > per_file_limit or metadata.st_size > remaining_total_limit:
-            raise _GkgRejected(
-                "compressed_byte_limit_exceeded",
-                "GDELT GKG checkpoint cache exceeds the compressed-byte limit",
-            )
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise _GkgRejected(
-                "checkpoint_cache_invalid",
-                "GDELT GKG checkpoint cache file cannot be read",
-            ) from exc
+        except _GkgRejected:
+            raise
         observed_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
         observed_sha256 = hashlib.sha256(payload).hexdigest()
         if (
@@ -1523,41 +1680,59 @@ class _CheckpointStore:
         sha256: str,
     ) -> None:
         cache_filename = f"{partition.partition_id}-{partition.filename}"
-        cache_path = self.directory / cache_filename
-        if os.path.lexists(cache_path):
+        if self._entry_exists(cache_filename):
             try:
-                metadata = cache_path.lstat()
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise _GkgRejected(
-                        "checkpoint_cache_collision",
-                        "GDELT GKG checkpoint cache destination is unsafe",
-                    )
-                existing = cache_path.read_bytes()
+                existing = self._read_private_file(
+                    cache_filename,
+                    error_type="checkpoint_cache_collision",
+                    unavailable_message=(
+                        "GDELT GKG checkpoint cache destination is unsafe"
+                    ),
+                )
             except _GkgRejected:
                 raise
-            except OSError as exc:
-                raise _GkgRejected(
-                    "checkpoint_cache_collision",
-                    "GDELT GKG checkpoint cache destination cannot be read",
-                ) from exc
             if hashlib.sha256(existing).hexdigest() != sha256:
                 raise _GkgRejected(
                     "checkpoint_cache_collision",
                     "GDELT GKG checkpoint cache destination already differs",
                 )
         else:
+            root_descriptor = self._open_root()
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(cache_path, flags, 0o600)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor: int | None = None
+            created = False
             try:
+                descriptor = os.open(
+                    cache_filename,
+                    flags,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+                created = True
+                os.fchmod(descriptor, 0o600)
                 with os.fdopen(descriptor, "wb") as handle:
+                    descriptor = None
                     handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
-            except BaseException:
-                cache_path.unlink(missing_ok=True)
+            except BaseException as exc:
+                if created:
+                    try:
+                        os.unlink(cache_filename, dir_fd=root_descriptor)
+                    except FileNotFoundError:
+                        pass
+                if isinstance(exc, OSError):
+                    raise _GkgRejected(
+                        "checkpoint_cache_collision",
+                        "GDELT GKG checkpoint cache destination is unsafe",
+                    ) from exc
                 raise
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                os.close(root_descriptor)
         self.entries[partition.partition_id] = {
             "archive_url": partition.archive_url,
             "archive_filename": partition.filename,
@@ -1575,19 +1750,56 @@ class _CheckpointStore:
         encoded = (
             json.dumps(document, sort_keys=True, indent=2, allow_nan=False) + "\n"
         ).encode("utf-8")
-        temporary = self.directory / f".checkpoint-{os.getpid()}-{uuid4().hex}.tmp"
+        temporary_name = f".checkpoint-{os.getpid()}-{uuid4().hex}.tmp"
+        root_descriptor = self._open_root()
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary, flags, 0o600)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        temporary_created = False
         try:
+            if self._entry_exists("checkpoint.json"):
+                self._read_private_file(
+                    "checkpoint.json",
+                    error_type="unsafe_checkpoint",
+                    unavailable_message=(
+                        "GDELT GKG checkpoint must be a private regular file"
+                    ),
+                )
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            temporary_created = True
+            os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
+            os.replace(
+                temporary_name,
+                "checkpoint.json",
+                src_dir_fd=root_descriptor,
+                dst_dir_fd=root_descriptor,
+            )
+            os.fsync(root_descriptor)
+        except OSError as exc:
+            raise _GkgRejected(
+                "unsafe_checkpoint",
+                "GDELT GKG checkpoint could not be written safely",
+            ) from exc
         finally:
-            temporary.unlink(missing_ok=True)
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_created:
+                try:
+                    os.unlink(temporary_name, dir_fd=root_descriptor)
+                except FileNotFoundError:
+                    pass
+            os.close(root_descriptor)
 
 
 class GdeltGkgArchiveProvider:
@@ -1939,13 +2151,9 @@ class GdeltGkgArchiveProvider:
             raise _GkgRejected(exc.error_type, exc.safe_message) from exc
         finally:
             if response is not None:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
+                _bounded_best_effort_cleanup(getattr(response, "close", None))
             cookies = getattr(self.session, "cookies", None)
-            clear = getattr(cookies, "clear", None)
-            if callable(clear):
-                clear()
+            _bounded_best_effort_cleanup(getattr(cookies, "clear", None))
 
     def _assert_permission_current(self) -> None:
         permission_decision = _validated_gdelt_permission(self.permission_policy)

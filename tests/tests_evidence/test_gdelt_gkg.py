@@ -16,6 +16,7 @@ import zipfile
 
 import pytest
 
+import paisa.evidence.gdelt_gkg as gdelt_gkg_module
 from paisa.evidence.policy import EvidencePermissionError, EvidencePermissionPolicy
 from paisa.evidence.gdelt_gkg import (
     GDELT_GKG_PROVIDER_ID,
@@ -567,6 +568,147 @@ def test_blocked_request_headers_are_interrupted_by_total_deadline() -> None:
     assert elapsed < 1.0
 
 
+def test_stubborn_request_is_interrupted_without_a_lingering_worker() -> None:
+    payload = _zip_payload((_row(),))
+    response = _Response(payload)
+    before = {thread.ident for thread in threading.enumerate()}
+
+    class _StubbornSession(_Session):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            self.calls.append((url, kwargs))
+            time.sleep(10)
+            return response
+
+    result = _provider(
+        _partition(payload),
+        _StubbornSession(()),
+        total_request_timeout_seconds=0.05,
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.records == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert {
+        thread.ident for thread in threading.enumerate() if thread.ident not in before
+    } == set()
+    assert not any(
+        thread.name.startswith("paisa-gdelt-request")
+        for thread in threading.enumerate()
+    )
+
+
+def test_blocking_session_close_cannot_defeat_request_deadline() -> None:
+    payload = _zip_payload((_row(),))
+    close_started = threading.Event()
+    first_interrupt_swallowed = threading.Event()
+
+    class _BlockingCloseSession(_Session):
+        def get(self, url: str, **kwargs: Any) -> _Response:
+            self.calls.append((url, kwargs))
+            time.sleep(10)
+            raise AssertionError("deadline did not interrupt request")
+
+        def close(self) -> None:
+            close_started.set()
+            try:
+                time.sleep(10)
+            except BaseException:
+                first_interrupt_swallowed.set()
+                time.sleep(10)
+
+    started = time.monotonic()
+    result = _provider(
+        _partition(payload),
+        _BlockingCloseSession(()),
+        total_request_timeout_seconds=0.05,
+    ).fetch(fetched_at=FETCHED_AT)
+    elapsed = time.monotonic() - started
+
+    assert result.records == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert close_started.is_set()
+    assert first_interrupt_swallowed.is_set()
+    assert elapsed < 1.0
+
+
+def test_stubborn_body_read_is_interrupted_without_a_lingering_worker() -> None:
+    payload = _zip_payload((_row(),))
+    before = {thread.ident for thread in threading.enumerate()}
+
+    class _StubbornBody:
+        def stream(
+            self, chunk_size: int, *, decode_content: bool
+        ) -> Iterable[bytes]:
+            assert chunk_size > 0
+            assert decode_content is False
+            time.sleep(10)
+            yield payload
+
+    response = _Response(payload)
+    response.raw = _StubbornBody()
+    result = _provider(
+        _partition(payload),
+        _Session((response,)),
+        total_request_timeout_seconds=0.05,
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert result.records == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert response.closed
+    assert {
+        thread.ident for thread in threading.enumerate() if thread.ident not in before
+    } == set()
+    assert not any(
+        thread.name.startswith("paisa-gdelt-body")
+        for thread in threading.enumerate()
+    )
+
+
+def test_blocking_response_close_cannot_defeat_body_deadline() -> None:
+    payload = _zip_payload((_row(),))
+    close_started = threading.Event()
+    first_interrupt_swallowed = threading.Event()
+
+    class _StubbornBody:
+        def stream(
+            self, chunk_size: int, *, decode_content: bool
+        ) -> Iterable[bytes]:
+            assert chunk_size > 0
+            assert decode_content is False
+            time.sleep(10)
+            yield payload
+
+    class _BlockingCloseResponse(_Response):
+        def __init__(self) -> None:
+            super().__init__(payload)
+            self.raw = _StubbornBody()
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            close_started.set()
+            try:
+                time.sleep(10)
+            except BaseException:
+                first_interrupt_swallowed.set()
+                time.sleep(10)
+
+    response = _BlockingCloseResponse()
+    started = time.monotonic()
+    result = _provider(
+        _partition(payload),
+        _Session((response,)),
+        total_request_timeout_seconds=0.05,
+    ).fetch(fetched_at=FETCHED_AT)
+    elapsed = time.monotonic() - started
+
+    assert result.records == ()
+    assert "request_deadline_exceeded" in _error_types(result)
+    assert close_started.is_set()
+    assert first_interrupt_swallowed.is_set()
+    assert response.close_calls == 2
+    assert elapsed < 1.0
+
+
 @pytest.mark.parametrize(
     ("response", "error_type"),
     [
@@ -953,6 +1095,11 @@ def test_validated_checkpoint_resumes_without_network_and_rejects_tamper(
     ).fetch(fetched_at=FETCHED_AT)
     assert first.counters["partitions_downloaded"] == 1
     assert first.counters["partitions_resumed"] == 0
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o700
+    assert all(
+        stat.S_IMODE(item.stat().st_mode) == 0o600
+        for item in checkpoint.iterdir()
+    )
 
     second_session = _Session(())
     second = _provider(
@@ -978,6 +1125,175 @@ def test_validated_checkpoint_resumes_without_network_and_rejects_tamper(
     assert third.records == ()
     assert third.captures == ()
     assert "checkpoint_cache_invalid" in _error_types(third)
+
+
+def test_checkpoint_rejects_symlink_components_without_writing_outside(
+    tmp_path: Path,
+) -> None:
+    payload = _zip_payload((_row(),))
+    partition = _partition(payload)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    session = _Session((_Response(payload),))
+
+    result = _provider(
+        partition,
+        session,
+        checkpoint_directory=alias / "checkpoint",
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert session.calls == []
+    assert result.records == ()
+    assert "unsafe_checkpoint" in _error_types(result)
+    assert not (outside / "checkpoint").exists()
+
+    final_alias = tmp_path / "checkpoint-alias"
+    final_alias.symlink_to(outside, target_is_directory=True)
+    final_session = _Session((_Response(payload),))
+    final_result = _provider(
+        partition,
+        final_session,
+        checkpoint_directory=final_alias,
+    ).fetch(fetched_at=FETCHED_AT)
+    assert final_session.calls == []
+    assert final_result.records == ()
+    assert "unsafe_checkpoint" in _error_types(final_result)
+
+
+@pytest.mark.parametrize("swap_component", ("root", "intermediate"))
+def test_checkpoint_creation_does_not_follow_a_raced_directory_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_component: str,
+) -> None:
+    payload = _zip_payload((_row(),))
+    partition = _partition(payload)
+    outside = tmp_path / f"outside-{swap_component}"
+    outside.mkdir(mode=0o755)
+    outside.chmod(0o755)
+    if swap_component == "root":
+        checkpoint = tmp_path / "raced-checkpoint-root"
+        target_component = checkpoint.name
+    else:
+        parent = tmp_path / "raced-checkpoint-parent"
+        checkpoint = parent / "checkpoint"
+        target_component = parent.name
+
+    real_mkdir = gdelt_gkg_module.os.mkdir
+    raced = False
+
+    def racing_mkdir(
+        path: Any,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if path == target_component and dir_fd is not None and not raced:
+            gdelt_gkg_module.os.symlink(
+                outside,
+                path,
+                target_is_directory=True,
+                dir_fd=dir_fd,
+            )
+            raced = True
+            raise FileExistsError(path)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(gdelt_gkg_module.os, "mkdir", racing_mkdir)
+    session = _Session((_Response(payload),))
+    result = _provider(
+        partition,
+        session,
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert raced is True
+    assert session.calls == []
+    assert result.records == ()
+    assert "unsafe_checkpoint" in _error_types(result)
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755
+    assert list(outside.iterdir()) == []
+
+
+def test_checkpoint_rejects_public_checkpoint_and_cache_modes(
+    tmp_path: Path,
+) -> None:
+    payload = _zip_payload((_row(),))
+    partition = _partition(payload)
+    checkpoint = tmp_path / "checkpoint-private"
+    first = _provider(
+        partition,
+        _Session((_Response(payload),)),
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+    assert first.counters["partitions_downloaded"] == 1
+
+    checkpoint_file = checkpoint / "checkpoint.json"
+    checkpoint_file.chmod(0o644)
+    public_checkpoint = _provider(
+        partition,
+        _Session(()),
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+    assert public_checkpoint.records == ()
+    assert "unsafe_checkpoint" in _error_types(public_checkpoint)
+
+    checkpoint_file.chmod(0o600)
+    cache_file = checkpoint / f"{partition.partition_id}-{partition.filename}"
+    cache_file.chmod(0o644)
+    public_cache = _provider(
+        partition,
+        _Session(()),
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+    assert public_cache.records == ()
+    assert "checkpoint_cache_invalid" in _error_types(public_cache)
+
+
+def test_checkpoint_descriptor_read_does_not_follow_a_swapped_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _zip_payload((_row(),))
+    partition = _partition(payload)
+    checkpoint = tmp_path / "checkpoint-race"
+    first = _provider(
+        partition,
+        _Session((_Response(payload),)),
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+    assert first.counters["partitions_downloaded"] == 1
+
+    checkpoint_file = checkpoint / "checkpoint.json"
+    outside = tmp_path / "outside-checkpoint.json"
+    outside.write_bytes(checkpoint_file.read_bytes())
+    outside.chmod(0o600)
+    real_open = gdelt_gkg_module.os.open
+    swapped = False
+
+    def swapping_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal swapped
+        if path == "checkpoint.json" and kwargs.get("dir_fd") is not None and not swapped:
+            checkpoint_file.unlink()
+            checkpoint_file.symlink_to(outside)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(gdelt_gkg_module.os, "open", swapping_open)
+    session = _Session(())
+    result = _provider(
+        partition,
+        session,
+        checkpoint_directory=checkpoint,
+    ).fetch(fetched_at=FETCHED_AT)
+
+    assert swapped is True
+    assert session.calls == []
+    assert result.records == ()
+    assert "unsafe_checkpoint" in _error_types(result)
 
 
 def test_checkpoint_plan_is_bound_to_permission_policy_checksum(

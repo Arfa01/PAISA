@@ -1513,6 +1513,9 @@ def test_real_mode_rejects_fixture_pack_and_test_mode_keeps_its_label(
     )
     assert loaded.occurrences[0].data_class == "fixture"
     assert loaded.occurrences[0].provider_mode == "fixture"
+    assert "artifact_inventory" not in loaded.run_references[0]
+    assert "source_snapshots" not in loaded.run_references[0]
+    assert "run_manifest_snapshot" not in loaded.run_references[0]
 
 
 def test_unsealed_legacy_pack_requires_explicit_compatibility_opt_in(
@@ -1522,6 +1525,27 @@ def test_unsealed_legacy_pack_requires_explicit_compatibility_opt_in(
 
     with pytest.raises(CoverageAuditError, match="compatibility opt-in"):
         load_news_evidence([run_dir])
+
+
+def test_portable_news_source_snapshots_are_explicitly_opt_in(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_news_pack(tmp_path)
+
+    ordinary = load_news_evidence(
+        [run_dir],
+        allow_legacy_unsealed=True,
+    )
+
+    assert "artifact_inventory" not in ordinary.run_references[0]
+    assert "source_snapshots" not in ordinary.run_references[0]
+    assert "run_manifest_snapshot" not in ordinary.run_references[0]
+    with pytest.raises(CoverageAuditError, match="manifest-bound"):
+        load_news_evidence(
+            [run_dir],
+            allow_legacy_unsealed=True,
+            include_portable_source_snapshots=True,
+        )
 
 
 def test_database_seals_and_fingerprint_use_one_immutable_snapshot(

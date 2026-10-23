@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timezone
+import base64
 import csv
 import errno
 import hashlib
@@ -918,6 +919,7 @@ def _load_one_news_run(
     allow_legacy_unsealed: bool,
     database_path: str | Path | None,
     source_permission_policy: SourcePermissionPolicy | None,
+    include_portable_source_snapshots: bool,
 ) -> tuple[list[NewsOccurrence], dict[str, Any]]:
     root = run_dir.resolve()
     if run_dir.is_symlink() or not root.is_dir():
@@ -1246,6 +1248,74 @@ def _load_one_news_run(
         ),
         "source_permission_decision": permission_decision,
     }
+    if include_portable_source_snapshots:
+        artifact_inventory = [
+            {"path": path, "sha256": digest, "size_bytes": size}
+            for path, (digest, size) in inventory.items()
+        ]
+        if manifest.get("artifact_inventory") != artifact_inventory or manifest.get(
+            "artifact_inventory_sha256"
+        ) != reference["artifact_inventory_sha256"]:
+            raise CoverageAuditError(
+                "Portable news provenance requires a manifest-bound artifact inventory"
+            )
+        snapshot_paths = ("article_entity_links.csv", "normalized_articles.csv")
+        if any(relative not in inventory for relative in snapshot_paths):
+            raise CoverageAuditError(
+                "News coverage provenance requires normalized articles and entity links"
+            )
+        source_snapshots: list[dict[str, Any]] = []
+        snapshot_total = 0
+        for relative in snapshot_paths:
+            snapshot_path = _validate_inventoried_file(root, relative, inventory)
+            try:
+                payload = snapshot_path.read_bytes()
+            except OSError as exc:
+                raise CoverageAuditError(
+                    "News provenance snapshot could not be read"
+                ) from exc
+            snapshot_total += len(payload)
+            if (
+                len(payload) > 16 * 1024 * 1024
+                or snapshot_total > 24 * 1024 * 1024
+            ):
+                raise CoverageAuditError(
+                    "News provenance snapshots exceed the portable limit"
+                )
+            source_snapshots.append(
+                {
+                    "path": relative,
+                    "encoding": "base64url",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                    "content_base64": base64.urlsafe_b64encode(payload).decode(
+                        "ascii"
+                    ),
+                }
+            )
+        try:
+            manifest_payload = manifest_path.read_bytes()
+        except OSError as exc:
+            raise CoverageAuditError(
+                "News manifest provenance snapshot could not be read"
+            ) from exc
+        if len(manifest_payload) > 4 * 1024 * 1024:
+            raise CoverageAuditError("News manifest snapshot exceeds the portable limit")
+        reference.update(
+            {
+                "artifact_inventory": artifact_inventory,
+                "source_snapshots": source_snapshots,
+                "run_manifest_snapshot": {
+                    "path": "run_manifest.json",
+                    "encoding": "base64url",
+                    "sha256": manifest_digest,
+                    "size_bytes": len(manifest_payload),
+                    "content_base64": base64.urlsafe_b64encode(
+                        manifest_payload
+                    ).decode("ascii"),
+                },
+            }
+        )
     return occurrences, reference
 
 
@@ -1341,6 +1411,7 @@ def load_news_evidence(
     database_path: str | Path | None = None,
     allow_legacy_unsealed: bool = False,
     source_permission_policy: SourcePermissionPolicy | None = None,
+    include_portable_source_snapshots: bool = False,
 ) -> NewsEvidence:
     resolved_roots: set[Path] = set()
     for path in run_directories:
@@ -1366,6 +1437,7 @@ def load_news_evidence(
                 allow_legacy_unsealed=allow_legacy_unsealed,
                 database_path=verification_database,
                 source_permission_policy=source_permission_policy,
+                include_portable_source_snapshots=include_portable_source_snapshots,
             )
             run_id = str(reference["run_id"])
             if run_id in seen_runs:

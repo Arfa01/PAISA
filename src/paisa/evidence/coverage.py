@@ -701,6 +701,15 @@ def compute_evidence_coverage(
     identifiers = [item.evidence_id for item in ordered_records]
     if len(set(identifiers)) != len(identifiers):
         raise EvidenceCoverageError("Evidence identities must be unique")
+    source_event_identities = [
+        (item.provider_id, item.provider_mode, item.source_record_id)
+        for item in ordered_records
+    ]
+    if len(set(source_event_identities)) != len(source_event_identities):
+        raise EvidenceCoverageError(
+            "Evidence source event identities must be unique by provider, mode, "
+            "and source_record_id"
+        )
 
     profiles_by_id = {
         item.evidence_id: _profiles_for(item) for item in ordered_records

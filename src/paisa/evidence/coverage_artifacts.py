@@ -10,10 +10,13 @@ advice.
 
 from __future__ import annotations
 
+import base64
 import csv
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -51,7 +54,16 @@ from paisa.evidence.models import (
     EvidenceRecord,
     utc_iso,
 )
-from paisa.news.coverage import CoverageConfig, StockEvidence, parse_cutoff
+from paisa.news.coverage import (
+    CoverageAuditError,
+    CoverageConfig,
+    NewsOccurrence,
+    StockEvidence,
+    _json_list,
+    _public_url,
+    parse_cutoff,
+    parse_timestamp,
+)
 from paisa.sentiment.artifacts import (
     SentimentRunCollisionError,
     artifact_inventory,
@@ -115,6 +127,12 @@ _PAYLOAD_FILES = frozenset(
     }
 )
 _ALL_FILES = _PAYLOAD_FILES | _SEAL_FILES
+_LEGACY_PUBLISHER_BINDINGS = {
+    (
+        "ECOV-20261023-175904-be50a499",
+        "6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250",
+    ): "NEWS-20261023-060000-gdelt-ogdc2",
+}
 
 _MAPPING_FIELDS = (
     "evidence_id",
@@ -256,6 +274,48 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _inventory_digest(inventory: Sequence[Mapping[str, Any]]) -> str:
     return _sha256_bytes(_canonical_bytes(list(inventory)))
+
+
+def make_record_identity_inventory(
+    records: Sequence[EvidenceRecord],
+) -> dict[str, Any]:
+    """Seal source order, identities, and every normalized record field."""
+
+    canonical_rows = [_canonical_bytes(record.to_dict()) for record in records]
+    values = [
+        {
+            "source_ordinal": source_ordinal,
+            "evidence_id": record.evidence_id,
+            "provider_id": record.provider_id,
+            "provider_mode": record.provider_mode,
+            "source_record_id": record.source_record_id,
+            "contemporaneous_source_id": record.contemporaneous_source_id,
+            "content_sha256": record.content_sha256,
+            "normalized_record_sha256": _sha256_bytes(
+                canonical_rows[source_ordinal]
+            ),
+        }
+        for source_ordinal, record in enumerate(records)
+    ]
+    source_keys = [
+        (item["provider_id"], item["provider_mode"], item["source_record_id"])
+        for item in values
+    ]
+    if len(source_keys) != len(set(source_keys)):
+        raise ValueError("Source-run record identities must be unique")
+    document = {
+        "schema_version": "2.0",
+        "algorithm": "sha256",
+        "record_count": len(values),
+        "canonical_jsonl_sha256": _sha256_bytes(
+            b"".join(row + b"\n" for row in canonical_rows)
+        ),
+        "records": values,
+    }
+    return {
+        **document,
+        "sha256": _sha256_bytes(_canonical_bytes(document)),
+    }
 
 
 def _write_private(path: Path, content: bytes) -> None:
@@ -551,6 +611,106 @@ def _require_reference(value: Any, *, field: str) -> str:
     return value
 
 
+def _validate_record_identity_inventory(
+    value: Any,
+    *,
+    field: str,
+    expected_count: int,
+    provider_id: str | None,
+    provider_mode: str | None,
+    expected_jsonl_sha256: str,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "algorithm",
+        "record_count",
+        "canonical_jsonl_sha256",
+        "records",
+        "sha256",
+    }:
+        raise _reference_error(f"{field} is missing or malformed")
+    if value.get("schema_version") != "2.0" or value.get("algorithm") != "sha256":
+        raise _reference_error(f"{field} contract is unsupported")
+    raw_records = value.get("records")
+    record_count = _require_count(
+        value.get("record_count"), field=f"{field}.record_count"
+    )
+    if (
+        record_count != expected_count
+        or not isinstance(raw_records, list)
+        or len(raw_records) != expected_count
+    ):
+        raise _reference_error(f"{field} record count differs")
+    records: list[dict[str, Any]] = []
+    expected_fields = {
+        "source_ordinal",
+        "evidence_id",
+        "provider_id",
+        "provider_mode",
+        "source_record_id",
+        "contemporaneous_source_id",
+        "content_sha256",
+        "normalized_record_sha256",
+    }
+    for index, item in enumerate(raw_records):
+        if not isinstance(item, Mapping) or set(item) != expected_fields:
+            raise _reference_error(f"{field}.records[{index}] is malformed")
+        record = {name: item.get(name) for name in expected_fields}
+        if (
+            isinstance(record["source_ordinal"], bool)
+            or not isinstance(record["source_ordinal"], int)
+            or record["source_ordinal"] != index
+        ):
+            raise _reference_error(f"{field}.records[{index}] ordinal differs")
+        if any(
+            not isinstance(item_value, str) or not item_value
+            for name, item_value in record.items()
+            if name != "source_ordinal"
+        ):
+            raise _reference_error(f"{field}.records[{index}] is incomplete")
+        if (
+            (provider_id is not None and record["provider_id"] != provider_id)
+            or (
+                provider_mode is not None
+                and record["provider_mode"] != provider_mode
+            )
+            or record["source_record_id"] != record["contemporaneous_source_id"]
+        ):
+            raise _reference_error(f"{field}.records[{index}] source identity differs")
+        _require_sha(
+            record["content_sha256"],
+            field=f"{field}.records[{index}].content_sha256",
+        )
+        _require_sha(
+            record["normalized_record_sha256"],
+            field=f"{field}.records[{index}].normalized_record_sha256",
+        )
+        records.append(record)
+    source_keys = [
+        (item["provider_id"], item["provider_mode"], item["source_record_id"])
+        for item in records
+    ]
+    if len(source_keys) != len(set(source_keys)):
+        raise _reference_error(f"{field} source identities are not unique")
+    jsonl_sha256 = _require_sha(
+        value.get("canonical_jsonl_sha256"),
+        field=f"{field}.canonical_jsonl_sha256",
+    )
+    if jsonl_sha256 != expected_jsonl_sha256:
+        raise _reference_error(f"{field} normalized JSONL checksum differs")
+    digest = _require_sha(value.get("sha256"), field=f"{field}.sha256")
+    document = {
+        "schema_version": value["schema_version"],
+        "algorithm": value["algorithm"],
+        "record_count": value["record_count"],
+        "canonical_jsonl_sha256": value["canonical_jsonl_sha256"],
+        "records": records,
+    }
+    if digest != _sha256_bytes(_canonical_bytes(document)):
+        raise _reference_error(f"{field} checksum differs")
+    return tuple(records)
+
+
 def _validate_permission_reference(value: Any, *, field: str) -> None:
     if not isinstance(value, Mapping) or value.get("schema_version") != "1.0":
         raise _reference_error(f"{field} is missing or unsupported")
@@ -602,8 +762,26 @@ def _validate_gdelt_reference(value: Mapping[str, Any]) -> None:
         "normalized_evidence_sha256",
     ):
         _require_sha(value.get(field), field=f"gdelt_gkg.{field}")
-    for field in ("record_count", "capture_count"):
-        _require_count(value.get(field), field=f"gdelt_gkg.{field}")
+    normalized_evidence_sha256 = str(value["normalized_evidence_sha256"])
+    record_count = _require_count(
+        value.get("record_count"), field="gdelt_gkg.record_count"
+    )
+    _require_count(value.get("capture_count"), field="gdelt_gkg.capture_count")
+    identity_inventory = value.get("record_identity_inventory")
+    empty_jsonl_sha256 = _sha256_bytes(b"")
+    if record_count == 0 and normalized_evidence_sha256 != empty_jsonl_sha256:
+        raise _reference_error(
+            "gdelt_gkg normalized JSONL checksum must identify an empty source"
+        )
+    if record_count or identity_inventory is not None:
+        _validate_record_identity_inventory(
+            identity_inventory,
+            field="gdelt_gkg.record_identity_inventory",
+            expected_count=record_count,
+            provider_id="gdelt-gkg-2.1",
+            provider_mode="raw_archive",
+            expected_jsonl_sha256=normalized_evidence_sha256,
+        )
     _require_reference(
         value.get("artifact_reference"), field="gdelt_gkg.artifact_reference"
     )
@@ -673,13 +851,507 @@ def _validate_gdelt_like_evidence_run(
         "normalized_evidence_sha256",
     ):
         _require_sha(value.get(name), field=f"{field}.{name}")
-    for name in ("record_count", "capture_count"):
-        _require_count(value.get(name), field=f"{field}.{name}")
-    _require_reference(value.get("artifact_reference"), field=f"{field}.artifact_reference")
+    normalized_evidence_sha256 = str(value["normalized_evidence_sha256"])
+    record_count = _require_count(
+        value.get("record_count"), field=f"{field}.record_count"
+    )
+    _require_count(value.get("capture_count"), field=f"{field}.capture_count")
+    identity_inventory = value.get("record_identity_inventory")
+    if record_count == 0 and normalized_evidence_sha256 != _sha256_bytes(b""):
+        raise _reference_error(
+            f"{field} normalized JSONL checksum must identify an empty source"
+        )
+    if record_count or identity_inventory is not None:
+        _validate_record_identity_inventory(
+            identity_inventory,
+            field=f"{field}.record_identity_inventory",
+            expected_count=record_count,
+            provider_id=provider_id,
+            provider_mode=provider_mode,
+            expected_jsonl_sha256=normalized_evidence_sha256,
+        )
+    _require_reference(
+        value.get("artifact_reference"),
+        field=f"{field}.artifact_reference",
+    )
 
 
-def _validate_publisher_reference(value: Mapping[str, Any]) -> None:
-    count = _require_count(value.get("record_count"), field="publisher_news.record_count")
+_PUBLISHER_SNAPSHOT_PATHS = (
+    "article_entity_links.csv",
+    "normalized_articles.csv",
+)
+_MAX_PUBLISHER_SNAPSHOT_BYTES = 16 * 1024 * 1024
+_MAX_PUBLISHER_SNAPSHOTS_TOTAL_BYTES = 24 * 1024 * 1024
+
+
+def _publisher_run_artifacts(
+    run: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, bytes]:
+    field = f"publisher_news.runs[{index}]"
+    raw_inventory = run.get("artifact_inventory")
+    if not isinstance(raw_inventory, list) or not raw_inventory:
+        raise _reference_error(f"{field}.artifact_inventory is missing")
+    inventory: dict[str, tuple[str, int]] = {}
+    canonical_inventory: list[dict[str, Any]] = []
+    previous = ""
+    for item_index, item in enumerate(raw_inventory):
+        if not isinstance(item, Mapping) or set(item) != {
+            "path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise _reference_error(
+                f"{field}.artifact_inventory[{item_index}] is malformed"
+            )
+        path = _require_reference(
+            item.get("path"),
+            field=f"{field}.artifact_inventory[{item_index}].path",
+        )
+        digest = _require_sha(
+            item.get("sha256"),
+            field=f"{field}.artifact_inventory[{item_index}].sha256",
+        )
+        size = _require_count(
+            item.get("size_bytes"),
+            field=f"{field}.artifact_inventory[{item_index}].size_bytes",
+        )
+        if path in inventory or path < previous:
+            raise _reference_error(f"{field}.artifact_inventory is not canonical")
+        previous = path
+        inventory[path] = (digest, size)
+        canonical_inventory.append(
+            {"path": path, "sha256": digest, "size_bytes": size}
+        )
+    if _inventory_digest(canonical_inventory) != run.get(
+        "artifact_inventory_sha256"
+    ):
+        raise _reference_error(f"{field}.artifact_inventory checksum differs")
+
+    manifest_snapshot = run.get("run_manifest_snapshot")
+    if not isinstance(manifest_snapshot, Mapping) or set(manifest_snapshot) != {
+        "path",
+        "encoding",
+        "sha256",
+        "size_bytes",
+        "content_base64",
+    }:
+        raise _reference_error(f"{field}.run_manifest_snapshot is missing")
+    if (
+        manifest_snapshot.get("path") != "run_manifest.json"
+        or manifest_snapshot.get("encoding") != "base64url"
+        or manifest_snapshot.get("sha256") != run.get("run_manifest_sha256")
+    ):
+        raise _reference_error(f"{field}.run manifest snapshot identity differs")
+    manifest_size = _require_count(
+        manifest_snapshot.get("size_bytes"),
+        field=f"{field}.run_manifest_snapshot.size_bytes",
+    )
+    encoded_manifest = manifest_snapshot.get("content_base64")
+    if not isinstance(encoded_manifest, str):
+        raise _reference_error(f"{field}.run manifest snapshot content is missing")
+    try:
+        manifest_payload = base64.b64decode(
+            encoded_manifest, altchars=b"-_", validate=True
+        )
+    except (ValueError, base64.binascii.Error) as exc:
+        raise _reference_error(
+            f"{field}.run manifest snapshot is not canonical base64url"
+        ) from exc
+    if (
+        len(manifest_payload) != manifest_size
+        or len(manifest_payload) > 4 * 1024 * 1024
+        or _sha256_bytes(manifest_payload) != run.get("run_manifest_sha256")
+    ):
+        raise _reference_error(f"{field}.run manifest snapshot checksum differs")
+    try:
+        manifest = json.loads(manifest_payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise _reference_error(f"{field}.run manifest snapshot is invalid") from exc
+    if not isinstance(manifest, Mapping):
+        raise _reference_error(f"{field}.run manifest snapshot is not an object")
+    manifest_provider_mode = manifest.get("provider_mode") or manifest.get("data_kind")
+    if (
+        manifest.get("run_id") != run.get("run_id")
+        or manifest.get("status") != run.get("status")
+        or manifest.get("provider") != run.get("provider")
+        or manifest_provider_mode != run.get("provider_mode")
+        or manifest.get("finalization_state") != "COMMITTED"
+        or manifest.get("completion_marker") != "completion.json"
+        or manifest.get("artifact_inventory") != canonical_inventory
+        or manifest.get("artifact_inventory_sha256")
+        != run.get("artifact_inventory_sha256")
+    ):
+        raise _reference_error(
+            f"{field}.artifact inventory is not bound to its run manifest"
+        )
+
+    raw_snapshots = run.get("source_snapshots")
+    if not isinstance(raw_snapshots, list) or len(raw_snapshots) != len(
+        _PUBLISHER_SNAPSHOT_PATHS
+    ):
+        raise _reference_error(f"{field}.source_snapshots are missing")
+    snapshots: dict[str, bytes] = {}
+    total_size = 0
+    for snapshot_index, item in enumerate(raw_snapshots):
+        if not isinstance(item, Mapping) or set(item) != {
+            "path",
+            "encoding",
+            "sha256",
+            "size_bytes",
+            "content_base64",
+        }:
+            raise _reference_error(
+                f"{field}.source_snapshots[{snapshot_index}] is malformed"
+            )
+        path = item.get("path")
+        if path != _PUBLISHER_SNAPSHOT_PATHS[snapshot_index]:
+            raise _reference_error(f"{field}.source_snapshots are not canonical")
+        if item.get("encoding") != "base64url":
+            raise _reference_error(f"{field}.source snapshot encoding differs")
+        digest = _require_sha(
+            item.get("sha256"),
+            field=f"{field}.source_snapshots[{snapshot_index}].sha256",
+        )
+        size = _require_count(
+            item.get("size_bytes"),
+            field=f"{field}.source_snapshots[{snapshot_index}].size_bytes",
+        )
+        encoded = item.get("content_base64")
+        if not isinstance(encoded, str):
+            raise _reference_error(f"{field}.source snapshot content is missing")
+        try:
+            payload = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise _reference_error(
+                f"{field}.source snapshot is not canonical base64url"
+            ) from exc
+        total_size += len(payload)
+        if (
+            len(payload) != size
+            or len(payload) > _MAX_PUBLISHER_SNAPSHOT_BYTES
+            or total_size > _MAX_PUBLISHER_SNAPSHOTS_TOTAL_BYTES
+            or _sha256_bytes(payload) != digest
+            or inventory.get(path) != (digest, size)
+        ):
+            raise _reference_error(
+                f"{field}.source snapshot differs from the artifact inventory"
+            )
+        snapshots[path] = payload
+    if snapshots["normalized_articles.csv"] and (
+        inventory["normalized_articles.csv"][0]
+        != run.get("normalized_articles_sha256")
+    ):
+        raise _reference_error(f"{field}.normalized article checksum differs")
+    return snapshots
+
+
+def _parse_publisher_run_occurrences(
+    run: Mapping[str, Any],
+    *,
+    index: int,
+) -> tuple[NewsOccurrence, ...]:
+    snapshots = _publisher_run_artifacts(run, index=index)
+    field = f"publisher_news.runs[{index}]"
+    run_id = str(run["run_id"])
+    provider = run.get("provider")
+    provider_mode = run.get("provider_mode")
+    if not isinstance(provider, str) or not provider:
+        raise _reference_error(f"{field}.provider is missing")
+    if provider_mode not in {"real", "imported", "fixture"}:
+        raise _reference_error(f"{field}.provider_mode is unsupported")
+
+    link_required = {
+        "link_id",
+        "article_id",
+        "ticker",
+        "company_name",
+        "matched_alias",
+        "match_method",
+        "match_location",
+        "confidence",
+    }
+    links: dict[str, list[dict[str, str]]] = defaultdict(list)
+    seen_links: set[str] = set()
+    try:
+        text = snapshots["article_entity_links.csv"].decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        if reader.fieldnames is None or not link_required.issubset(reader.fieldnames):
+            raise _reference_error(f"{field}.entity-link snapshot fields differ")
+        for row_index, row in enumerate(reader, start=2):
+            link = {name: str(row.get(name) or "").strip() for name in link_required}
+            if any(not value for value in link.values()):
+                raise _reference_error(
+                    f"{field}.entity-link row {row_index} is incomplete"
+                )
+            if link["link_id"] in seen_links:
+                raise _reference_error(f"{field}.entity-link identity is duplicated")
+            seen_links.add(link["link_id"])
+            links[link["article_id"]].append(link)
+    except (UnicodeError, csv.Error) as exc:
+        raise _reference_error(f"{field}.entity-link snapshot is invalid") from exc
+
+    article_required = {
+        "article_id",
+        "provider",
+        "source_name",
+        "published_at",
+        "available_at",
+        "fetched_at",
+        "mentioned_tickers",
+        "mentioned_companies",
+        "mentioned_sectors",
+        "content_sha256",
+        "duplicate_of",
+        "ingestion_run_id",
+        "raw_artifact_reference",
+        "data_class",
+    }
+    occurrences: list[NewsOccurrence] = []
+    seen_articles: set[str] = set()
+    inventory_paths = {
+        str(item["path"])
+        for item in run["artifact_inventory"]
+        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+    }
+    try:
+        text = snapshots["normalized_articles.csv"].decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        if reader.fieldnames is None or not article_required.issubset(reader.fieldnames):
+            raise _reference_error(f"{field}.normalized article fields differ")
+        for row_index, row in enumerate(reader, start=2):
+            article_id = str(row.get("article_id") or "").strip()
+            data_class = str(row.get("data_class") or "").casefold()
+            row_provider = str(row.get("provider") or "").strip()
+            raw_reference = str(row.get("raw_artifact_reference") or "").strip()
+            if (
+                not article_id
+                or article_id in seen_articles
+                or row.get("ingestion_run_id") != run_id
+                or row_provider != provider
+                or data_class != provider_mode
+                or raw_reference not in inventory_paths
+            ):
+                raise _reference_error(
+                    f"{field}.normalized article identity differs at row {row_index}"
+                )
+            seen_articles.add(article_id)
+            content_sha256 = _require_sha(
+                str(row.get("content_sha256") or ""),
+                field=f"{field}.normalized_articles[{row_index}].content_sha256",
+            )
+            row_links = tuple(
+                sorted(links.get(article_id, ()), key=lambda item: item["link_id"])
+            )
+            try:
+                tickers = _json_list(
+                    row.get("mentioned_tickers"),
+                    field_name=f"mentioned_tickers row {row_index}",
+                )
+                companies = _json_list(
+                    row.get("mentioned_companies"),
+                    field_name=f"mentioned_companies row {row_index}",
+                )
+                sectors = _json_list(
+                    row.get("mentioned_sectors"),
+                    field_name=f"mentioned_sectors row {row_index}",
+                )
+                published_at = parse_timestamp(
+                    row.get("published_at"), field_name="published_at"
+                )
+                source_observed_at = parse_timestamp(
+                    row.get("source_observed_at"), field_name="source_observed_at"
+                )
+                available_at = parse_timestamp(
+                    row.get("available_at"), field_name="available_at"
+                )
+                fetched_at = parse_timestamp(
+                    row.get("fetched_at"), field_name="fetched_at"
+                )
+            except CoverageAuditError as exc:
+                raise _reference_error(
+                    f"{field}.normalized article row {row_index} is invalid"
+                ) from exc
+            if available_at is None or fetched_at is None:
+                raise _reference_error(f"{field}.normalized article time is missing")
+            if available_at < fetched_at or (
+                published_at is not None and available_at < published_at
+            ):
+                raise _reference_error(
+                    f"{field}.normalized article availability precedes its evidence"
+                )
+            if {item.upper() for item in tickers} != {
+                item["ticker"].upper() for item in row_links
+            } or set(companies) != {item["company_name"] for item in row_links}:
+                raise _reference_error(
+                    f"{field}.entity links disagree with normalized article"
+                )
+            duplicate_of = str(row.get("duplicate_of") or "").strip() or None
+            occurrences.append(
+                NewsOccurrence(
+                    occurrence_key=f"{run_id}:{article_id}",
+                    ingestion_run_id=run_id,
+                    article_id=article_id,
+                    canonical_article_id=duplicate_of or article_id,
+                    provider=row_provider,
+                    provider_mode=str(provider_mode),
+                    source_name=str(row.get("source_name") or "unknown").strip()
+                    or "unknown",
+                    source_url=_public_url(
+                        str(row.get("canonical_url") or row.get("source_url") or "")
+                    ),
+                    title=str(row.get("title") or "").strip() or None,
+                    published_at=published_at,
+                    available_at=available_at,
+                    fetched_at=fetched_at,
+                    published_timezone=(
+                        str(row.get("published_timezone") or "").strip() or None
+                    ),
+                    language=str(row.get("language") or "").strip().casefold() or None,
+                    tickers=tickers,
+                    companies=companies,
+                    sectors=sectors,
+                    content_sha256=content_sha256,
+                    raw_artifact_reference=raw_reference,
+                    data_class=data_class,
+                    duplicate_of=duplicate_of,
+                    entity_links=row_links,
+                    source_observed_at=source_observed_at,
+                )
+            )
+    except (UnicodeError, csv.Error) as exc:
+        raise _reference_error(f"{field}.normalized article snapshot is invalid") from exc
+    if set(links) - seen_articles:
+        raise _reference_error(f"{field}.entity link references an unknown article")
+    if len(occurrences) != run.get("occurrence_count"):
+        raise _reference_error(f"{field}.occurrence count differs")
+    return tuple(occurrences)
+
+
+def adapt_publisher_occurrences(
+    occurrences: Sequence[NewsOccurrence],
+    permission_ids: Mapping[str, str],
+) -> tuple[EvidenceRecord, ...]:
+    """Adapt checksum-bound NEWS occurrences into canonical coverage records."""
+
+    grouped: dict[str, list[NewsOccurrence]] = defaultdict(list)
+    for occurrence in occurrences:
+        grouped[occurrence.canonical_article_id].append(occurrence)
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+    records: list[EvidenceRecord] = []
+    for canonical_id in sorted(grouped):
+        grouped_occurrences = sorted(
+            grouped[canonical_id],
+            key=lambda item: (
+                item.available_at or far_future,
+                item.fetched_at or far_future,
+                item.occurrence_key,
+            ),
+        )
+        ogdc_occurrences = [item for item in grouped_occurrences if item.is_ogdc]
+        # A canonical article may first appear without an OGDC entity match and
+        # only gain that evidence in a later duplicate.  OGDC membership cannot
+        # borrow the earlier general-news timestamp: use the earliest occurrence
+        # that actually carries the controlled link.  General-only records keep
+        # the earliest occurrence as their representative.
+        representative = (
+            ogdc_occurrences[0] if ogdc_occurrences else grouped_occurrences[0]
+        )
+        if representative.fetched_at is None:
+            raise ValueError("Publisher-news evidence has no acquisition timestamp")
+        if (
+            representative.available_at is not None
+            and representative.available_at < representative.fetched_at
+        ):
+            raise ValueError("Publisher-news evidence attempts historical backdating")
+        if representative.ingestion_run_id not in permission_ids:
+            raise ValueError("Publisher-news run has no permission decision")
+        links = tuple(
+            {"ingestion_run_id": item.ingestion_run_id, **dict(link)}
+            for item in ogdc_occurrences
+            for link in item.entity_links
+            if str(link.get("ticker") or "").upper() == "OGDC"
+        )
+        occurrence_identities = [
+            {
+                "occurrence_ordinal": ordinal,
+                "occurrence_key": item.occurrence_key,
+                "ingestion_run_id": item.ingestion_run_id,
+                "article_id": item.article_id,
+                "canonical_article_id": item.canonical_article_id,
+                "content_sha256": item.content_sha256,
+                "is_ogdc": item.is_ogdc,
+            }
+            for ordinal, item in enumerate(grouped_occurrences)
+        ]
+        identity = hashlib.sha256(
+            (canonical_id + "\0" + representative.occurrence_key).encode("utf-8")
+        ).hexdigest()[:24]
+        records.append(
+            EvidenceRecord(
+                evidence_id=f"EVID-NEWS-{identity}",
+                evidence_type="publisher_news",
+                provider_id=representative.provider,
+                provider_mode=representative.provider_mode,
+                data_class=representative.data_class,
+                source_name=representative.source_name,
+                source_url=representative.source_url,
+                source_record_id=canonical_id,
+                ticker="OGDC" if ogdc_occurrences else "GENERAL",
+                company_name=(
+                    "Oil & Gas Development Company Limited"
+                    if ogdc_occurrences
+                    else "General financial news"
+                ),
+                title=representative.title,
+                source_published_at=representative.published_at,
+                source_published_date=None,
+                available_at=representative.available_at,
+                fetched_at=representative.fetched_at,
+                imported_at=representative.fetched_at,
+                historical_availability_basis=(
+                    "news-availability-v1-conservative-acquisition"
+                ),
+                time_precision=(
+                    "second" if representative.published_at is not None else "unknown"
+                ),
+                contemporaneous_source_id=canonical_id,
+                contemporaneous_batch_at=None,
+                permission_policy_id=permission_ids[representative.ingestion_run_id],
+                raw_evidence_reference=(
+                    "news_ingestion/"
+                    f"{representative.ingestion_run_id}/"
+                    f"{representative.raw_artifact_reference}"
+                ),
+                content_sha256=representative.content_sha256,
+                language=representative.language,
+                entity_match_evidence=links,
+                source_metadata={
+                    "canonical_article_id": canonical_id,
+                    "representative_occurrence_key": representative.occurrence_key,
+                    "occurrence_count": len(grouped_occurrences),
+                    "ogdc_occurrence_count": len(ogdc_occurrences),
+                    "occurrence_identities": occurrence_identities,
+                    "source_observed_at": (
+                        representative.source_observed_at.isoformat()
+                        if representative.source_observed_at is not None
+                        else None
+                    ),
+                },
+            )
+        )
+    return tuple(records)
+
+
+def _validate_publisher_reference(
+    value: Mapping[str, Any],
+    *,
+    allow_legacy_binding: bool = False,
+) -> None:
+    count = _require_count(
+        value.get("record_count"), field="publisher_news.record_count"
+    )
     status = value.get("status")
     if status == "NOT_SUPPLIED":
         if count != 0:
@@ -727,8 +1399,30 @@ def _validate_publisher_reference(value: Mapping[str, Any]) -> None:
             or not decision["decision_id"]
         ):
             raise _reference_error("publisher-news permission decision did not pass")
+        if not allow_legacy_binding or run.get("source_snapshots") is not None:
+            _parse_publisher_run_occurrences(run, index=index)
     if count > total_occurrences:
         raise _reference_error("publisher-news canonical count exceeds occurrences")
+    adapted_sha256 = value.get("adapted_records_sha256")
+    adapted_inventory = value.get("adapted_record_inventory")
+    if adapted_sha256 is None or adapted_inventory is None:
+        if not allow_legacy_binding:
+            raise _reference_error(
+                "publisher-news adapted-record provenance is missing"
+            )
+    else:
+        expected_jsonl_sha256 = _require_sha(
+            adapted_sha256,
+            field="publisher_news.adapted_records_sha256",
+        )
+        _validate_record_identity_inventory(
+            adapted_inventory,
+            field="publisher_news.adapted_record_inventory",
+            expected_count=count,
+            provider_id=None,
+            provider_mode=None,
+            expected_jsonl_sha256=expected_jsonl_sha256,
+        )
     _validate_permission_reference(
         value.get("permission_policy_reference"),
         field="publisher_news.permission_policy_reference",
@@ -753,7 +1447,11 @@ def _validate_publisher_reference(value: Mapping[str, Any]) -> None:
             )
 
 
-def _validate_input_reference_document(value: Mapping[str, Any]) -> None:
+def _validate_input_reference_document(
+    value: Mapping[str, Any],
+    *,
+    allow_legacy_publisher_binding: bool = False,
+) -> None:
     if value.get("schema_version") != EVIDENCE_COVERAGE_PACK_SCHEMA_VERSION:
         raise _reference_error("input-reference schema is unsupported")
     inputs = value.get("inputs")
@@ -772,7 +1470,10 @@ def _validate_input_reference_document(value: Mapping[str, Any]) -> None:
         elif kind == "psx_announcement_evidence":
             _validate_psx_reference(item)
         elif kind == "publisher_news":
-            _validate_publisher_reference(item)
+            _validate_publisher_reference(
+                item,
+                allow_legacy_binding=allow_legacy_publisher_binding,
+            )
         elif kind == "readiness_configuration":
             if item.get("schema_version") != "1.0":
                 raise _reference_error("readiness configuration schema differs")
@@ -860,8 +1561,79 @@ def _permission_ids_by_evidence_type(
     return result
 
 
+def _record_inventory_entry(
+    record: EvidenceRecord,
+    *,
+    source_ordinal: int,
+) -> dict[str, Any]:
+    return {
+        "source_ordinal": source_ordinal,
+        "evidence_id": record.evidence_id,
+        "provider_id": record.provider_id,
+        "provider_mode": record.provider_mode,
+        "source_record_id": record.source_record_id,
+        "contemporaneous_source_id": record.contemporaneous_source_id,
+        "content_sha256": record.content_sha256,
+        "normalized_record_sha256": _sha256_bytes(
+            _canonical_bytes(record.to_dict())
+        ),
+    }
+
+
+def _verify_bound_record_inventory(
+    *,
+    records_by_id: Mapping[str, EvidenceRecord],
+    inventory: Mapping[str, Any],
+    expected_evidence_type: str,
+    expected_jsonl_sha256: str,
+    claimed_ids: set[str],
+    label: str,
+) -> None:
+    entries = inventory.get("records")
+    if not isinstance(entries, list):
+        raise EvidenceCoverageVerificationError(
+            f"Coverage {label} record identity inventory is missing"
+        )
+    canonical_rows: list[bytes] = []
+    for source_ordinal, expected in enumerate(entries):
+        if not isinstance(expected, Mapping):
+            raise EvidenceCoverageVerificationError(
+                f"Coverage {label} record identity inventory is malformed"
+            )
+        evidence_id = expected.get("evidence_id")
+        record = records_by_id.get(str(evidence_id))
+        if (
+            record is None
+            or record.evidence_type != expected_evidence_type
+            or record.evidence_id in claimed_ids
+            or _record_inventory_entry(
+                record,
+                source_ordinal=source_ordinal,
+            )
+            != dict(expected)
+        ):
+            raise EvidenceCoverageVerificationError(
+                f"Coverage {label} record differs from its upstream identity inventory"
+            )
+        claimed_ids.add(record.evidence_id)
+        canonical_rows.append(_canonical_bytes(record.to_dict()))
+    observed_jsonl_sha256 = _sha256_bytes(
+        b"".join(row + b"\n" for row in canonical_rows)
+    )
+    if (
+        observed_jsonl_sha256 != expected_jsonl_sha256
+        or inventory.get("canonical_jsonl_sha256") != expected_jsonl_sha256
+    ):
+        raise EvidenceCoverageVerificationError(
+            f"Coverage {label} records differ from the checksum-bound source JSONL"
+        )
+
+
 def _verify_record_sources(
-    records: Sequence[EvidenceRecord], inputs: Mapping[str, Any]
+    records: Sequence[EvidenceRecord],
+    inputs: Mapping[str, Any],
+    *,
+    allow_legacy_publisher_binding: bool = False,
 ) -> None:
     expected_counts = _referenced_population_counts(inputs)
     observed_counts = {
@@ -874,6 +1646,131 @@ def _verify_record_sources(
         raise EvidenceCoverageVerificationError(
             "Coverage normalized evidence populations disagree with source references"
         )
+
+    records_by_id = {record.evidence_id: record for record in records}
+    if len(records_by_id) != len(records):
+        raise EvidenceCoverageVerificationError(
+            "Coverage normalized evidence identities are duplicated"
+        )
+    inventory_bindings: list[tuple[str, Mapping[str, Any], str, str]] = []
+    publisher_run_decisions: dict[str, str] = {}
+    publisher_occurrence_count = 0
+    publisher_occurrences: list[NewsOccurrence] = []
+    for item in inputs.get("inputs", []):
+        if not isinstance(item, Mapping):
+            continue
+        kind = item.get("input_kind")
+        if kind == "gdelt_gkg":
+            inventory = item.get("record_identity_inventory")
+            if isinstance(inventory, Mapping):
+                inventory_bindings.append(
+                    (
+                        "gdelt_metadata",
+                        inventory,
+                        str(item.get("normalized_evidence_sha256") or ""),
+                        "GDELT",
+                    )
+                )
+        elif kind == "psx_announcement_evidence" and item.get("status") == "LOADED":
+            run = item.get("run_reference")
+            if isinstance(run, Mapping):
+                inventory = run.get("record_identity_inventory")
+                if isinstance(inventory, Mapping):
+                    inventory_bindings.append(
+                        (
+                            "exchange_announcement",
+                            inventory,
+                            str(run.get("normalized_evidence_sha256") or ""),
+                            "PSX",
+                        )
+                    )
+        elif kind == "publisher_news" and item.get("status") == "LOADED":
+            inventory = item.get("adapted_record_inventory")
+            adapted_sha256 = item.get("adapted_records_sha256")
+            if isinstance(inventory, Mapping) and isinstance(
+                adapted_sha256, str
+            ):
+                inventory_bindings.append(
+                    (
+                        "publisher_news",
+                        inventory,
+                        adapted_sha256,
+                        "publisher",
+                    )
+                )
+            elif not allow_legacy_publisher_binding:
+                raise EvidenceCoverageVerificationError(
+                    "Coverage publisher records lack checksum-bound adapted provenance"
+                )
+            for run_index, run in enumerate(item.get("run_references", [])):
+                if not isinstance(run, Mapping):
+                    continue
+                run_id = run.get("run_id")
+                decision = run.get("source_permission_decision")
+                if isinstance(run_id, str) and isinstance(decision, Mapping):
+                    decision_id = decision.get("decision_id")
+                    if isinstance(decision_id, str):
+                        publisher_run_decisions[run_id] = decision_id
+                publisher_occurrence_count += int(run.get("occurrence_count", 0))
+                if not allow_legacy_publisher_binding or run.get(
+                    "source_snapshots"
+                ) is not None:
+                    publisher_occurrences.extend(
+                        _parse_publisher_run_occurrences(run, index=run_index)
+                    )
+
+    claimed_ids: set[str] = set()
+    for evidence_type, inventory, source_sha256, label in inventory_bindings:
+        _verify_bound_record_inventory(
+            records_by_id=records_by_id,
+            inventory=inventory,
+            expected_evidence_type=evidence_type,
+            expected_jsonl_sha256=source_sha256,
+            claimed_ids=claimed_ids,
+            label=label,
+        )
+    expected_bound_ids = {
+        record.evidence_id
+        for record in records
+        if record.evidence_type != "publisher_news"
+        or not allow_legacy_publisher_binding
+    }
+    if claimed_ids != expected_bound_ids:
+        unclaimed_nonempty_types = {
+            record.evidence_type
+            for record in records
+            if record.evidence_id not in claimed_ids
+        }
+        if unclaimed_nonempty_types:
+            raise EvidenceCoverageVerificationError(
+                "Coverage normalized evidence is not bound to its upstream "
+                "record identity inventory"
+            )
+
+    if not allow_legacy_publisher_binding:
+        try:
+            expected_publisher_records = adapt_publisher_occurrences(
+                publisher_occurrences,
+                publisher_run_decisions,
+            )
+        except (TypeError, ValueError) as exc:
+            raise EvidenceCoverageVerificationError(
+                "Coverage publisher source snapshots cannot be adapted safely"
+            ) from exc
+        observed_publisher_records = tuple(
+            record for record in records if record.evidence_type == "publisher_news"
+        )
+        if {
+            record.evidence_id: record.to_dict()
+            for record in observed_publisher_records
+        } != {
+            record.evidence_id: record.to_dict()
+            for record in expected_publisher_records
+        }:
+            raise EvidenceCoverageVerificationError(
+                "Coverage publisher records differ from checksum-bound NEWS snapshots"
+            )
+
     allowed_permissions = _permission_ids_by_evidence_type(inputs)
     for record in records:
         permitted = allowed_permissions[record.evidence_type]
@@ -881,6 +1778,46 @@ def _verify_record_sources(
             raise EvidenceCoverageVerificationError(
                 "Coverage normalized evidence permission identity is unbound"
             )
+        if record.evidence_type == "publisher_news":
+            occurrence_key = str(
+                record.source_metadata.get("representative_occurrence_key") or ""
+            )
+            run_id = occurrence_key.partition(":")[0]
+            if (
+                run_id not in publisher_run_decisions
+                or publisher_run_decisions[run_id] != record.permission_policy_id
+            ):
+                raise EvidenceCoverageVerificationError(
+                    "Coverage publisher record is not bound to its upstream "
+                    "run identity"
+                )
+            occurrence_run_ids = {
+                item.get("ingestion_run_id")
+                for item in record.source_metadata.get(
+                    "occurrence_identities", ()
+                )
+                if isinstance(item, Mapping)
+            }
+            if not occurrence_run_ids.issubset(publisher_run_decisions):
+                raise EvidenceCoverageVerificationError(
+                    "Coverage publisher occurrence is not bound to an upstream run"
+                )
+            if any(
+                link.get("ingestion_run_id") not in publisher_run_decisions
+                for link in record.entity_match_evidence
+            ):
+                raise EvidenceCoverageVerificationError(
+                    "Coverage publisher entity link is not bound to an upstream run"
+                )
+    observed_publisher_occurrences = sum(
+        int(record.source_metadata.get("occurrence_count", 0))
+        for record in records
+        if record.evidence_type == "publisher_news"
+    )
+    if observed_publisher_occurrences != publisher_occurrence_count:
+        raise EvidenceCoverageVerificationError(
+            "Coverage publisher occurrence identities disagree with upstream runs"
+        )
 
 
 def _validate_stock_reference(value: Mapping[str, Any]) -> None:
@@ -1117,7 +2054,11 @@ def _read_csv(
         ) from exc
 
 
-def _read_evidence_records(root: Path) -> tuple[EvidenceRecord, ...]:
+def _read_evidence_records(
+    root: Path,
+    *,
+    legacy_publisher_run_id: str | None = None,
+) -> tuple[EvidenceRecord, ...]:
     path = root / "normalized_evidence.jsonl"
     if path.is_symlink() or not path.is_file():
         raise EvidenceCoverageVerificationError(
@@ -1142,8 +2083,62 @@ def _read_evidence_records(root: Path) -> tuple[EvidenceRecord, ...]:
                 raise EvidenceCoverageVerificationError(
                     "Coverage normalized evidence is not canonical"
                 )
+            normalized_value = dict(value)
+            if (
+                legacy_publisher_run_id is not None
+                and normalized_value.get("evidence_type") == "publisher_news"
+            ):
+                metadata = normalized_value.get("source_metadata")
+                links = normalized_value.get("entity_match_evidence")
+                if isinstance(metadata, Mapping) and isinstance(links, list):
+                    occurrence_key = str(
+                        metadata.get("representative_occurrence_key") or ""
+                    )
+                    run_id, separator, article_id = occurrence_key.partition(":")
+                    if (
+                        separator
+                        and run_id == legacy_publisher_run_id
+                        and metadata.get("occurrence_count") == 1
+                        and "occurrence_identities" not in metadata
+                    ):
+                        upgraded_metadata = dict(metadata)
+                        upgraded_metadata["occurrence_identities"] = [
+                            {
+                                "occurrence_ordinal": 0,
+                                "occurrence_key": occurrence_key,
+                                "ingestion_run_id": run_id,
+                                "article_id": article_id,
+                                "canonical_article_id": metadata.get(
+                                    "canonical_article_id"
+                                ),
+                                "content_sha256": normalized_value.get(
+                                    "content_sha256"
+                                ),
+                                "is_ogdc": normalized_value.get("ticker")
+                                == "OGDC",
+                            }
+                        ]
+                        normalized_value["source_metadata"] = upgraded_metadata
+                    if (
+                        separator
+                        and run_id == legacy_publisher_run_id
+                        and links
+                        and all(
+                            isinstance(link, Mapping)
+                            and "ingestion_run_id" not in link
+                            and link.get("article_id") == article_id
+                            for link in links
+                        )
+                    ):
+                        normalized_value["entity_match_evidence"] = [
+                            {
+                                "ingestion_run_id": legacy_publisher_run_id,
+                                **dict(link),
+                            }
+                            for link in links
+                        ]
             try:
-                records.append(EvidenceRecord.from_dict(value))
+                records.append(EvidenceRecord.from_dict(normalized_value))
             except (TypeError, ValueError) as exc:
                 raise EvidenceCoverageVerificationError(
                     f"Coverage normalized evidence contract failed at line {line_number}"
@@ -1801,10 +2796,18 @@ def _verify_portable_recomputation(
     split_rows: Sequence[Mapping[str, str]],
     monthly_rows: Sequence[Mapping[str, str]],
     missing_rows: Sequence[Mapping[str, str]],
+    legacy_publisher_run_id: str | None = None,
 ) -> EvidenceCoverageComputation:
-    records = _read_evidence_records(root)
+    records = _read_evidence_records(
+        root,
+        legacy_publisher_run_id=legacy_publisher_run_id,
+    )
     stock, config = _read_stock_calendar(root)
-    _verify_record_sources(records, inputs)
+    _verify_record_sources(
+        records,
+        inputs,
+        allow_legacy_publisher_binding=legacy_publisher_run_id is not None,
+    )
     _verify_stock_calendar_reference(stock, stock_reference)
     criteria = _criteria_from_summary(summary)
     try:
@@ -1847,6 +2850,7 @@ def _verify_semantics(
     quality: Mapping[str, Any],
     inputs: Mapping[str, Any],
     stock_reference: Mapping[str, Any],
+    legacy_publisher_run_id: str | None = None,
 ) -> tuple[int, dict[str, str]]:
     mapping_rows = _read_csv(root, "evidence_session_mappings.csv", _MAPPING_FIELDS)
     split_rows = _read_csv(root, "split_coverage.csv", _SPLIT_FIELDS)
@@ -1861,6 +2865,7 @@ def _verify_semantics(
         split_rows=split_rows,
         monthly_rows=monthly_rows,
         missing_rows=missing_rows,
+        legacy_publisher_run_id=legacy_publisher_run_id,
     )
     mappings = _typed_mappings(mapping_rows)
     splits = _typed_split_rows(split_rows, mappings)
@@ -1958,7 +2963,11 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         )
 
     run_id = validate_evidence_coverage_run_id(expected_run_id)
-    manifest = _read_json(root / "run_manifest.json")
+    manifest_path = root / "run_manifest.json"
+    manifest = _read_json(manifest_path)
+    legacy_publisher_run_id = _LEGACY_PUBLISHER_BINDINGS.get(
+        (run_id, sha256_file(manifest_path))
+    )
     completion = _read_json(root / "completion.json")
     summary = _read_json(root / "final_summary.json")
     quality = _read_json(root / "quality_report.json")
@@ -1977,7 +2986,10 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         raise EvidenceCoverageVerificationError(
             "Coverage input or stock references are invalid"
         )
-    _validate_input_reference_document(inputs)
+    _validate_input_reference_document(
+        inputs,
+        allow_legacy_publisher_binding=legacy_publisher_run_id is not None,
+    )
     _validate_stock_reference(stock)
     if _referenced_record_count(inputs) != summary.get("record_count_input"):
         raise EvidenceCoverageVerificationError(
@@ -2030,7 +3042,6 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         optional=False,
     )
 
-    manifest_path = root / "run_manifest.json"
     summary_path = root / "final_summary.json"
     if (
         completion.get("manifest_sha256") != sha256_file(manifest_path)
@@ -2098,6 +3109,7 @@ def _verify_root(root: Path, *, expected_run_id: str) -> EvidenceCoverageRunVeri
         quality=quality,
         inputs=inputs,
         stock_reference=stock,
+        legacy_publisher_run_id=legacy_publisher_run_id,
     )
     return EvidenceCoverageRunVerification(
         run_id=run_id,
@@ -2364,6 +3376,8 @@ __all__ = [
     "EvidenceCoverageRunCollisionError",
     "EvidenceCoverageRunVerification",
     "EvidenceCoverageVerificationError",
+    "adapt_publisher_occurrences",
+    "make_record_identity_inventory",
     "make_evidence_coverage_run_id",
     "publish_evidence_coverage_run",
     "validate_evidence_coverage_run_id",

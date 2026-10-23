@@ -4,13 +4,10 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 import sys
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +21,8 @@ from paisa.evidence.coverage import (  # noqa: E402
     compute_evidence_coverage,
 )
 from paisa.evidence.coverage_artifacts import (  # noqa: E402
+    adapt_publisher_occurrences,
+    make_record_identity_inventory,
     make_evidence_coverage_run_id,
     publish_evidence_coverage_run,
     verify_evidence_coverage_pack,
@@ -33,7 +32,6 @@ from paisa.evidence.policy import load_evidence_permission_policy  # noqa: E402
 from paisa.news.coverage import (  # noqa: E402
     CoverageConfig,
     NewsEvidence,
-    NewsOccurrence,
     load_news_evidence,
     load_source_permission_policy,
     load_stock_evidence,
@@ -167,109 +165,26 @@ def _publisher_permission_ids(news: NewsEvidence) -> dict[str, str]:
 
 def adapt_publisher_news(news: NewsEvidence) -> tuple[EvidenceRecord, ...]:
     """Convert one representative per canonical article without backdating it."""
-
-    permission_ids = _publisher_permission_ids(news)
-    grouped: dict[str, list[NewsOccurrence]] = defaultdict(list)
-    for occurrence in news.occurrences:
-        grouped[occurrence.canonical_article_id].append(occurrence)
-
-    far_future = datetime.max.replace(tzinfo=timezone.utc)
-    records: list[EvidenceRecord] = []
-    for canonical_id in sorted(grouped):
-        occurrences = sorted(
-            grouped[canonical_id],
-            key=lambda item: (
-                item.available_at or far_future,
-                item.fetched_at or far_future,
-                item.occurrence_key,
-            ),
-        )
-        representative = occurrences[0]
-        if representative.fetched_at is None:
-            raise ValueError("Publisher-news evidence has no acquisition timestamp")
-        if (
-            representative.available_at is not None
-            and representative.available_at < representative.fetched_at
-        ):
-            raise ValueError("Publisher-news evidence attempts historical backdating")
-        if representative.ingestion_run_id not in permission_ids:
-            raise ValueError("Publisher-news run has no permission decision")
-
-        ogdc_occurrences = [item for item in occurrences if item.is_ogdc]
-        entity_links = tuple(
-            dict(link)
-            for item in ogdc_occurrences
-            for link in item.entity_links
-            if str(link.get("ticker") or "").upper() == "OGDC"
-        )
-        identity = hashlib.sha256(
-            (canonical_id + "\0" + representative.occurrence_key).encode("utf-8")
-        ).hexdigest()[:24]
-        records.append(
-            EvidenceRecord(
-                evidence_id=f"EVID-NEWS-{identity}",
-                evidence_type="publisher_news",
-                provider_id=representative.provider,
-                provider_mode=representative.provider_mode,
-                data_class=representative.data_class,
-                source_name=representative.source_name,
-                source_url=representative.source_url,
-                source_record_id=canonical_id,
-                ticker="OGDC" if ogdc_occurrences else "GENERAL",
-                company_name=(
-                    "Oil & Gas Development Company Limited"
-                    if ogdc_occurrences
-                    else "General financial news"
-                ),
-                title=representative.title,
-                source_published_at=representative.published_at,
-                source_published_date=None,
-                available_at=representative.available_at,
-                fetched_at=representative.fetched_at,
-                imported_at=representative.fetched_at,
-                historical_availability_basis=(
-                    "news-availability-v1-conservative-acquisition"
-                ),
-                time_precision=(
-                    "second" if representative.published_at is not None else "unknown"
-                ),
-                contemporaneous_source_id=canonical_id,
-                contemporaneous_batch_at=None,
-                permission_policy_id=permission_ids[
-                    representative.ingestion_run_id
-                ],
-                raw_evidence_reference=(
-                    "news_ingestion/"
-                    f"{representative.ingestion_run_id}/"
-                    f"{representative.raw_artifact_reference}"
-                ),
-                content_sha256=representative.content_sha256,
-                language=representative.language,
-                entity_match_evidence=entity_links,
-                source_metadata={
-                    "canonical_article_id": canonical_id,
-                    "representative_occurrence_key": representative.occurrence_key,
-                    "occurrence_count": len(occurrences),
-                    "ogdc_occurrence_count": len(ogdc_occurrences),
-                    "source_observed_at": (
-                        representative.source_observed_at.isoformat()
-                        if representative.source_observed_at is not None
-                        else None
-                    ),
-                },
-            )
-        )
-    return tuple(records)
+    return adapt_publisher_occurrences(
+        news.occurrences,
+        _publisher_permission_ids(news),
+    )
 
 
-def _publisher_reference(news: NewsEvidence, count: int) -> dict[str, Any]:
+def _publisher_reference(
+    news: NewsEvidence,
+    records: Sequence[EvidenceRecord],
+) -> dict[str, Any]:
+    inventory = make_record_identity_inventory(records)
     return {
         "input_kind": "publisher_news",
         "status": "LOADED" if news.run_references else "NOT_SUPPLIED",
-        "record_count": count,
+        "record_count": len(records),
         "run_references": [dict(item) for item in news.run_references],
         "database_fingerprints": dict(news.database_fingerprints),
         "permission_policy_reference": dict(news.permission_policy_reference),
+        "adapted_records_sha256": inventory["canonical_jsonl_sha256"],
+        "adapted_record_inventory": inventory,
     }
 
 
@@ -328,7 +243,15 @@ def _load_gdelt_runs(
             raise ValueError("GDELT evidence identity is duplicated across runs")
         seen_ids.update(item.evidence_id for item in loaded.records)
         records.extend(loaded.records)
-        references.append({"input_kind": "gdelt_gkg", **dict(loaded.reference)})
+        references.append(
+            {
+                "input_kind": "gdelt_gkg",
+                **dict(loaded.reference),
+                "record_identity_inventory": make_record_identity_inventory(
+                    loaded.records
+                ),
+            }
+        )
     return records, references
 
 
@@ -353,11 +276,12 @@ def main(argv: list[str] | None = None) -> int:
                 database_path=args.news_database or None,
                 allow_legacy_unsealed=False,
                 source_permission_policy=news_policy,
+                include_portable_source_snapshots=True,
             )
             publisher_records = adapt_publisher_news(news)
             records.extend(publisher_records)
             input_references.append(
-                _publisher_reference(news, len(publisher_records))
+                _publisher_reference(news, publisher_records)
             )
         else:
             input_references.append(_no_publisher_reference())

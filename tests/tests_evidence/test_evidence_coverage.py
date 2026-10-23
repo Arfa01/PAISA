@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, time, timezone
+import hashlib
 
 import pytest
 
@@ -215,8 +216,15 @@ def _publisher(
     identifier: str,
     available_at: datetime,
     *,
-    ticker: str = "MEBL",
+    ticker: str = "GENERAL",
 ) -> EvidenceRecord:
+    run_id = "NEWS-20240101-000000-coverage"
+    article_id = f"ARTICLE-{identifier}"
+    link_id = "NEWSLINK-" + hashlib.sha256(
+        "\0".join((article_id, "OGDC", "OGDC", "title", "exact")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
     return EvidenceRecord(
         evidence_id=identifier,
         evidence_type="publisher_news",
@@ -230,7 +238,7 @@ def _publisher(
         company_name=(
             "Oil and Gas Development Company Limited"
             if ticker == "OGDC"
-            else "Meezan Bank Limited"
+            else "General financial news"
         ),
         title="Financial news",
         source_published_at=available_at,
@@ -243,8 +251,43 @@ def _publisher(
         contemporaneous_source_id=identifier,
         contemporaneous_batch_at=None,
         permission_policy_id="rss-policy",
-        raw_evidence_reference=f"feed.xml#{identifier}",
+        raw_evidence_reference=f"news_ingestion/{run_id}/feed.xml#{identifier}",
         content_sha256=SHA256,
+        entity_match_evidence=(
+            (
+                {
+                    "ingestion_run_id": run_id,
+                    "link_id": link_id,
+                    "article_id": article_id,
+                    "ticker": "OGDC",
+                    "company_name": "Oil and Gas Development Company Limited",
+                    "matched_alias": "OGDC",
+                    "match_method": "exact",
+                    "match_location": "title",
+                    "confidence": "exact",
+                },
+            )
+            if ticker == "OGDC"
+            else ()
+        ),
+        source_metadata={
+            "canonical_article_id": identifier,
+            "representative_occurrence_key": f"{run_id}:{article_id}",
+            "occurrence_count": 1,
+            "ogdc_occurrence_count": 1 if ticker == "OGDC" else 0,
+            "occurrence_identities": [
+                {
+                    "occurrence_ordinal": 0,
+                    "occurrence_key": f"{run_id}:{article_id}",
+                    "ingestion_run_id": run_id,
+                    "article_id": article_id,
+                    "canonical_article_id": identifier,
+                    "content_sha256": SHA256,
+                    "is_ogdc": ticker == "OGDC",
+                }
+            ],
+            "source_observed_at": None,
+        },
     )
 
 
@@ -645,3 +688,220 @@ def test_psx_record_requires_checksum_bound_permission_evidence() -> None:
 
     with pytest.raises(ValueError, match="checksum-bound permission evidence"):
         replace(record, source_metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"ticker": "KSE100"}, "GDELT OGDC evidence requires ticker"),
+        (
+            {"company_name": "Unrelated Company Limited"},
+            "GDELT OGDC evidence requires the controlled company identity",
+        ),
+    ],
+)
+def test_gkg_record_cannot_be_relabelled_out_of_ogdc_coverage(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(_gkg("gkg-identity", _at("2024-01-05")), **changes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"source_url": "https://evil.example/announcement/1"},
+            "official psx.com.pk domain",
+        ),
+        (
+            {"source_url": "https://dps.psx.com.pk:80/announcement/1"},
+            "unsupported port",
+        ),
+        (
+            {"source_url": "https://dps.psx.com.pk/announcement/1#private"},
+            "must not contain a fragment",
+        ),
+        (
+            {"pdf_reference": "HTTPS://evil.example/announcement.pdf"},
+            "official psx.com.pk domain",
+        ),
+        ({"source_name": "Unrelated Exchange"}, "official source identity"),
+        (
+            {"company_name": "Unrelated Company Limited"},
+            "controlled company identity",
+        ),
+        (
+            {"contemporaneous_source_id": "another-announcement"},
+            "record identities disagree",
+        ),
+    ],
+)
+def test_psx_record_requires_official_source_and_entity_identity(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(_psx_timed("PSX-IDENTITY", _at("2024-01-05")), **changes)
+
+
+def test_psx_official_url_accepts_case_insensitive_https_scheme() -> None:
+    record = replace(
+        _psx_timed("PSX-UPPERCASE", _at("2024-01-05")),
+        source_url="HTTPS://DPS.PSX.COM.PK/company/OGDC",
+    )
+
+    assert record.source_url == "HTTPS://DPS.PSX.COM.PK/company/OGDC"
+
+
+@pytest.mark.parametrize(
+    "pdf_reference",
+    [
+        "ftp://dps.psx.com.pk/announcement.pdf",
+        "javascript:alert(1)",
+        "data:application/pdf;base64,JVBERi0x",
+        "https:%2F%2Fdps.psx.com.pk%2Fannouncement.pdf",
+    ],
+)
+def test_psx_pdf_reference_cannot_disguise_uri_scheme_as_relative_path(
+    pdf_reference: str,
+) -> None:
+    with pytest.raises(ValueError, match="PSX pdf_reference"):
+        replace(
+            _psx_timed("PSX-PDF-SCHEME", _at("2024-01-05")),
+            pdf_reference=pdf_reference,
+        )
+
+
+def test_psx_pdf_reference_preserves_scheme_free_relative_capture_reference() -> None:
+    record = replace(
+        _psx_timed("PSX-PDF-RELATIVE", _at("2024-01-05")),
+        pdf_reference="documents/OGDC/announcement.pdf#page=1",
+    )
+
+    assert record.pdf_reference == "documents/OGDC/announcement.pdf#page=1"
+
+
+def test_general_publisher_label_cannot_opt_into_ogdc_profile() -> None:
+    general = _publisher("publisher-general", _at("2024-01-05"))
+
+    with pytest.raises(ValueError, match="OGDC-linked publisher evidence"):
+        replace(
+            general,
+            ticker="OGDC",
+            company_name="Oil and Gas Development Company Limited",
+        )
+
+
+def test_publisher_ogdc_profile_requires_checksum_bound_entity_link() -> None:
+    linked = _publisher(
+        "publisher-linked", _at("2024-01-05"), ticker="OGDC"
+    )
+    forged = dict(linked.entity_match_evidence[0])
+    forged["company_name"] = "Unrelated Company Limited"
+
+    with pytest.raises(ValueError, match="entity-link provenance"):
+        replace(linked, entity_match_evidence=(forged,))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("ingestion_run_id", None, "complete entity-link provenance"),
+        ("article_id", "ARTICLE-unbound", "contradictory entity-link"),
+    ],
+)
+def test_publisher_link_is_bound_to_a_declared_occurrence(
+    field: str,
+    replacement: str | None,
+    message: str,
+) -> None:
+    linked = _publisher(
+        "publisher-link-identity",
+        _at("2024-01-05"),
+        ticker="OGDC",
+    )
+    forged = dict(linked.entity_match_evidence[0])
+    if replacement is None:
+        forged.pop(field)
+    else:
+        forged[field] = replacement
+
+    with pytest.raises(ValueError, match=message):
+        replace(linked, entity_match_evidence=(forged,))
+
+
+def test_ogdc_publisher_representative_must_be_an_ogdc_occurrence() -> None:
+    linked = _publisher(
+        "publisher-linked-representative",
+        _at("2024-01-05"),
+        ticker="OGDC",
+    )
+    linked_identity = dict(
+        linked.source_metadata["occurrence_identities"][0]
+    )
+    general_run = "NEWS-20231231-000000-general"
+    general_article = "ARTICLE-GENERAL-EARLIER"
+    general_digest = "b" * 64
+    forged_metadata = {
+        **linked.source_metadata,
+        "representative_occurrence_key": f"{general_run}:{general_article}",
+        "occurrence_count": 2,
+        "ogdc_occurrence_count": 1,
+        "occurrence_identities": [
+            {
+                "occurrence_ordinal": 0,
+                "occurrence_key": f"{general_run}:{general_article}",
+                "ingestion_run_id": general_run,
+                "article_id": general_article,
+                "canonical_article_id": linked.source_record_id,
+                "content_sha256": general_digest,
+                "is_ogdc": False,
+            },
+            {**linked_identity, "occurrence_ordinal": 1},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="linked representative"):
+        replace(
+            linked,
+            raw_evidence_reference=(
+                f"news_ingestion/{general_run}/raw/general.json"
+            ),
+            content_sha256=general_digest,
+            source_metadata=forged_metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"contemporaneous_source_id": "different-canonical-id"},
+            "canonical record identities disagree",
+        ),
+        (
+            {
+                "raw_evidence_reference": (
+                    "news_ingestion/NEWS-20240102-000000-other/feed.xml#record"
+                )
+            },
+            "raw evidence is not bound to its representative run",
+        ),
+    ],
+)
+def test_publisher_canonical_occurrence_identities_are_consistent(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(
+            _publisher("publisher-identity", _at("2024-01-05")),
+            **changes,
+        )
+
+
+def test_duplicate_provider_mode_source_record_identity_is_rejected() -> None:
+    first = _psx_timed("PSX-DUPLICATE-A", _at("2024-01-05"))
+    second = replace(first, evidence_id="PSX-DUPLICATE-B")
+
+    with pytest.raises(EvidenceCoverageError, match="source event identities"):
+        compute_evidence_coverage((first, second), _stock(), CoverageConfig())

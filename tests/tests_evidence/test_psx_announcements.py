@@ -480,6 +480,10 @@ def test_extra_csv_values_are_rejected_instead_of_becoming_hidden_content(tmp_pa
         "ftp://dps.psx.com.pk/announcement/1",
         "https://user:secret@dps.psx.com.pk/announcement/1",
         "https://dps.psx.com.pk:8443/announcement/1",
+        "https://dps.psx.com.pk:80/announcement/1",
+        "http://dps.psx.com.pk:443/announcement/1",
+        "https://dps.psx.com.pk/announcement/1#private-fragment",
+        "HTTPS://evil.example/announcement/1",
         "https://dps.psx.com.pk/announcement/1?token=secret",
     ],
 )

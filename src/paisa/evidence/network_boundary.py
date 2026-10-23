@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass
 import ipaddress
 import math
+import signal
 import socket
+import threading
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 
 class NetworkBoundaryError(ValueError):
@@ -22,6 +24,86 @@ class NetworkBoundaryError(ValueError):
 
 Resolver = Callable[..., Iterable[tuple[Any, ...]]]
 MonotonicClock = Callable[[], float]
+_INTERRUPT_REPEAT_SECONDS = 0.05
+
+
+class _InterruptibleCallExpired(BaseException):
+    """Private signal used to unwind libraries that catch ordinary errors."""
+
+
+@contextmanager
+def interruptible_call(
+    timeout_seconds: float,
+    *,
+    error_type: str,
+    message: str,
+) -> Iterator[None]:
+    """Interrupt one blocking call without leaving a background worker alive.
+
+    The evidence acquisition CLI runs on a POSIX main thread.  ``SIGALRM`` is
+    the only in-process mechanism available here that can unwind a blocked
+    resolver or socket call rather than merely stop waiting for an otherwise
+    live worker.  After the deadline, the timer repeats briefly until the
+    protected call unwinds, so a callback cannot defeat the bound by swallowing
+    one ``BaseException``.  Unsupported execution contexts fail closed before
+    invoking the supplied operation.  An already armed process timer is also
+    left untouched and rejected rather than silently weakening another
+    deadline.
+    """
+
+    timeout = _positive_seconds(timeout_seconds, field_name="Call timeout")
+    if (
+        threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "ITIMER_REAL")
+    ):
+        raise NetworkBoundaryError(
+            "interruptible_deadline_unavailable",
+            "GDELT archive hard deadline is unavailable in this execution context",
+        )
+    try:
+        previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+        previous_handler = signal.getsignal(signal.SIGALRM)
+    except (OSError, ValueError) as exc:
+        raise NetworkBoundaryError(
+            "interruptible_deadline_unavailable",
+            "GDELT archive hard deadline could not be established",
+        ) from exc
+    if previous_delay > 0 or previous_interval > 0:
+        raise NetworkBoundaryError(
+            "interruptible_deadline_unavailable",
+            "GDELT archive hard deadline conflicts with an active process timer",
+        )
+
+    def expire(_signum: int, _frame: Any) -> None:
+        raise _InterruptibleCallExpired
+
+    armed = False
+    try:
+        signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(
+            signal.ITIMER_REAL,
+            timeout,
+            _INTERRUPT_REPEAT_SECONDS,
+        )
+        armed = True
+        yield
+    except _InterruptibleCallExpired as exc:
+        raise NetworkBoundaryError(error_type, message) from exc
+    except NetworkBoundaryError:
+        raise
+    except (OSError, ValueError) as exc:
+        if not armed:
+            raise NetworkBoundaryError(
+                "interruptible_deadline_unavailable",
+                "GDELT archive hard deadline could not be established",
+            ) from exc
+        raise
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _positive_seconds(value: float, *, field_name: str) -> float:
@@ -70,34 +152,27 @@ def resolve_global_addresses(
     """Resolve a fixed host within a deadline and require only global peers."""
 
     timeout = _positive_seconds(timeout_seconds, field_name="DNS timeout")
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paisa-dns")
-    def resolve() -> tuple[tuple[Any, ...], ...]:
-        return tuple(
-            resolver(
-                hostname,
-                port,
-                socket.AF_UNSPEC,
-                socket.SOCK_STREAM,
-            )
-        )
-
-    future = executor.submit(resolve)
     try:
-        try:
-            answers = future.result(timeout=timeout)
-        except FutureTimeout as exc:
-            future.cancel()
-            raise NetworkBoundaryError(
-                "dns_resolution_timeout",
-                "GDELT archive DNS resolution exceeded its deadline",
-            ) from exc
-        except Exception as exc:
-            raise NetworkBoundaryError(
-                "dns_resolution_error",
-                "GDELT archive DNS resolution failed",
-            ) from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        with interruptible_call(
+            timeout,
+            error_type="dns_resolution_timeout",
+            message="GDELT archive DNS resolution exceeded its deadline",
+        ):
+            answers = tuple(
+                resolver(
+                    hostname,
+                    port,
+                    socket.AF_UNSPEC,
+                    socket.SOCK_STREAM,
+                )
+            )
+    except NetworkBoundaryError:
+        raise
+    except Exception as exc:
+        raise NetworkBoundaryError(
+            "dns_resolution_error",
+            "GDELT archive DNS resolution failed",
+        ) from exc
 
     approved: set[str] = set()
     for answer in answers:
@@ -203,6 +278,7 @@ class MonotonicDeadline:
 __all__ = [
     "MonotonicDeadline",
     "NetworkBoundaryError",
+    "interruptible_call",
     "resolve_global_addresses",
     "verify_connected_peer",
 ]

@@ -154,7 +154,8 @@ def _official_psx_url(value: Any, *, field_name: str) -> str:
         )
     if parsed.username is not None or parsed.password is not None:
         raise PsxAnnouncementImportError(f"{field_name} must not contain credentials")
-    if port is not None and port not in {80, 443}:
+    expected_port = 443 if scheme == "https" else 80
+    if port is not None and port != expected_port:
         raise PsxAnnouncementImportError(f"{field_name} uses an unsupported port")
     if parsed.fragment:
         raise PsxAnnouncementImportError(f"{field_name} must not contain a fragment")

@@ -563,7 +563,7 @@ printf '%s  %s\n' \
   'artifacts/evidence_coverage/ECOV-20261023-164000-final001/run_manifest.json' \
   | shasum -a 256 -c -
 
-tar -czf "$PAIR_ARCHIVE" \
+COPYFILE_DISABLE=1 tar -czf "$PAIR_ARCHIVE" \
   artifacts/contemporaneous_evidence/EVID-20261023-175847-822c5685 \
   artifacts/evidence_coverage/ECOV-20261023-175904-be50a499 \
   artifacts/contemporaneous_evidence/EVID-20261023-163905-gkgfinal \
@@ -579,8 +579,20 @@ chmod 600 "$PAIR_ARCHIVE.sha256"
 
 Restore only into a checkout where all four exact target directories are
 absent. Never merge an archive into an existing pack. Verify the transferred
-tar before extraction, then recheck the immutable manifest identities and run
-the current semantic verifiers against the canonical pair:
+archive checksum, then use the committed restore helper. The helper accepts
+only the exact four checksum-bound pack manifests and their sealed inventory,
+rejects every duplicate, unexpected, traversal, absolute, link, and special
+member, extracts regular files into private staging, verifies the staged
+canonical packs, and atomically publishes each expected root without
+replacement. It never extracts an untrusted tar directly into the checkout.
+Afterward, run the current semantic verifiers against the canonical pair:
+
+Publication is an explicit sequence of four atomic no-replace renames because
+portable filesystems do not offer one atomic multi-directory transaction. The
+helper preflights every destination again immediately before publication. If a
+concurrent process creates a later destination, the helper preserves any
+earlier verified pack already committed, refuses to replace the collision, and
+reports failure; inspect the reported repository state before retrying.
 
 ```bash
 set -euo pipefail
@@ -616,19 +628,9 @@ do
   fi
 done
 
-for parent in \
-  artifacts \
-  artifacts/contemporaneous_evidence \
-  artifacts/evidence_coverage
-do
-  if test -L "$parent" || { test -e "$parent" && ! test -d "$parent"; }; then
-    printf 'ERROR: restore parent must be a real directory or absent: %s\n' \
-      "$parent" >&2
-    exit 1
-  fi
-done
-
-tar -xzf "$PAIR_ARCHIVE" -C .
+.venv/bin/python scripts/restore_evidence_bundle.py \
+  --archive "$PAIR_ARCHIVE" \
+  --destination-root .
 
 printf '%s  %s\n' \
   '15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4' \
@@ -688,7 +690,7 @@ test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
 test -f artifacts/model_training/TRN-20261020-191815-624662-nogit/run_manifest.json
 
-tar -czf "$DEMO_ARCHIVE" \
+COPYFILE_DISABLE=1 tar -czf "$DEMO_ARCHIVE" \
   artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   artifacts/model_training/TRN-20261020-191815-624662-nogit
 (
@@ -702,7 +704,10 @@ Transfer both `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz` and
 `PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz.sha256`. From the receiving
 repository root, refuse to overwrite any existing run, verify the archive, and
 then restore it. Point `PAISA_DEMO_TRANSFER_DIR` at the approved storage
-location containing the received files.
+location containing the received files. The restore helper rejects traversal,
+absolute paths, links, special files, duplicates, and every member outside the
+two named roots before extracting regular files into private staging. It then
+publishes each root atomically without replacement.
 
 <!-- BEGIN DEMO_ARTIFACT_RESTORE -->
 ```bash
@@ -725,7 +730,11 @@ require_absent_restore_target artifacts/model_training/TRN-20261020-191815-62466
   cd "$PAISA_DEMO_TRANSFER_DIR"
   shasum -a 256 -c "$DEMO_ARCHIVE_NAME.sha256"
 )
-tar -xzf "$DEMO_ARCHIVE" -C .
+.venv/bin/python scripts/restore_artifact_bundle.py \
+  --archive "$DEMO_ARCHIVE" \
+  --destination-root . \
+  --allow-directory artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --allow-directory artifacts/model_training/TRN-20261020-191815-624662-nogit
 
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/manifest.json
 test -f artifacts/vertical_slice/VSL-20261020-OGDC-main-02/final_summary.json
@@ -779,7 +788,7 @@ if [ -e "$NEWS_ARCHIVE" ] || [ -L "$NEWS_ARCHIVE" ] || \
   exit 1
 fi
 
-tar -czf "$NEWS_ARCHIVE" \
+COPYFILE_DISABLE=1 tar -czf "$NEWS_ARCHIVE" \
   artifacts/news_ingestion \
   artifacts/news_coverage \
   data/news/paisa_news.sqlite3
@@ -792,7 +801,9 @@ tar -czf "$NEWS_ARCHIVE" \
 
 Transfer both archive and sidecar. Restore only into a checkout where the
 generated targets are absent; never merge the archive into another working
-database or artifact root:
+database or artifact root. The allowlisted helper performs the same private
+staging and unsafe-member rejection used for the demo pair; the explicit file
+and directory roots are the complete permitted extraction surface:
 
 <!-- BEGIN NEWS_ARTIFACT_RESTORE -->
 ```bash
@@ -816,7 +827,12 @@ done
   cd "$PAISA_NEWS_TRANSFER_DIR"
   shasum -a 256 -c "$NEWS_ARCHIVE_NAME.sha256"
 )
-tar -xzf "$NEWS_ARCHIVE" -C .
+.venv/bin/python scripts/restore_artifact_bundle.py \
+  --archive "$NEWS_ARCHIVE" \
+  --destination-root . \
+  --allow-directory artifacts/news_ingestion \
+  --allow-directory artifacts/news_coverage \
+  --allow-file data/news/paisa_news.sqlite3
 
 test -f artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2/completion.json
 test -f artifacts/news_coverage/COVERAGE-20261023-120000-real0002/completion.json

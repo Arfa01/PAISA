@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -223,6 +224,11 @@ def test_demo_artifact_checksum_remains_verifiable_after_transfer(
         'PAISA_DEMO_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"',
         f'PAISA_DEMO_TRANSFER_DIR="{receiver_staging}"',
     )
+    restore_commands = restore_commands.replace(
+        ".venv/bin/python scripts/restore_artifact_bundle.py",
+        f'"{sys.executable}" '
+        f'"{REPOSITORY_ROOT / "scripts" / "restore_artifact_bundle.py"}"',
+    )
     restored = subprocess.run(
         ["bash", "-c", restore_commands],
         cwd=receiver_repository,
@@ -257,11 +263,36 @@ def test_team_handoff_documents_artifact_restore_and_new_run_regeneration() -> N
     assert f"artifacts/model_training/{TRAINING_RUN_ID}/" in handoff
     assert "PAISA-demo-VSL-20261020-OGDC-main-02.tar.gz" in handoff
     assert "shasum -a 256" in handoff
-    assert "tar -xzf" in handoff
+    assert "scripts/restore_artifact_bundle.py" in handoff
     assert "scripts/migrate_legacy_psx_cache.py" in handoff
     assert "scripts/run_ogdc_vertical_slice.py" in handoff
     assert "--run-id \"$PAISA_NEW_VERTICAL_RUN_ID\"" in handoff
     assert "cannot reproduce the exact historical demo" in handoff_lower
+
+
+def test_evidence_bundle_restore_never_extracts_untrusted_tar_into_checkout() -> None:
+    handoff = _read("docs/TEAM_HANDOFF.md")
+    evidence_restore = handoff.split(
+        "Preserve the canonical and retained superseded pairs together.", 1
+    )[1].split("### Restore the exact supervisor demo pair", 1)[0]
+
+    assert "scripts/restore_evidence_bundle.py" in evidence_restore
+    assert 'tar -xzf "$PAIR_ARCHIVE" -C .' not in evidence_restore
+    normalized_restore = _normalized(evidence_restore)
+    assert "private staging" in normalized_restore
+    assert "without replacement" in normalized_restore
+    assert "COPYFILE_DISABLE=1 tar -czf" in evidence_restore
+
+
+def test_all_handoff_restore_examples_use_private_allowlisted_staging() -> None:
+    handoff = _read("docs/TEAM_HANDOFF.md")
+
+    assert 'tar -xzf "$DEMO_ARCHIVE" -C .' not in handoff
+    assert 'tar -xzf "$NEWS_ARCHIVE" -C .' not in handoff
+    assert handoff.count("scripts/restore_artifact_bundle.py") == 2
+    assert "--allow-directory artifacts/vertical_slice/" in handoff
+    assert "--allow-directory artifacts/news_ingestion" in handoff
+    assert "--allow-file data/news/paisa_news.sqlite3" in handoff
 
 
 def test_readme_indexes_every_demo_pack_document() -> None:
@@ -411,6 +442,11 @@ def test_news_evidence_checksum_remains_verifiable_after_transfer(
     restore_commands = _news_artifact_commands("restore").replace(
         'PAISA_NEWS_TRANSFER_DIR="/absolute/path/to/approved-transfer-staging"',
         f'PAISA_NEWS_TRANSFER_DIR="{receiver_staging}"',
+    )
+    restore_commands = restore_commands.replace(
+        ".venv/bin/python scripts/restore_artifact_bundle.py",
+        f'"{sys.executable}" '
+        f'"{REPOSITORY_ROOT / "scripts" / "restore_artifact_bundle.py"}"',
     )
     restored = subprocess.run(
         ["bash", "-c", restore_commands],

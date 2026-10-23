@@ -277,17 +277,21 @@ This artifact-present workflow is separate from the GDELT DOC news-ingestion
 path above. It reads official GDELT GKG 2.1 raw archives and does not fetch
 publisher pages. The configured subset contains the official 15-minute
 partitions at `2026-09-04 09:00`, `09:15`, and `09:30` UTC within the requested
-`2025-12-16`--`2026-09-15` interval. Its real execution scanned `2,957` rows
-and retained `0` exact OGDC records; the subset does not establish full-period
-completeness.
+`2025-12-16`--`2026-09-15` interval. These are only three adjacent partitions,
+or 45 minutes, not the full test period. The canonical post-fix execution has
+three captures, `2,957` scanned and timestamp-valid rows, `0` rejected,
+`2,957` unmatched, `0` matched, and `0` duplicates. The subset does not
+establish full-period completeness.
 
 ```bash
-python scripts/run_gdelt_gkg_evidence.py \
+.venv/bin/python scripts/run_gdelt_gkg_evidence.py \
   --config configs/evidence/gdelt_gkg_test_subset.json \
   --permission-policy configs/evidence/source_permissions.json \
-  --output-dir artifacts/contemporaneous_evidence
+  --output-dir artifacts/contemporaneous_evidence \
+  --run-id "EVID-<UTC-timestamp>-<unique-suffix>" \
+  --no-resume
 
-python scripts/verify_evidence_run.py \
+.venv/bin/python scripts/verify_evidence_run.py \
   --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
 ```
 
@@ -302,7 +306,7 @@ current policy status is `REVIEW_REQUIRED`, so the command below must fail
 closed until reviewed policy bytes bind both supplied authorization hashes:
 
 ```bash
-python scripts/import_psx_announcements.py \
+.venv/bin/python scripts/import_psx_announcements.py \
   --input /absolute/path/to/authorized-ogdc-announcements.csv \
   --authorization-attestation-file /absolute/path/to/attestation.txt \
   --authorization-reference-file /absolute/path/to/authorization-reference.txt \
@@ -314,14 +318,15 @@ With the ignored GKG, publisher-news, stock, split, and SQLite evidence
 restored, generate the immutable four-profile coverage pack:
 
 ```bash
-python scripts/audit_contemporaneous_evidence.py \
+.venv/bin/python scripts/audit_contemporaneous_evidence.py \
   --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
   --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
   --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --output-dir artifacts/evidence_coverage
+  --output-dir artifacts/evidence_coverage \
+  --run-id "ECOV-<UTC-timestamp>-<unique-suffix>"
 
-python scripts/verify_evidence_coverage.py \
+.venv/bin/python scripts/verify_evidence_coverage.py \
   --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
 ```
 
@@ -332,9 +337,38 @@ The evidence types are `gdelt_metadata`, `exchange_announcement`, and
 publisher-news input contributes `656` general records and `42` exact
 OGDC-linked combined records. Every profile nevertheless has `0 / 853` train,
 `0 / 182` validation, and `0 / 184` test overlap, so all are `NO_OVERLAP`.
-The coverage verifier is an offline sealed-pack semantic check, not a replay of
-the source evidence. These results are an academic simulation and are not
-financial advice.
+The canonical pair was produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`:
+
+- `EVID-20261023-175847-822c5685`: manifest
+  `15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4`;
+  payload inventory
+  `636b096f9bedaed73756c7175b35676555049251c6a3b14f8ed609e960c50888`;
+  verification basis `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY`.
+- `ECOV-20261023-175904-be50a499`: manifest
+  `6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250`;
+  payload inventory
+  `baf14a5d30f60fd7c5fad2d1daa75322007b43e2257e0a1a1ecf498efc23b826`;
+  `656` mappings and verification basis
+  `PORTABLE_RECORD_CALENDAR_RECOMPUTATION`.
+
+All four profiles are `NO_OVERLAP`. Readiness means caller-defined gate
+satisfaction only; it is not proof of statistical sufficiency or predictive
+value. Canonical pack directories are private mode `0700` and files are mode
+`0600`. The retained old pair
+`EVID-20261023-163905-gkgfinal` / `ECOV-20261023-164000-final001` is
+superseded but must not be deleted. The local attempts
+`EVID-20261023-163553-gkgfinal`, `EVID-20261023-213000-gkgraw01`,
+`EVID-20261023-213500-gkgraw02`, and
+`EVID-20261023-175415-5c1b0c48` are also noncanonical/superseded and must not
+be substituted for the canonical pair. See
+[the team handoff](docs/TEAM_HANDOFF.md#canonical-contemporaneous-evidence-pair)
+for all old hashes plus checksum-bound export, absent-target-only restore, and
+verification commands.
+
+The coverage verifier recomputes the sealed normalized records against the
+sealed stock calendar, but remains explicitly not source-archive-bound. These
+results are an academic simulation and are not financial advice.
 
 ## 4d. Run article-level FinBERT sentiment inference
 

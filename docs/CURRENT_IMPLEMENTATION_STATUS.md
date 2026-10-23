@@ -207,10 +207,14 @@ licensed manual historical dataset was supplied in this task.
 The new GKG path uses raw GKG 2.1 archives rather than GDELT DOC. It accepts
 only `WEB=1`, treats the batch timestamp in `GKGRECORDID` as the defensible
 historical `available_at`, retains `V2.1DATE` as publication time, verifies
-archive size and checksums, and never follows publisher URLs. The bounded real
-execution processed the official `2026-09-04 09:00`, `09:15`, and `09:30` UTC
-15-minute partitions within the requested `2025-12-16`--`2026-09-15` interval.
-It scanned `2,957` rows and retained `0` exact OGDC matches; this is bounded
+archive size and checksums, and never follows publisher URLs. The canonical
+post-fix execution `EVID-20261023-175847-822c5685` processed the official
+`2026-09-04 09:00`, `09:15`, and `09:30` UTC 15-minute partitions within the
+requested `2025-12-16`--`2026-09-15` interval. That is only three adjacent
+partitions, or 45 minutes, and is not the full test period. Its three raw
+captures contain `2,957` scanned and timestamp-valid rows, `0` rejected,
+`2,957` unmatched, `0` matched, and `0` duplicate rows. The verifier returned
+`PASS` with basis `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY`; this is bounded
 execution evidence, not full-period completeness.
 
 The PSX path accepts only exact `OGDC` announcement metadata supplied offline.
@@ -220,15 +224,43 @@ session. The reviewed permission decision is still `REVIEW_REQUIRED`, so no
 authorized input was imported and the count is `0`; public-page automation is
 not used.
 
-The four coverage profiles are `gdelt_gkg_ogdc`,
-`psx_ogdc_announcements`, `combined_ogdc_evidence`, and
+The canonical paired coverage run is `ECOV-20261023-175904-be50a499`. Its `656`
+mapping rows are verified by portable sealed-record/stock-calendar
+recomputation with basis `PORTABLE_RECORD_CALENDAR_RECOMPUTATION`; that basis
+is deliberately not source-archive-bound. The four coverage profiles are
+`gdelt_gkg_ogdc`, `psx_ogdc_announcements`, `combined_ogdc_evidence`, and
 `general_financial_news`. The restored publisher-news evidence contributes
 `656` general inputs, including `42` exact OGDC-linked inputs to the combined
 profile. None is cutoff-eligible inside the immutable model period. Every
 profile reports `0 / 853` train, `0 / 182` validation, and `0 / 184` test
-overlap and readiness `NO_OVERLAP`. The immutable coverage verifier performs
-sealed-pack semantic reconciliation and explicitly does not claim a source
-replay. These are academic simulation results, not financial advice.
+overlap and readiness `NO_OVERLAP`. These labels express caller-defined gate
+satisfaction only, not statistical sufficiency, predictive value, or financial
+merit. These are academic simulation results, not financial advice.
+
+Both canonical packs were produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`; pack directories are mode `0700`
+and files are mode `0600`. Their immutable identities are:
+
+| Pack | Manifest SHA-256 | Payload-inventory SHA-256 |
+|---|---|---|
+| `EVID-20261023-175847-822c5685` | `15ae19a7d186bd1417545914e3898b23ba80e1f1adb31bb7f8e8018f01f633a4` | `636b096f9bedaed73756c7175b35676555049251c6a3b14f8ed609e960c50888` |
+| `ECOV-20261023-175904-be50a499` | `6b35a6c6c7a9a83b20bc93099fbfaff05743e49150ea0dc2cfa3ceb1e6667250` | `baf14a5d30f60fd7c5fad2d1daa75322007b43e2257e0a1a1ecf498efc23b826` |
+
+The earlier retained pair is immutable audit history and is superseded, not
+deleted: `EVID-20261023-163905-gkgfinal` has manifest
+`a335bcf657ca855e52aebc2a0bcd4721e85434716aa8d6fa13a405cc0d42991e`
+and payload inventory
+`1675a8902f4c0175972392d04a207f09157d034ec1b118eb4c449e2ac9d77e7e`;
+`ECOV-20261023-164000-final001` has manifest
+`d4c31758d39e1a97ee7629e487fe04a801b82ce291923e47392b552f4f99335c`
+and payload inventory
+`e01f33b278bc780d02e74fa5dc88abbba803f12ffc8e90b95562ffb272010e4d`.
+The local attempts `EVID-20261023-163553-gkgfinal`,
+`EVID-20261023-213000-gkgraw01`, `EVID-20261023-213500-gkgraw02`, and the
+post-review pre-final `EVID-20261023-175415-5c1b0c48` are likewise
+noncanonical/superseded and must be preserved rather than relabeled. The team
+handoff contains the checksum-bound preservation, absent-target-only restore,
+and current verifier commands.
 
 ### FinBERT article-sentiment implementation
 

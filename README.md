@@ -377,27 +377,46 @@ date-only announcement keeps both publication and availability timestamps null
 and becomes eligible only on the next observed trading session. No same-day
 time is invented.
 
-The bounded real GKG execution processed the three official 15-minute
+The canonical post-fix GKG execution
+`EVID-20261023-175847-822c5685` processed the three official 15-minute
 partitions at `2026-09-04 09:00`, `09:15`, and `09:30` UTC within the requested
-`2025-12-16` through `2026-09-15` interval. It scanned `2,957` rows and found
-`0` exact OGDC records. This narrow subset is a reproducible acquisition check,
-not a claim of full-period completeness. PSX remains `REVIEW_REQUIRED`; no
-authorized announcement input was supplied, so its retained count is `0` and
-public-page automation remains blocked. The existing publisher-news input adds
+`2025-12-16` through `2026-09-15` interval. This is only three adjacent
+partitions, or 45 minutes, and is not the full test period. Its three raw ZIP
+captures contain `2,957` scanned and timestamp-valid rows, `0` rejected,
+`2,957` unmatched, `0` matched, and `0` duplicate rows. Verification passes
+with basis `RAW_GDELT_GKG_ZIP_SEMANTIC_REPLAY`. This narrow subset is a
+reproducible acquisition check, not a claim of full-period completeness. PSX
+remains `REVIEW_REQUIRED`; no authorized announcement input was supplied, so
+its retained count is `0` and public-page automation remains blocked. The
+existing publisher-news input adds
 `656` general records, including `42` exact OGDC-linked records in the combined
 profile. Nevertheless, cutoff-eligible overlap is `0 / 853` train,
 `0 / 182` validation, and `0 / 184` test for every profile. All four readiness
 statuses are therefore `NO_OVERLAP`.
 
-Run and verify the bounded GKG path with a fresh automatically generated ID:
+The paired canonical coverage pack is `ECOV-20261023-175904-be50a499`. It has
+`656` mapping rows, recomputes the sealed records against the sealed stock
+calendar with basis `PORTABLE_RECORD_CALENDAR_RECOMPUTATION`, and reports
+`NO_OVERLAP` for all four profiles. Its readiness labels mean
+caller-defined gate satisfaction only, not statistical sufficiency or
+predictive value. Both canonical packs were produced from clean commit
+`ec6a47b6922d1858d727845ab7de37be719a1dea`; their directories are mode `0700`
+and payload files are mode `0600`. Exact manifest and payload-inventory hashes,
+the retained superseded pair, and checksum-bound preservation and restoration
+commands are recorded in [the team handoff](docs/TEAM_HANDOFF.md#canonical-contemporaneous-evidence-pair).
+
+Run and verify the bounded GKG path with a fresh immutable ID. `--no-resume`
+forces a new acquisition rather than reusing an earlier checkpoint:
 
 ```bash
-python scripts/run_gdelt_gkg_evidence.py \
+.venv/bin/python scripts/run_gdelt_gkg_evidence.py \
   --config configs/evidence/gdelt_gkg_test_subset.json \
   --permission-policy configs/evidence/source_permissions.json \
-  --output-dir artifacts/contemporaneous_evidence
+  --output-dir artifacts/contemporaneous_evidence \
+  --run-id "EVID-<UTC-timestamp>-<unique-suffix>" \
+  --no-resume
 
-python scripts/verify_evidence_run.py \
+.venv/bin/python scripts/verify_evidence_run.py \
   --run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>"
 ```
 
@@ -407,7 +426,7 @@ the exact authorization attestation and authorization reference hashes may an
 operator run this offline command:
 
 ```bash
-python scripts/import_psx_announcements.py \
+.venv/bin/python scripts/import_psx_announcements.py \
   --input /absolute/path/to/authorized-ogdc-announcements.csv \
   --authorization-attestation-file /absolute/path/to/attestation.txt \
   --authorization-reference-file /absolute/path/to/authorization-reference.txt \
@@ -419,20 +438,22 @@ Create and verify the immutable four-profile coverage pack after restoring the
 ignored stock, split, publisher-news, and GKG artifacts:
 
 ```bash
-python scripts/audit_contemporaneous_evidence.py \
+.venv/bin/python scripts/audit_contemporaneous_evidence.py \
   --gdelt-run-dir "artifacts/contemporaneous_evidence/<generated-gkg-run-id>" \
   --publisher-news-run-dir artifacts/news_ingestion/NEWS-20261023-060000-gdelt-ogdc2 \
   --vertical-slice-dir artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --model-training-dir artifacts/model_training/TRN-20261020-191815-624662-nogit \
-  --output-dir artifacts/evidence_coverage
+  --output-dir artifacts/evidence_coverage \
+  --run-id "ECOV-<UTC-timestamp>-<unique-suffix>"
 
-python scripts/verify_evidence_coverage.py \
+.venv/bin/python scripts/verify_evidence_coverage.py \
   --run-dir "artifacts/evidence_coverage/<generated-coverage-run-id>"
 ```
 
-The coverage verifier proves the sealed pack's checksums and internal semantic
-reconciliation; it reports that it is not a source-evidence replay. These are
-academic data-engineering results for a simulation, not financial advice, and
+The coverage verifier proves the sealed pack's checksums and performs portable
+record/calendar recomputation; it remains explicitly not source-archive-bound.
+These are academic data-engineering results for a simulation, not financial
+advice, and
 they do not authorize aggregation, modeling, signals, trading, portfolio, API,
 or dashboard changes.
 

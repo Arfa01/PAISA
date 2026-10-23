@@ -1,13 +1,14 @@
 """Portable, immutable comparison packs for PAISA price-only models.
 
-The builder in this module is deliberately a reader of completed evidence.  It
-never loads a fitted estimator, performs inference, or runs the trading policy
-again.  Prediction metrics are replayed from persisted prediction rows and
-portfolio metrics are replayed from persisted snapshots and trades.
+The builder in this module is deliberately a reader of completed evidence. It
+never loads a fitted estimator, performs inference, or reruns a backtest.
+Prediction metrics and portfolio semantics are independently replayed from
+persisted, checksum-bound rows.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -17,7 +18,8 @@ import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import date
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -30,6 +32,7 @@ from paisa.evidence.artifact_security import (
     prepare_output_root,
     reject_symlink_components,
 )
+from paisa.evidence.diagnostics import contains_sensitive_text
 from paisa.experiments.artifacts import (
     TrainingRunEvidence,
     assert_training_run_artifacts_unchanged,
@@ -48,15 +51,16 @@ from paisa.experiments.lstm_comparison import (
     align_predictions_on_common_dates,
     calibration_information,
 )
-from paisa.experiments.lstm_runner import (
-    DirectoryInventoryEvidence,
-    assert_vertical_slice_artifacts_unchanged,
-    validate_vertical_slice_artifacts,
-)
-from paisa.experiments.runner import (
-    load_experiment_config,
-    load_portfolio_snapshots,
-    load_trades,
+from paisa.trading.models import (
+    Action,
+    BPS_DENOMINATOR,
+    ExperimentConfig,
+    MarketBar,
+    PortfolioSnapshot,
+    SignalRecord,
+    TradeRecord,
+    money,
+    stable_id,
 )
 
 
@@ -101,6 +105,9 @@ AUTHORITATIVE_SOURCE_ROOTS = {
         "manifest_sha256": (
             "2ce2f7581a5baff8487b09ae695213745c704f11715e6bd5abd0e99009337f31"
         ),
+        "portable_certificate_sha256": (
+            "e948409e679061d0c503171be64b76d9d847a2161cb70f7baa5737089e19c314"
+        ),
     },
     "lstm": {
         "run_id": "LSTM-20261024-OGDC-price-only-02",
@@ -121,6 +128,7 @@ _PACK_REQUIRED_FILES = {
 }
 _PORTFOLIO_FILES = (
     "config.json",
+    "signals.csv",
     "portfolio_snapshots.csv",
     "trades.csv",
     "benchmarks/cash_only_snapshots.csv",
@@ -129,6 +137,45 @@ _PORTFOLIO_FILES = (
 )
 _MAX_ZIP_FILES = 256
 _MAX_ZIP_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_SIGNAL_FIELDS = (
+    "schema_version",
+    "signal_id",
+    "portfolio_id",
+    "model_id",
+    "ticker",
+    "signal_date",
+    "target_date",
+    "action",
+    "probability_up",
+    "target_allocation",
+    "reason",
+)
+_TRADE_FIELDS = (
+    "schema_version",
+    "trade_id",
+    "portfolio_id",
+    "signal_date",
+    "execution_date",
+    "action",
+    "quantity",
+    "reference_price",
+    "execution_price",
+    "fee",
+    "cash_after_trade",
+    "shares_after_trade",
+)
+_SNAPSHOT_FIELDS = (
+    "schema_version",
+    "portfolio_id",
+    "date",
+    "cash",
+    "shares",
+    "market_price",
+    "position_value",
+    "total_equity",
+    "realized_profit_loss",
+    "unrealized_profit_loss",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +191,15 @@ class LSTMRunEvidence:
     baseline_training_manifest_sha256: str
     baseline_vertical_slice_id: str
     baseline_vertical_manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryInventoryEvidence:
+    """Checksum baseline for the retained vertical-slice directory."""
+
+    directory: Path
+    manifest_sha256: str
+    files: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +237,13 @@ class ReplayResults:
 
 def _safe_id(value: object, *, field: str) -> str:
     result = str(value).strip()
-    if not _SAFE_ID.fullmatch(result) or result in {".", ".."}:
+    device_name = result.split(".", 1)[0].upper()
+    if (
+        not _SAFE_ID.fullmatch(result)
+        or result in {".", ".."}
+        or result.rstrip(" .") != result
+        or device_name in _WINDOWS_RESERVED_NAMES
+    ):
         raise ValueError(f"{field} must be a filesystem-safe identifier")
     return result
 
@@ -235,6 +297,117 @@ def _regular_files(root: Path, *, exclude: set[str] | None = None) -> dict[str, 
         if relative not in excluded:
             files[relative] = candidate
     return files
+
+
+def validate_vertical_slice_artifacts(
+    directory: str | Path,
+) -> DirectoryInventoryEvidence:
+    """Validate the retained vertical slice without importing plotting modules."""
+
+    candidate = Path(directory)
+    if candidate.is_symlink():
+        raise ValueError("Baseline vertical-slice directory must not be a symlink")
+    root = candidate.resolve(strict=True)
+    if not root.is_dir():
+        raise FileNotFoundError("Baseline vertical-slice directory is missing")
+    manifest_path = root / "manifest.json"
+    manifest = _read_json(manifest_path, field="Vertical-slice manifest")
+    raw_entries = manifest.get("artifacts")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ValueError("Vertical-slice manifest artifacts must be a non-empty array")
+
+    parsed: list[tuple[str, str]] = []
+    for index, raw_entry in enumerate(raw_entries):
+        if not isinstance(raw_entry, Mapping) or set(raw_entry) != {"path", "sha256"}:
+            raise ValueError(
+                "Every vertical-slice artifact entry must contain exactly path and sha256"
+            )
+        relative = _safe_relative(
+            raw_entry["path"], field=f"artifacts[{index}].path"
+        )
+        checksum = str(raw_entry["sha256"])
+        if not _SHA256.fullmatch(checksum):
+            raise ValueError(f"Invalid vertical-slice SHA-256 for {relative}")
+        parsed.append((relative, checksum))
+    if parsed != sorted(parsed) or len({item[0] for item in parsed}) != len(parsed):
+        raise ValueError("Vertical-slice artifact inventory must be sorted and unique")
+
+    actual = _regular_files(root, exclude={"manifest.json"})
+    expected_paths = {relative for relative, _ in parsed}
+    if set(actual) != expected_paths:
+        raise ValueError(
+            "Vertical-slice artifact paths must exactly match its manifest; "
+            f"missing={sorted(expected_paths - set(actual))}, "
+            f"unexpected={sorted(set(actual) - expected_paths)}"
+        )
+    for relative, expected in parsed:
+        if sha256_file(actual[relative]) != expected:
+            raise ValueError(f"Vertical-slice artifact checksum mismatch: {relative}")
+    return DirectoryInventoryEvidence(
+        directory=root,
+        manifest_sha256=sha256_file(manifest_path),
+        files=tuple(parsed),
+    )
+
+
+def assert_vertical_slice_artifacts_unchanged(
+    evidence: DirectoryInventoryEvidence,
+) -> None:
+    current = validate_vertical_slice_artifacts(evidence.directory)
+    if (
+        current.manifest_sha256 != evidence.manifest_sha256
+        or current.files != evidence.files
+    ):
+        raise RuntimeError("Baseline vertical-slice artifacts changed during the run")
+
+
+def _read_csv_rows(path: Path, *, expected_columns: Sequence[str]) -> list[dict[str, str]]:
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("Portable CSV evidence is missing")
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != tuple(expected_columns):
+            raise ValueError(
+                f"Portable CSV has an unexpected schema: {path.name}"
+            )
+        return [dict(row) for row in reader]
+
+
+def _load_experiment_config(path: Path) -> ExperimentConfig:
+    return ExperimentConfig.from_mapping(_read_json(path, field="Experiment config"))
+
+
+def _load_signals(path: Path) -> tuple[SignalRecord, ...]:
+    return tuple(
+        SignalRecord.from_mapping(row)
+        for row in _read_csv_rows(path, expected_columns=_SIGNAL_FIELDS)
+    )
+
+
+def _load_trades(path: Path) -> tuple[TradeRecord, ...]:
+    return tuple(
+        TradeRecord.from_mapping(row)
+        for row in _read_csv_rows(path, expected_columns=_TRADE_FIELDS)
+    )
+
+
+def _load_portfolio_snapshots(path: Path) -> tuple[PortfolioSnapshot, ...]:
+    return tuple(
+        PortfolioSnapshot.from_mapping(row)
+        for row in _read_csv_rows(path, expected_columns=_SNAPSHOT_FIELDS)
+    )
+
+
+def _load_market_bars(path: Path) -> tuple[MarketBar, ...]:
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("Portable market evidence is missing")
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        columns = tuple(reader.fieldnames or ())
+        required = {"date", "ticker", "open", "close"}
+        if not required.issubset(columns):
+            raise ValueError("Portable market evidence is missing required columns")
+        return tuple(MarketBar.from_mapping(row) for row in reader)
 
 
 def _parse_sha256_inventory(
@@ -432,7 +605,14 @@ def _capture_source_snapshots(
             "manifest_sha256": lstm.run_manifest_sha256,
         },
     }
-    if observed_roots != AUTHORITATIVE_SOURCE_ROOTS:
+    expected_roots = {
+        role: {
+            "run_id": values["run_id"],
+            "manifest_sha256": values["manifest_sha256"],
+        }
+        for role, values in AUTHORITATIVE_SOURCE_ROOTS.items()
+    }
+    if observed_roots != expected_roots:
         raise ValueError(
             "Unified comparison accepts only the three authoritative completed sources"
         )
@@ -535,13 +715,6 @@ def _source_manifest_specs(snapshots: SourceSnapshots) -> list[EvidenceFile]:
             purpose="source_integrity_root",
         ),
         EvidenceFile(
-            source_role="baseline_vertical_slice",
-            source_path="manifest.json",
-            pack_path="evidence/source_manifests/baseline_vertical_manifest.json",
-            sha256=snapshots.vertical.manifest_sha256,
-            purpose="source_integrity_root",
-        ),
-        EvidenceFile(
             source_role="lstm",
             source_path="run_manifest.json",
             pack_path="evidence/source_manifests/lstm_run_manifest.json",
@@ -603,6 +776,20 @@ def _evidence_specs(snapshots: SourceSnapshots) -> list[EvidenceFile]:
         "lstm_sequence_split_membership",
         lstm_inventory,
     )
+    add(
+        "baseline_vertical_slice",
+        "input_snapshot/psx_prices.csv",
+        "evidence/market_data/baseline_psx_prices.csv",
+        "portfolio_market_observations",
+        vertical_inventory,
+    )
+    add(
+        "lstm",
+        "frozen_input/OGDC_prices.csv",
+        "evidence/market_data/lstm_ogdc_prices.csv",
+        "portfolio_market_observations",
+        lstm_inventory,
+    )
 
     for variant_id, registered_id in snapshots.training.model_ids:
         source_path = f"models/{registered_id}/predictions_all_splits.csv"
@@ -650,6 +837,55 @@ def _evidence_specs(snapshots: SourceSnapshots) -> list[EvidenceFile]:
     return sorted(specs, key=lambda spec: spec.pack_path)
 
 
+def _write_vertical_manifest_certificate(
+    stage_dir: Path, snapshots: SourceSnapshots
+) -> tuple[str, str]:
+    """Write a safe projection bound to the source manifest's immutable digest."""
+
+    pack_path = (
+        "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "paisa_source_integrity_certificate",
+        "source_role": "baseline_vertical_slice",
+        "run_id": snapshots.vertical.directory.name,
+        "source_manifest": {
+            "name": "manifest.json",
+            "sha256": snapshots.vertical.manifest_sha256,
+        },
+        "projection_policy": "allowlisted_fields_v1",
+        "raw_manifest_included": False,
+        "source_assertions": {
+            "schema_version": "1.0",
+            "status": "PASS",
+            "symbol": "OGDC",
+            "model_training_run_id": snapshots.training.run_id,
+            "registered_model_ids": dict(snapshots.training.model_ids),
+            "disclaimer": ACADEMIC_DISCLAIMER,
+        },
+        "artifact_inventory": {
+            "algorithm": "sha256",
+            "root": ".",
+            "excludes": ["manifest.json"],
+            "files": [
+                {"path": relative, "sha256": checksum}
+                for relative, checksum in snapshots.vertical.files
+            ],
+        },
+        "disclaimer": ACADEMIC_DISCLAIMER,
+    }
+    destination = stage_dir / pack_path
+    write_json(payload, destination)
+    certificate_sha256 = sha256_file(destination)
+    expected = AUTHORITATIVE_SOURCE_ROOTS["baseline_vertical_slice"].get(
+        "portable_certificate_sha256"
+    )
+    if certificate_sha256 != expected:
+        raise ValueError("Vertical-slice certificate does not match the allowlisted projection")
+    return pack_path, certificate_sha256
+
+
 def _copy_evidence(
     stage_dir: Path,
     snapshots: SourceSnapshots,
@@ -672,6 +908,9 @@ def _source_roots_payload(
     comparison_id: str,
     snapshots: SourceSnapshots,
     specs: Sequence[EvidenceFile],
+    *,
+    vertical_certificate_path: str,
+    vertical_certificate_sha256: str,
 ) -> dict[str, Any]:
     roots = [
         {
@@ -684,6 +923,8 @@ def _source_roots_payload(
             "integrity_root_pack_path": (
                 "evidence/source_manifests/baseline_training_run_manifest.json"
             ),
+            "integrity_root_pack_sha256": snapshots.training.run_manifest_sha256,
+            "integrity_root_derivation": "byte_copy",
         },
         {
             "role": "baseline_vertical_slice",
@@ -692,9 +933,9 @@ def _source_roots_payload(
             "integrity_root_name": "manifest.json",
             "integrity_root_sha256": snapshots.vertical.manifest_sha256,
             "payload_file_count": len(snapshots.vertical.files),
-            "integrity_root_pack_path": (
-                "evidence/source_manifests/baseline_vertical_manifest.json"
-            ),
+            "integrity_root_pack_path": vertical_certificate_path,
+            "integrity_root_pack_sha256": vertical_certificate_sha256,
+            "integrity_root_derivation": "deterministic_redacted_projection",
         },
         {
             "role": "lstm",
@@ -704,6 +945,8 @@ def _source_roots_payload(
             "integrity_root_sha256": snapshots.lstm.run_manifest_sha256,
             "payload_file_count": len(snapshots.lstm.files),
             "integrity_root_pack_path": "evidence/source_manifests/lstm_run_manifest.json",
+            "integrity_root_pack_sha256": snapshots.lstm.run_manifest_sha256,
+            "integrity_root_derivation": "byte_copy",
         },
     ]
     return {
@@ -1088,6 +1331,439 @@ def _validate_ledger_identity(
         raise ValueError(f"Portfolio trade identity mismatch for {portfolio_id}")
 
 
+def _raw_holdout_probabilities(
+    pack_root: Path,
+    *,
+    variant_id: str,
+    registered_model_id: str,
+    common_keys: Sequence[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], Decimal]:
+    path = pack_root / f"evidence/predictions/{variant_id}/predictions_all_splits.csv"
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        expected = tuple(PREDICTION_COLUMNS) + (
+            ("split",) if variant_id in BASELINE_VARIANTS else ()
+        )
+        if tuple(reader.fieldnames or ()) != expected:
+            raise ValueError(f"Prediction CSV schema mismatch for {variant_id}")
+        wanted = set(common_keys)
+        result: dict[tuple[str, str, str], Decimal] = {}
+        for row in reader:
+            key = (row["ticker"], row["feature_date"], row["target_date"])
+            if key not in wanted:
+                continue
+            if row["model_id"] != registered_model_id or key in result:
+                raise ValueError(f"Prediction identity mismatch for {variant_id}")
+            probability = Decimal(row["probability_up"])
+            if not probability.is_finite() or not Decimal("0") <= probability <= Decimal("1"):
+                raise ValueError(f"Prediction probability is invalid for {variant_id}")
+            result[key] = probability
+    if set(result) != set(common_keys):
+        raise ValueError(f"Prediction probability coverage mismatch for {variant_id}")
+    return result
+
+
+def _portfolio_market_sessions(
+    pack_root: Path, holdout_alignment: FairCommonDateAlignment
+) -> tuple[MarketBar, ...]:
+    keys = tuple(
+        (str(ticker), str(feature_date), str(target_date))
+        for ticker, feature_date, target_date in holdout_alignment.common_keys
+    )
+    if not keys:
+        raise ValueError("Portfolio replay requires shared project holdout rows")
+    session_dates = (keys[0][1], *(key[2] for key in keys))
+    if len(session_dates) != len(set(session_dates)):
+        raise ValueError("Portfolio session vector must be unique")
+    for index, key in enumerate(keys):
+        if key[0] != "OGDC" or key[1] != session_dates[index] or key[2] != session_dates[index + 1]:
+            raise ValueError("Shared project holdout rows are not consecutive sessions")
+
+    start = date.fromisoformat(session_dates[0])
+    end = date.fromisoformat(session_dates[-1])
+
+    def select(path: Path) -> tuple[MarketBar, ...]:
+        selected = tuple(
+            bar
+            for bar in _load_market_bars(path)
+            if bar.ticker == "OGDC" and start <= bar.date <= end
+        )
+        if tuple(bar.date.isoformat() for bar in selected) != session_dates:
+            raise ValueError("Market evidence does not exactly cover the portfolio sessions")
+        return selected
+
+    baseline = select(
+        pack_root / "evidence/market_data/baseline_psx_prices.csv"
+    )
+    lstm = select(pack_root / "evidence/market_data/lstm_ogdc_prices.csv")
+    if baseline != lstm:
+        raise ValueError("Baseline and LSTM market observations disagree")
+    expected_classes = tuple(
+        int(target.close > feature.close)
+        for feature, target in zip(baseline, baseline[1:])
+    )
+    for variant_id in MODEL_VARIANTS:
+        observed_classes = tuple(
+            int(value)
+            for value in holdout_alignment.frame_for(variant_id)["actual_class"]
+        )
+        if observed_classes != expected_classes:
+            raise ValueError(
+                f"Persisted target labels disagree with market closes for {variant_id}"
+            )
+    return baseline
+
+
+def _expected_signal(
+    *,
+    config: ExperimentConfig,
+    probability_up: Decimal,
+    feature_date: date,
+    target_date: date,
+    shares: int,
+) -> SignalRecord:
+    if probability_up >= config.thresholds.buy_probability_up_gte:
+        if shares == 0:
+            action, allocation, reason = (
+                Action.BUY,
+                config.maximum_allocation,
+                "buy_threshold_reached",
+            )
+        else:
+            action, allocation, reason = Action.HOLD, None, "already_in_position"
+    elif probability_up <= config.thresholds.sell_probability_up_lte:
+        if shares > 0:
+            action, allocation, reason = (
+                Action.SELL,
+                Decimal("0"),
+                "sell_threshold_reached",
+            )
+        else:
+            action, allocation, reason = Action.HOLD, None, "already_in_cash"
+    else:
+        action, allocation, reason = Action.HOLD, None, "inside_neutral_band"
+    signal_id = stable_id(
+        "signal",
+        config.portfolio_id,
+        config.model_id,
+        config.symbol,
+        feature_date.isoformat(),
+        target_date.isoformat(),
+        action.value,
+    )
+    return SignalRecord(
+        signal_id=signal_id,
+        portfolio_id=config.portfolio_id,
+        model_id=config.model_id,
+        ticker=config.symbol,
+        signal_date=feature_date,
+        target_date=target_date,
+        action=action,
+        probability_up=probability_up,
+        target_allocation=allocation,
+        reason=reason,
+    )
+
+
+def _expected_trade_and_state(
+    *,
+    config: ExperimentConfig,
+    signal: SignalRecord,
+    bar: MarketBar,
+    cash: Decimal,
+    shares: int,
+    open_cost_basis: Decimal,
+    realized: Decimal,
+) -> tuple[TradeRecord | None, Decimal, int, Decimal, Decimal]:
+    if signal.action is Action.HOLD:
+        return None, cash, shares, open_cost_basis, realized
+    slippage = config.execution_policy.slippage_bps / BPS_DENOMINATOR
+    multiplier = Decimal("1") + slippage if signal.action is Action.BUY else Decimal("1") - slippage
+    execution_price = money(bar.open * multiplier, field_name="execution_price")
+    fee_rate = config.transaction_cost.value / BPS_DENOMINATOR
+
+    if signal.action is Action.BUY:
+        equity = money(cash + Decimal(shares) * bar.open)
+        cash_limit = cash / (execution_price * (Decimal("1") + fee_rate))
+        allocation_limit = config.maximum_allocation * equity / execution_price
+        quantity = min(
+            int(cash_limit.to_integral_value(rounding=ROUND_FLOOR)),
+            int(allocation_limit.to_integral_value(rounding=ROUND_FLOOR)),
+        )
+        while quantity > 0:
+            notional = money(Decimal(quantity) * execution_price)
+            fee = money(Decimal(quantity) * execution_price * fee_rate)
+            if (
+                money(notional + fee) <= cash
+                and notional <= config.maximum_allocation * equity
+            ):
+                break
+            quantity -= 1
+        if quantity == 0:
+            return None, cash, shares, open_cost_basis, realized
+        notional = money(Decimal(quantity) * execution_price)
+        fee = money(Decimal(quantity) * execution_price * fee_rate)
+        total_cost = money(notional + fee)
+        cash_after = money(cash - total_cost)
+        shares_after = quantity
+        cost_after = total_cost
+        realized_after = realized
+    else:
+        quantity = shares
+        if quantity <= 0:
+            raise ValueError("SELL signal cannot execute while the replay is flat")
+        notional = money(Decimal(quantity) * execution_price)
+        fee = money(Decimal(quantity) * execution_price * fee_rate)
+        net_proceeds = money(notional - fee)
+        cash_after = money(cash + net_proceeds)
+        shares_after = 0
+        realized_after = money(realized + money(net_proceeds - open_cost_basis))
+        cost_after = Decimal("0.00")
+
+    trade_id = stable_id(
+        "trade",
+        signal.portfolio_id,
+        signal.signal_id,
+        bar.date.isoformat(),
+        signal.action.value,
+        quantity,
+        execution_price,
+        fee,
+    )
+    trade = TradeRecord(
+        trade_id=trade_id,
+        portfolio_id=signal.portfolio_id,
+        signal_date=signal.signal_date,
+        execution_date=bar.date,
+        action=signal.action,
+        quantity=quantity,
+        reference_price=bar.open,
+        execution_price=execution_price,
+        fee=fee,
+        cash_after_trade=cash_after,
+        shares_after_trade=shares_after,
+    )
+    return trade, cash_after, shares_after, cost_after, realized_after
+
+
+def _expected_snapshot(
+    *,
+    portfolio_id: str,
+    bar: MarketBar,
+    cash: Decimal,
+    shares: int,
+    open_cost_basis: Decimal,
+    realized: Decimal,
+) -> PortfolioSnapshot:
+    position = money(Decimal(shares) * bar.close)
+    return PortfolioSnapshot(
+        portfolio_id=portfolio_id,
+        date=bar.date,
+        cash=cash,
+        shares=shares,
+        market_price=bar.close,
+        position_value=position,
+        total_equity=money(cash + position),
+        realized_profit_loss=realized,
+        unrealized_profit_loss=(
+            money(position - open_cost_basis) if shares else Decimal("0.00")
+        ),
+    )
+
+
+def _replay_strategy_ledger(
+    *,
+    variant_id: str,
+    config: ExperimentConfig,
+    bars: Sequence[MarketBar],
+    probabilities: Mapping[tuple[str, str, str], Decimal],
+    signals: Sequence[SignalRecord],
+    snapshots: Sequence[PortfolioSnapshot],
+    trades: Sequence[TradeRecord],
+) -> None:
+    expected_count = len(bars) - 1
+    if len(signals) != expected_count or len(snapshots) != len(bars):
+        raise ValueError(f"Strategy ledger row count mismatch for {variant_id}")
+    cash = config.initial_cash
+    shares = 0
+    open_cost_basis = Decimal("0.00")
+    realized = Decimal("0.00")
+    if snapshots[0] != _expected_snapshot(
+        portfolio_id=config.portfolio_id,
+        bar=bars[0],
+        cash=cash,
+        shares=shares,
+        open_cost_basis=open_cost_basis,
+        realized=realized,
+    ):
+        raise ValueError(f"Opening portfolio state mismatch for {variant_id}")
+
+    trade_index = 0
+    for index, (feature_bar, target_bar) in enumerate(zip(bars, bars[1:])):
+        key = (
+            config.symbol,
+            feature_bar.date.isoformat(),
+            target_bar.date.isoformat(),
+        )
+        signal = _expected_signal(
+            config=config,
+            probability_up=probabilities[key],
+            feature_date=feature_bar.date,
+            target_date=target_bar.date,
+            shares=shares,
+        )
+        if signals[index] != signal:
+            raise ValueError(f"Persisted signal semantics mismatch for {variant_id}")
+        expected_trade, cash, shares, open_cost_basis, realized = (
+            _expected_trade_and_state(
+                config=config,
+                signal=signal,
+                bar=target_bar,
+                cash=cash,
+                shares=shares,
+                open_cost_basis=open_cost_basis,
+                realized=realized,
+            )
+        )
+        if expected_trade is not None:
+            if trade_index >= len(trades) or trades[trade_index] != expected_trade:
+                raise ValueError(f"Persisted trade semantics mismatch for {variant_id}")
+            trade_index += 1
+        elif trade_index < len(trades) and trades[trade_index].execution_date <= target_bar.date:
+            raise ValueError(f"Unexpected trade without an executable signal for {variant_id}")
+        expected_snapshot = _expected_snapshot(
+            portfolio_id=config.portfolio_id,
+            bar=target_bar,
+            cash=cash,
+            shares=shares,
+            open_cost_basis=open_cost_basis,
+            realized=realized,
+        )
+        if snapshots[index + 1] != expected_snapshot:
+            raise ValueError(f"Portfolio state transition mismatch for {variant_id}")
+    if trade_index != len(trades):
+        raise ValueError(f"Unexpected trailing trades for {variant_id}")
+
+
+def _replay_cash_ledger(
+    *, config: ExperimentConfig, bars: Sequence[MarketBar], snapshots: Sequence[PortfolioSnapshot]
+) -> None:
+    if len(snapshots) != len(bars):
+        raise ValueError("Cash-only benchmark session count mismatch")
+    for bar, snapshot in zip(bars, snapshots, strict=True):
+        expected = _expected_snapshot(
+            portfolio_id=config.benchmark_portfolio_ids.cash_only,
+            bar=bar,
+            cash=config.initial_cash,
+            shares=0,
+            open_cost_basis=Decimal("0.00"),
+            realized=Decimal("0.00"),
+        )
+        if snapshot != expected:
+            raise ValueError("Cash-only benchmark must remain independently funded and flat")
+
+
+def _replay_buy_and_hold_ledger(
+    *,
+    config: ExperimentConfig,
+    bars: Sequence[MarketBar],
+    snapshots: Sequence[PortfolioSnapshot],
+    trades: Sequence[TradeRecord],
+) -> None:
+    if len(snapshots) != len(bars) or len(trades) != 1 or len(bars) < 2:
+        raise ValueError("Buy-and-hold benchmark must contain one controlled entry")
+    portfolio_id = config.benchmark_portfolio_ids.buy_and_hold
+    cash = config.initial_cash
+    shares = 0
+    open_cost_basis = Decimal("0.00")
+    realized = Decimal("0.00")
+    if snapshots[0] != _expected_snapshot(
+        portfolio_id=portfolio_id,
+        bar=bars[0],
+        cash=cash,
+        shares=shares,
+        open_cost_basis=open_cost_basis,
+        realized=realized,
+    ):
+        raise ValueError("Buy-and-hold opening state mismatch")
+    signal = SignalRecord(
+        signal_id=stable_id(
+            "signal",
+            portfolio_id,
+            "buy-and-hold",
+            config.symbol,
+            bars[0].date.isoformat(),
+            bars[1].date.isoformat(),
+            Action.BUY.value,
+        ),
+        portfolio_id=portfolio_id,
+        model_id=config.model_id,
+        ticker=config.symbol,
+        signal_date=bars[0].date,
+        target_date=bars[1].date,
+        action=Action.BUY,
+        probability_up=Decimal("1"),
+        target_allocation=config.maximum_allocation,
+        reason="buy_and_hold_entry",
+    )
+    expected_trade, cash, shares, open_cost_basis, realized = _expected_trade_and_state(
+        config=config,
+        signal=signal,
+        bar=bars[1],
+        cash=cash,
+        shares=shares,
+        open_cost_basis=open_cost_basis,
+        realized=realized,
+    )
+    if expected_trade is None or trades[0] != expected_trade:
+        raise ValueError("Buy-and-hold entry does not match first-target open execution")
+    for index, bar in enumerate(bars[1:], start=1):
+        if snapshots[index] != _expected_snapshot(
+            portfolio_id=portfolio_id,
+            bar=bar,
+            cash=cash,
+            shares=shares,
+            open_cost_basis=open_cost_basis,
+            realized=realized,
+        ):
+            raise ValueError("Buy-and-hold benchmark state transition mismatch")
+
+
+def _normalized_snapshots(
+    snapshots: Sequence[PortfolioSnapshot],
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            item.date,
+            item.cash,
+            item.shares,
+            item.market_price,
+            item.position_value,
+            item.total_equity,
+            item.realized_profit_loss,
+            item.unrealized_profit_loss,
+        )
+        for item in snapshots
+    )
+
+
+def _normalized_trades(trades: Sequence[TradeRecord]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            item.signal_date,
+            item.execution_date,
+            item.action,
+            item.quantity,
+            item.reference_price,
+            item.execution_price,
+            item.fee,
+            item.cash_after_trade,
+            item.shares_after_trade,
+        )
+        for item in trades
+    )
+
+
 def _portfolio_replay(
     pack_root: Path,
     registry: Mapping[str, str],
@@ -1095,10 +1771,11 @@ def _portfolio_replay(
     holdout_alignment: FairCommonDateAlignment,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     model_rows: list[dict[str, Any]] = []
-    benchmark_rows: list[dict[str, Any]] = []
+    benchmark_candidates: dict[str, list[dict[str, Any]]] = {
+        benchmark_id: [] for benchmark_id in BENCHMARKS
+    }
     expected_signature: dict[str, Any] | None = None
     all_portfolio_ids: list[str] = []
-    expected_snapshot_dates: tuple[str, ...] | None = None
 
     common_feature_dates = [key[1] for key in holdout_alignment.common_keys]
     common_target_dates = [key[2] for key in holdout_alignment.common_keys]
@@ -1108,10 +1785,15 @@ def _portfolio_replay(
         "target_start": min(common_target_dates),
         "target_end": max(common_target_dates),
     }
+    market_bars = _portfolio_market_sessions(pack_root, holdout_alignment)
+    common_keys = tuple(
+        (str(ticker), str(feature_date), str(target_date))
+        for ticker, feature_date, target_date in holdout_alignment.common_keys
+    )
 
     for variant_id in MODEL_VARIANTS:
         base = pack_root / "evidence" / "portfolios" / variant_id
-        config = load_experiment_config(base / "config.json")
+        config = _load_experiment_config(base / "config.json")
         config_payload = config.to_dict()
         if config.model_id != registry[variant_id]:
             raise ValueError(f"Portfolio model identity mismatch for {variant_id}")
@@ -1124,15 +1806,24 @@ def _portfolio_replay(
         elif signature != expected_signature:
             raise ValueError("All six model portfolios must use identical assumptions")
 
-        strategy_snapshots = load_portfolio_snapshots(base / "portfolio_snapshots.csv")
-        strategy_trades = load_trades(base / "trades.csv")
-        cash_snapshots = load_portfolio_snapshots(
+        probabilities = _raw_holdout_probabilities(
+            pack_root,
+            variant_id=variant_id,
+            registered_model_id=registry[variant_id],
+            common_keys=common_keys,
+        )
+        signals = _load_signals(base / "signals.csv")
+        strategy_snapshots = _load_portfolio_snapshots(
+            base / "portfolio_snapshots.csv"
+        )
+        strategy_trades = _load_trades(base / "trades.csv")
+        cash_snapshots = _load_portfolio_snapshots(
             base / "benchmarks" / "cash_only_snapshots.csv"
         )
-        buy_hold_snapshots = load_portfolio_snapshots(
+        buy_hold_snapshots = _load_portfolio_snapshots(
             base / "benchmarks" / "buy_and_hold_snapshots.csv"
         )
-        buy_hold_trades = load_trades(
+        buy_hold_trades = _load_trades(
             base / "benchmarks" / "buy_and_hold_trades.csv"
         )
         _validate_ledger_identity(
@@ -1156,18 +1847,24 @@ def _portfolio_replay(
             )
         )
 
-        dates = tuple(snapshot.date.isoformat() for snapshot in strategy_snapshots)
-        if (
-            dates[0] != expected_evaluation_dates["feature_start"]
-            or dates[-1] != expected_evaluation_dates["target_end"]
-            or tuple(snapshot.date.isoformat() for snapshot in cash_snapshots) != dates
-            or tuple(snapshot.date.isoformat() for snapshot in buy_hold_snapshots) != dates
-        ):
-            raise ValueError(f"Portfolio snapshot dates are misaligned for {variant_id}")
-        if expected_snapshot_dates is None:
-            expected_snapshot_dates = dates
-        elif dates != expected_snapshot_dates:
-            raise ValueError("All six portfolios must use identical valuation dates")
+        _replay_strategy_ledger(
+            variant_id=variant_id,
+            config=config,
+            bars=market_bars,
+            probabilities=probabilities,
+            signals=signals,
+            snapshots=strategy_snapshots,
+            trades=strategy_trades,
+        )
+        _replay_cash_ledger(
+            config=config, bars=market_bars, snapshots=cash_snapshots
+        )
+        _replay_buy_and_hold_ledger(
+            config=config,
+            bars=market_bars,
+            snapshots=buy_hold_snapshots,
+            trades=buy_hold_trades,
+        )
 
         metric_options = {
             "annualization_factor": config.metric_assumptions.annualization_factor,
@@ -1201,61 +1898,81 @@ def _portfolio_replay(
                 }
             )
         )
-        for benchmark_id, portfolio_id, metrics in (
+        config_path = f"evidence/portfolios/{variant_id}/config.json"
+        for benchmark_id, portfolio_id, metrics, snapshots, trades, relative in (
             (
                 "cash-only",
                 config.benchmark_portfolio_ids.cash_only,
                 cash_metrics,
+                cash_snapshots,
+                (),
+                "benchmarks/cash_only_snapshots.csv",
             ),
             (
                 "buy-and-hold",
                 config.benchmark_portfolio_ids.buy_and_hold,
                 buy_hold_metrics,
+                buy_hold_snapshots,
+                buy_hold_trades,
+                "benchmarks/buy_and_hold_snapshots.csv",
             ),
         ):
-            benchmark_rows.append(
-                to_jsonable(
-                    {
+            benchmark_candidates[benchmark_id].append(
+                {
+                    "metrics": to_jsonable(_metric_without_daily_returns(metrics)),
+                    "normalized_snapshots": _normalized_snapshots(snapshots),
+                    "normalized_trades": _normalized_trades(trades),
+                    "provenance": {
                         "variant_id": variant_id,
-                        "benchmark_id": benchmark_id,
+                        "registered_model_id": registry[variant_id],
                         "experiment_id": config.experiment_id,
                         "portfolio_id": portfolio_id,
-                        **_metric_without_daily_returns(metrics),
-                    }
-                )
+                        "config_path": config_path,
+                        "snapshots_path": f"evidence/portfolios/{variant_id}/{relative}",
+                        "trades_path": (
+                            None
+                            if benchmark_id == "cash-only"
+                            else (
+                                f"evidence/portfolios/{variant_id}/benchmarks/"
+                                "buy_and_hold_trades.csv"
+                            )
+                        ),
+                    },
+                }
             )
 
     if len(all_portfolio_ids) != 18 or len(set(all_portfolio_ids)) != 18:
         raise ValueError("Every model and benchmark must retain an independent portfolio ID")
     assert expected_signature is not None
 
+    benchmark_rows: list[dict[str, Any]] = []
     for benchmark_id in BENCHMARKS:
-        selected = [
-            row for row in benchmark_rows if row["benchmark_id"] == benchmark_id
-        ]
-        economic_fields = (
-            "initial_equity",
-            "ending_equity",
-            "total_return",
-            "maximum_drawdown",
-            "volatility",
-            "sharpe_ratio",
-            "number_of_trades",
-            "win_rate",
-            "average_gain",
-            "average_loss",
-            "turnover",
-            "fees_paid",
-            "time_in_market",
-        )
-        reference = {field: selected[0][field] for field in economic_fields}
+        selected = benchmark_candidates[benchmark_id]
+        if len(selected) != len(MODEL_VARIANTS):
+            raise ValueError(f"Exactly six {benchmark_id} ledgers are required")
+        reference = selected[0]
         if any(
-            {field: row[field] for field in economic_fields} != reference
-            for row in selected[1:]
+            candidate["metrics"] != reference["metrics"]
+            or candidate["normalized_snapshots"]
+            != reference["normalized_snapshots"]
+            or candidate["normalized_trades"] != reference["normalized_trades"]
+            for candidate in selected[1:]
         ):
-            raise ValueError(f"Independent {benchmark_id} ledgers disagree economically")
+            raise ValueError(
+                f"Independent {benchmark_id} ledgers disagree row by row"
+            )
+        benchmark_rows.append(
+            {
+                "benchmark_id": benchmark_id,
+                "competitor_type": "portfolio_benchmark",
+                **reference["metrics"],
+                "ledger_provenance": [
+                    candidate["provenance"] for candidate in selected
+                ],
+            }
+        )
 
-    return model_rows, benchmark_rows, expected_signature
+    return model_rows, to_jsonable(benchmark_rows), expected_signature
 
 
 def _rank_portfolios(
@@ -1700,9 +2417,16 @@ def _replay_pack_evidence(pack_root: Path, *, comparison_id: str) -> ReplayResul
         "portfolio_assumptions": portfolio_assumptions,
         "metric_recomputation": {
             "prediction_source": "persisted prediction rows",
-            "portfolio_source": "persisted snapshots and trades",
+            "portfolio_source": (
+                "persisted signals, source-bound market observations, snapshots, and trades"
+            ),
+            "portfolio_semantic_replay": True,
             "models_retrained": False,
             "backtests_rerun": False,
+        },
+        "presentation": {
+            "format": "tabular_report_only",
+            "plots_included": False,
         },
         "disclaimer": ACADEMIC_DISCLAIMER,
     }
@@ -1738,6 +2462,8 @@ def _replay_pack_evidence(pack_root: Path, *, comparison_id: str) -> ReplayResul
             "The shared project holdout and baseline results were exposed previously.",
             "Corporate-action adjustment is unknown and dividends are not modeled.",
             "Results depend on one fixed policy, execution model, fee, and split regime.",
+            "This price-only comparison does not integrate or evaluate sentiment features.",
+            "The portable pack is tabular/report-only and does not include plots.",
             "Simulated results do not predict future performance.",
         ],
         "disclaimer": ACADEMIC_DISCLAIMER,
@@ -1916,8 +2642,9 @@ def _render_report(
         *benchmark_table,
         "",
         "Each model configuration retains separate strategy, cash-only, and "
-        "buy-and-hold portfolio identities. The benchmark rows above show their "
-        "common economic result.",
+        "buy-and-hold portfolio identities. Each benchmark row is one logical "
+        "result reconciled row by row from six independently identified ledgers; "
+        "their relative paths and IDs are recorded in metrics.json.",
         "",
         "## Limitations",
         "",
@@ -1981,11 +2708,6 @@ def _expected_evidence_bindings(
             "run_manifest.json",
             "source_integrity_root",
         ),
-        "evidence/source_manifests/baseline_vertical_manifest.json": (
-            "baseline_vertical_slice",
-            "manifest.json",
-            "source_integrity_root",
-        ),
         "evidence/source_manifests/lstm_run_manifest.json": (
             "lstm",
             "run_manifest.json",
@@ -2005,6 +2727,16 @@ def _expected_evidence_bindings(
             "lstm",
             "split_manifest.json",
             "lstm_sequence_split_membership",
+        ),
+        "evidence/market_data/baseline_psx_prices.csv": (
+            "baseline_vertical_slice",
+            "input_snapshot/psx_prices.csv",
+            "portfolio_market_observations",
+        ),
+        "evidence/market_data/lstm_ogdc_prices.csv": (
+            "lstm",
+            "frozen_input/OGDC_prices.csv",
+            "portfolio_market_observations",
         ),
     }
     for variant_id in MODEL_VARIANTS:
@@ -2053,32 +2785,55 @@ def _source_checksum_maps(pack_root: Path) -> tuple[dict[str, dict[str, str]], d
         )
     )
 
-    vertical_manifest = _read_json(
-        pack_root / "evidence/source_manifests/baseline_vertical_manifest.json",
-        field="Copied vertical-slice manifest",
+    vertical_certificate_path = (
+        pack_root
+        / "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
     )
-    raw_vertical_files = vertical_manifest.get("artifacts")
-    if not isinstance(raw_vertical_files, list) or not raw_vertical_files:
-        raise ValueError("Copied vertical-slice inventory must be a non-empty array")
-    vertical_inventory: dict[str, str] = {}
-    ordered_vertical: list[str] = []
-    for index, raw_entry in enumerate(raw_vertical_files):
-        if not isinstance(raw_entry, Mapping) or set(raw_entry) != {"path", "sha256"}:
-            raise ValueError(
-                f"Copied vertical-slice artifacts[{index}] must contain path and sha256"
-            )
-        relative = _safe_relative(
-            raw_entry["path"], field=f"Copied vertical artifacts[{index}].path"
+    vertical_certificate = _read_json(
+        vertical_certificate_path, field="Vertical-slice integrity certificate"
+    )
+    if set(vertical_certificate) != {
+        "schema_version",
+        "artifact_type",
+        "source_role",
+        "run_id",
+        "source_manifest",
+        "projection_policy",
+        "raw_manifest_included",
+        "source_assertions",
+        "artifact_inventory",
+        "disclaimer",
+    }:
+        raise ValueError("Vertical-slice integrity certificate has an unexpected schema")
+    source_manifest = vertical_certificate["source_manifest"]
+    if not isinstance(source_manifest, Mapping) or set(source_manifest) != {
+        "name",
+        "sha256",
+    }:
+        raise ValueError("Vertical-slice source manifest certificate is malformed")
+    vertical_manifest_sha256 = str(source_manifest["sha256"])
+    if (
+        vertical_certificate["schema_version"] != SCHEMA_VERSION
+        or vertical_certificate["artifact_type"]
+        != "paisa_source_integrity_certificate"
+        or vertical_certificate["source_role"] != "baseline_vertical_slice"
+        or vertical_certificate["run_id"]
+        != AUTHORITATIVE_SOURCE_ROOTS["baseline_vertical_slice"]["run_id"]
+        or source_manifest["name"] != "manifest.json"
+        or vertical_manifest_sha256
+        != AUTHORITATIVE_SOURCE_ROOTS["baseline_vertical_slice"]["manifest_sha256"]
+        or vertical_certificate["projection_policy"] != "allowlisted_fields_v1"
+        or vertical_certificate["raw_manifest_included"] is not False
+        or vertical_certificate["disclaimer"] != ACADEMIC_DISCLAIMER
+    ):
+        raise ValueError("Vertical-slice integrity certificate identity mismatch")
+    vertical_inventory = dict(
+        _parse_sha256_inventory(
+            vertical_certificate["artifact_inventory"],
+            field="Certified vertical-slice inventory",
+            expected_excludes=("manifest.json",),
         )
-        checksum = str(raw_entry["sha256"])
-        if not _SHA256.fullmatch(checksum):
-            raise ValueError(f"Invalid copied vertical SHA-256 for {relative}")
-        if relative in vertical_inventory:
-            raise ValueError("Copied vertical-slice inventory contains duplicate paths")
-        ordered_vertical.append(relative)
-        vertical_inventory[relative] = checksum
-    if ordered_vertical != sorted(ordered_vertical):
-        raise ValueError("Copied vertical-slice inventory must be sorted")
+    )
 
     lstm_run_manifest_path = (
         pack_root / "evidence/source_manifests/lstm_run_manifest.json"
@@ -2128,9 +2883,7 @@ def _source_checksum_maps(pack_root: Path) -> tuple[dict[str, dict[str, str]], d
             **training_inventory,
         },
         "baseline_vertical_slice": {
-            "manifest.json": sha256_file(
-                pack_root / "evidence/source_manifests/baseline_vertical_manifest.json"
-            ),
+            "manifest.json": vertical_manifest_sha256,
             **vertical_inventory,
         },
         "lstm": {
@@ -2188,16 +2941,19 @@ def _validate_source_roots_payload(
             "run_manifest.json",
             "evidence/source_manifests/baseline_training_run_manifest.json",
             "model_training_run",
+            "byte_copy",
         ),
         "baseline_vertical_slice": (
             "manifest.json",
-            "evidence/source_manifests/baseline_vertical_manifest.json",
+            "evidence/source_manifests/baseline_vertical_manifest_certificate.json",
             "vertical_slice",
+            "deterministic_redacted_projection",
         ),
         "lstm": (
             "run_manifest.json",
             "evidence/source_manifests/lstm_run_manifest.json",
             "lstm_price_only_experiment",
+            "byte_copy",
         ),
     }
     if [source.get("role") for source in raw_sources if isinstance(source, Mapping)] != list(
@@ -2213,11 +2969,13 @@ def _validate_source_roots_payload(
             "integrity_root_sha256",
             "payload_file_count",
             "integrity_root_pack_path",
+            "integrity_root_pack_sha256",
+            "integrity_root_derivation",
         }:
             raise ValueError("Each source root has an unexpected schema")
         role = str(source["role"])
         expected_identity = AUTHORITATIVE_SOURCE_ROOTS[role]
-        root_name, pack_path, artifact_type = expected_root_paths[role]
+        root_name, pack_path, artifact_type, derivation = expected_root_paths[role]
         if (
             source["run_id"] != expected_identity["run_id"]
             or source["integrity_root_sha256"]
@@ -2226,12 +2984,41 @@ def _validate_source_roots_payload(
             or source["integrity_root_pack_path"] != pack_path
             or source["artifact_type"] != artifact_type
             or source["payload_file_count"] != payload_counts[role]
+            or source["integrity_root_derivation"] != derivation
         ):
             raise ValueError(f"Authoritative source binding mismatch for {role}")
-        if inventory.get(pack_path) != expected_identity["manifest_sha256"]:
+        pack_sha256 = str(source["integrity_root_pack_sha256"])
+        if (
+            not _SHA256.fullmatch(pack_sha256)
+            or inventory.get(pack_path) != pack_sha256
+            or (derivation == "byte_copy" and pack_sha256 != source["integrity_root_sha256"])
+            or (
+                role == "baseline_vertical_slice"
+                and pack_sha256
+                != expected_identity.get("portable_certificate_sha256")
+            )
+        ):
             raise ValueError(f"Copied integrity root mismatch for {role}")
 
     registry = _model_registry(pack_root)
+    vertical_certificate = _read_json(
+        pack_root
+        / "evidence/source_manifests/baseline_vertical_manifest_certificate.json",
+        field="Vertical-slice integrity certificate",
+    )
+    if vertical_certificate.get("source_assertions") != {
+        "schema_version": "1.0",
+        "status": "PASS",
+        "symbol": "OGDC",
+        "model_training_run_id": AUTHORITATIVE_SOURCE_ROOTS["baseline_training"][
+            "run_id"
+        ],
+        "registered_model_ids": {
+            variant_id: registry[variant_id] for variant_id in BASELINE_VARIANTS
+        },
+        "disclaimer": ACADEMIC_DISCLAIMER,
+    }:
+        raise ValueError("Vertical-slice certificate assertions are incomplete")
     expected_bindings = _expected_evidence_bindings(registry)
     raw_evidence = payload["evidence_files"]
     if not isinstance(raw_evidence, list):
@@ -2279,26 +3066,32 @@ def _validate_source_roots_payload(
     actual_evidence = {
         path for path in inventory if path.startswith("evidence/")
     }
-    if actual_evidence != set(expected_bindings):
+    expected_evidence = {
+        *expected_bindings,
+        "evidence/source_manifests/baseline_vertical_manifest_certificate.json",
+    }
+    if actual_evidence != expected_evidence:
         raise ValueError("Pack evidence files must exactly match source_roots.json")
     return payload
 
 
 def _assert_no_prohibited_claims(pack_root: Path) -> None:
     forbidden = ("globally untouched", "universal winner", "universal_winner")
-    for relative in (
-        "comparison_contract.json",
-        "date_alignment.json",
-        "final_summary.json",
-        "metrics.json",
-        "rankings.json",
-        "report.md",
-        "source_roots.json",
-    ):
-        text = (pack_root / relative).read_text(encoding="utf-8").lower()
+    for relative, path in _regular_files(pack_root).items():
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"Portable comparison member is not UTF-8 text: {relative}"
+            ) from exc
+        text = raw_text.lower()
         for phrase in forbidden:
             if phrase in text:
                 raise ValueError(f"Comparison pack contains prohibited claim: {phrase}")
+        if contains_sensitive_text(raw_text):
+            raise ValueError(
+                f"Portable comparison member contains host-path or credential data: {relative}"
+            )
 
 
 def _compare_replayed_outputs(
@@ -2601,7 +3394,8 @@ def verify_unified_comparison_pack(
     )
     return {
         **result,
-        "pack": str(resolved),
+        "pack": resolved.name,
+        "path_base": "input_parent",
         "checksum_verified": checksum_path is not None,
         "zip_sha256": zip_sha256,
         "source_verification": source_verification,
@@ -2712,7 +3506,16 @@ def build_unified_price_model_comparison(
     try:
         specs = _evidence_specs(snapshots)
         _copy_evidence(stage_dir, snapshots, specs)
-        source_roots = _source_roots_payload(resolved_id, snapshots, specs)
+        certificate_path, certificate_sha256 = _write_vertical_manifest_certificate(
+            stage_dir, snapshots
+        )
+        source_roots = _source_roots_payload(
+            resolved_id,
+            snapshots,
+            specs,
+            vertical_certificate_path=certificate_path,
+            vertical_certificate_sha256=certificate_sha256,
+        )
         write_json(source_roots, stage_dir / "source_roots.json")
         replay = _replay_pack_evidence(stage_dir, comparison_id=resolved_id)
         _write_replayed_outputs(stage_dir, replay, source_roots=source_roots)
@@ -2751,11 +3554,11 @@ def build_unified_price_model_comparison(
     assert replay is not None
     return {
         **replay.final_summary,
-        "artifact_directory": str(final_dir),
-        "zip_path": str(final_zip) if final_zip is not None else None,
-        "checksum_path": str(final_checksum) if final_checksum is not None else None,
+        "artifact_directory": final_dir.name,
+        "zip_path": final_zip.name if final_zip is not None else None,
+        "checksum_path": final_checksum.name if final_checksum is not None else None,
         "zip_sha256": zip_sha256,
-        "path_base": "absolute",
+        "path_base": "output_root",
     }
 
 

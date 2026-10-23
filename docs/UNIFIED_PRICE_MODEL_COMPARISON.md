@@ -2,8 +2,14 @@
 
 This document defines the `PAISA-RM-003` derived-artifact contract for the
 price-only comparison of `M-001` through `M-006`. The canonical comparison ID
-is `CMP-20261024-OGDC-price-only-01`, and its output root is
+is `CMP-20261024-OGDC-price-only-02`, and its output root is
 `artifacts/model_comparisons/`.
+
+`CMP-20261024-OGDC-price-only-01` is a superseded, non-portable historical
+draft. Its copied vertical-slice manifest disclosed producer-host paths, and
+its verifier did not establish every portfolio transition it claimed. Do not
+use, relabel, or distribute `-01` as the authoritative comparison. The
+hardened `-02` ID is immutable and must be generated afresh.
 
 The comparison is an academic simulation, not financial advice. It does not
 demonstrate future performance.
@@ -11,11 +17,12 @@ demonstrate future performance.
 ## Contract boundary
 
 The builder is a deterministic evidence transformer. It validates completed
-source runs, copies the minimum row-level prediction and portfolio evidence
-needed for portable replay, derives the two reference baselines, and recomputes
-every published metric. It does **not** train or deserialize a model, run model
-inference, rerun a backtest, change a decision threshold, or mutate a source
-run.
+source runs, copies the row-level predictions, signals, two independently
+retained market sources, and portfolio ledgers needed for portable replay,
+derives the two reference baselines, and recomputes every published metric. It
+does **not** train or deserialize a model, run model inference, rerun a
+backtest, change a decision threshold, or mutate a source run. It does not
+integrate or evaluate sentiment features.
 
 The pack keeps three questions separate:
 
@@ -39,6 +46,15 @@ checksum-verified custodian bundle before the build.
 | Baseline training and M-001--M-004 prediction evidence | `TRN-20261020-191815-624662-nogit` | `run_manifest.json` | `8d5113bc8b67f43a76639d7397b905217bda1f94321183f0438e33448f689023` |
 | M-001--M-004 portfolio and benchmark evidence | `VSL-20261020-OGDC-main-02` | `manifest.json` | `2ce2f7581a5baff8487b09ae695213745c704f11715e6bd5abd0e99009337f31` |
 | M-005--M-006 prediction, portfolio, and benchmark evidence | `LSTM-20261024-OGDC-price-only-02` | `run_manifest.json` | `e475e077f375071c79ce8743425831d8cd9cf5ceb37f42eca0acfa65a100f3d0` |
+
+The raw vertical-slice manifest is still authenticated by its authoritative
+SHA-256, but it is not copied into the portable pack because its historical
+diagnostic text contains producer-host paths. Instead, the builder writes a
+deterministic allowlisted projection named
+`baseline_vertical_manifest_certificate.json`. The certificate binds the
+original manifest name and digest, stable source assertions, and the complete
+source artifact inventory. Its own digest is independently allowlisted, so
+neither an edited raw manifest nor an edited projection can be substituted.
 
 `LSTM-20261024-OGDC-price-only-01` is historical pre-hardening evidence. It is
 not an accepted input, a fallback, or a source of canonical values. A generic
@@ -89,7 +105,7 @@ not required because the builder never loads or retrains either LSTM.
 
 ```bash
 python scripts/build_unified_price_model_comparison.py \
-  --comparison-id CMP-20261024-OGDC-price-only-01 \
+  --comparison-id CMP-20261024-OGDC-price-only-02 \
   --output-dir artifacts/model_comparisons \
   --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
@@ -109,27 +125,36 @@ ZIP/sidecar pair, but never an unauthenticated ZIP or a partially written
 comparison directory. Inspect an orphan explicitly and use a new ID; never
 silently overwrite it.
 
+Successful CLI output contains the comparison ID and paths relative to the
+declared output root, not checkout or home-directory paths. Failures emit
+sanitized JSON without a traceback by default. `--debug` adds a sanitized
+traceback; path and credential-like material remains redacted. The build and
+verification import path does not import Matplotlib or another plotting
+backend.
+
 ## Pack layout
 
 The successful default build publishes these three siblings:
 
 ```text
 artifacts/model_comparisons/
-├── CMP-20261024-OGDC-price-only-01/
-├── CMP-20261024-OGDC-price-only-01.zip
-└── CMP-20261024-OGDC-price-only-01.zip.sha256
+├── CMP-20261024-OGDC-price-only-02/
+├── CMP-20261024-OGDC-price-only-02.zip
+└── CMP-20261024-OGDC-price-only-02.zip.sha256
 ```
 
-The canonical ZIP SHA-256 is
-`6482b22da616907f1f9bc1b6fc621f5a193b0bffeb3d41ad59ab353595ab2129`.
-This custody value identifies the generated local archive; the pack remains
-Git-ignored and must be preserved or restored separately from a clean clone.
+The authoritative `-02` ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and the verified total file count is `65`: `manifest.json` plus the 64 entries
+in its exact inventory. The final immutable directory and ZIP/sidecar pair pass
+portable and external-source verification. The pack remains Git-ignored and
+must be preserved or restored separately from a clean clone.
 
 The comparison directory has this exact structure. `<variant>` means each of
 `M-001`, `M-002`, `M-003`, `M-004`, `M-005`, and `M-006`.
 
 ```text
-CMP-20261024-OGDC-price-only-01/
+CMP-20261024-OGDC-price-only-02/
 ├── manifest.json
 ├── final_summary.json
 ├── comparison_contract.json
@@ -151,9 +176,13 @@ CMP-20261024-OGDC-price-only-01/
     ├── splits/
     │   ├── baseline_split_manifest.json
     │   └── lstm_split_manifest.json
+    ├── market_data/
+    │   ├── baseline_psx_prices.csv
+    │   └── lstm_ogdc_prices.csv
     ├── portfolios/
     │   └── <variant>/
     │       ├── config.json
+    │       ├── signals.csv
     │       ├── portfolio_snapshots.csv
     │       ├── trades.csv
     │       └── benchmarks/
@@ -162,22 +191,26 @@ CMP-20261024-OGDC-price-only-01/
     │           └── buy_and_hold_trades.csv
     └── source_manifests/
         ├── baseline_training_run_manifest.json
-        ├── baseline_vertical_manifest.json
+        ├── baseline_vertical_manifest_certificate.json
         ├── lstm_run_manifest.json
         └── lstm_artifact_manifest.json
 ```
 
-No fitted model, model binary, raw market-data file, cache, or secret belongs
-in the pack. All comparison-authored paths are normalized relative POSIX paths.
-The byte-copied authoritative integrity roots remain opaque evidence and may
-retain historical diagnostic text from their producing host; the verifier
-never resolves a path from that text. Symlinks, special files, traversal
+No fitted model, model binary, cache, or secret belongs in the pack. The only
+raw market files are the two checksum-bound sources required to prove identical
+session opens and closes across the baseline and LSTM families. All authored
+paths are normalized relative POSIX paths. Every portable member must be UTF-8
+text, and the verifier recursively rejects defined host-path and
+credential-like patterns, including POSIX home/root paths, Windows drive or UNC
+paths, file URIs, URL credentials, authorization values, known token or key
+formats, and credential-like assignments. Symlinks, special files, traversal
 components, and unexpected files are invalid.
 
 ## Schema 1.0
 
 Every comparison-authored JSON document carries `schema_version="1.0"`;
-byte-copied source manifests retain their original source contracts.
+byte-copied source manifests retain their original source contracts, while the
+vertical-slice certificate is a schema-`1.0` deterministic projection.
 Identifiers and ordered arrays are deterministic, authored JSON is UTF-8 and
 rejects non-finite numeric values, dates use `YYYY-MM-DD`, and SHA-256 values
 are lowercase 64-character hexadecimal strings. Authored comparison JSON omits
@@ -201,15 +234,19 @@ pack.
 
 This file binds the three allowlisted source roles. Each source record contains
 `role`, `artifact_type`, exact `run_id`, `integrity_root_name`,
-`integrity_root_sha256`, `payload_file_count`, and
-`integrity_root_pack_path`. Top-level `relationships` records the required
-source binding. Every ordered `evidence_files` entry contains exactly
+`integrity_root_sha256`, `payload_file_count`, `integrity_root_pack_path`,
+`integrity_root_pack_sha256`, and `integrity_root_derivation`. Top-level
+`relationships` records the required source binding. Every ordered
+`evidence_files` entry contains exactly
 `source_role`, `source_path`, `pack_path`, `sha256`, `purpose`, and
 `derivation="byte_copy"`; it maps each safe source-relative path to its safe
 pack-relative path and SHA-256. `source_revalidation` records the
 pre-generation and pre-publication checks. The document stores no source
-checkout's absolute path. The copied manifests under
-`evidence/source_manifests/` must match these digests byte for byte.
+checkout's absolute path. The training and LSTM manifests under
+`evidence/source_manifests/` must match their source digests byte for byte.
+The vertical role instead names the digest-allowlisted deterministic redacted
+certificate, while retaining the authoritative raw-manifest digest as the
+source integrity root.
 For the LSTM source, the allowlisted `run_manifest.json` inventory must bind
 the copied `artifact_manifest.json` digest, and that nested inventory must
 exactly equal the remaining run-level entries. Neither layer is trusted on its
@@ -222,7 +259,7 @@ top-level fields are `schema_version`, `comparison_id`, `symbol`,
 `source_frequency`, `models`, `reference_baselines`, `portfolio_benchmarks`,
 `target_definition`, `alignment_key`, `evaluation_scopes`, `selection_policy`,
 `reference_baseline_policy`, `portfolio_assumptions`,
-`metric_recomputation`, and `disclaimer`:
+`metric_recomputation`, `presentation`, and `disclaimer`:
 
 - the six stable variant IDs in their canonical order; the copied source
   manifests bind each variant to its registered model ID;
@@ -236,7 +273,10 @@ top-level fields are `schema_version`, `comparison_id`, `symbol`,
   fee, zero slippage, long-only state, after-close signal, next-session-open
   execution, close valuation, and 252-session annualization;
 - separate model portfolios plus cash-only and controlled buy-and-hold
-  benchmarks.
+  benchmarks;
+- full semantic portfolio replay from persisted probabilities, signals,
+  source-bound market opens/closes, trades, and snapshots; and
+- tabular/report-only presentation with no generated comparison plots.
 
 ### `date_alignment.json`
 
@@ -295,10 +335,34 @@ target_date,predicted_class,probability_up,probability_down,actual_class
 direction; it does not look at the scored target-date close. The file contains
 both validation and shared project holdout scopes, with deterministic ordering.
 
+### Copied market and signal evidence
+
+`evidence/market_data/baseline_psx_prices.csv` and
+`evidence/market_data/lstm_ogdc_prices.csv` are byte copies of the two
+independently checksum-bound source files. The verifier selects `OGDC` from the
+declared feature start through target end and requires both sources to contain
+the exact same ordered 185-session `(date, open, close)` vector: the opening
+feature session plus every one of the 184 shared project holdout target
+sessions. Missing, duplicate, reordered, or changed observations fail closed,
+including a changed price on a day when a portfolio is flat.
+
+Each `evidence/portfolios/<variant>/signals.csv` is also a source-exact byte
+copy with this ordered schema:
+
+```text
+schema_version,signal_id,portfolio_id,model_id,ticker,signal_date,target_date,
+action,probability_up,target_allocation,reason
+```
+
+The verifier derives the expected signal from the persisted `probability_up`,
+the configured inclusive `0.60`/`0.40` thresholds, and the preceding share
+state. It requires an exact signal row for every target session and never uses
+`actual_class` to make a policy decision.
+
 ### Copied portfolio evidence
 
-Every `<variant>` portfolio directory contains source-exact config, snapshots,
-trades, and benchmark ledgers. Snapshot columns are:
+Every `<variant>` portfolio directory contains source-exact config, signals,
+snapshots, trades, and benchmark ledgers. Snapshot columns are:
 
 ```text
 schema_version,portfolio_id,date,cash,shares,market_price,position_value,
@@ -313,10 +377,15 @@ quantity,reference_price,execution_price,fee,cash_after_trade,
 shares_after_trade
 ```
 
-The verifier recomputes portfolio metrics from these ledgers, verifies
-accounting and policy assumptions, and proves that the repeated benchmark
-copies are economically identical. A persisted portfolio summary is never the
-primary metric input.
+Using exact `Decimal` arithmetic, PKR `0.01` `ROUND_HALF_UP` money rounding,
+and whole-share floor sizing, the verifier independently replays every policy
+and ledger transition. It proves the opening PKR 100,000 flat state, all 184
+next-observed-session decisions, next-session-open fills, zero slippage,
+10-basis-point fees, 50% allocation sizing, cash/share and cost-basis changes,
+realized and unrealized P/L, close-valued snapshots, cash-only invariance, and
+the controlled benchmark's single first-session buy. This is semantic evidence
+validation, not a call to the production backtest runner. A persisted portfolio
+summary is never the primary metric input.
 
 ### `metrics.json`
 
@@ -328,7 +397,7 @@ This file has deliberately separate ordered collections:
 | `validation_reference_baseline_metrics` | `majority-class-baseline`, `previous-direction-baseline` | Recomputed validation reference context; never used to select a model. |
 | `shared_project_holdout_prediction_metrics` | `M-001` through `M-006`, `majority-class-baseline`, `previous-direction-baseline` | Recomputed prediction metrics on the exact 184 common target dates. |
 | `model_portfolio_metrics` | `M-001` through `M-006` | Recomputed fixed-policy model portfolio outcomes. |
-| `benchmark_portfolio_metrics` | Six independent copies each of `cash-only` and `buy-and-hold`, one pair per model experiment | Recomputed benchmark outcomes and evidence that independent ledgers agree economically. |
+| `benchmark_portfolio_metrics` | Exactly two logical rows: `cash-only` and `buy-and-hold` | One reconciled economic metric record per benchmark. Each row carries six `ledger_provenance` records naming the independent variant, model, experiment, portfolio, config, snapshot, and optional trade evidence. |
 | `reference_baseline_training` | Training row count, class counts, and frozen majority class | Provenance for the majority-class prediction rule. |
 
 Prediction records include row/support counts, class coverage and
@@ -340,7 +409,10 @@ Portfolio records use `initial_equity`, `ending_equity`, `total_return`,
 `win_rate`, `average_gain`, `average_loss`, `turnover`, `fees_paid`, and
 `time_in_market`; model records also include return differences against both
 benchmarks. Undefined values are JSON `null`, never `NaN` or infinity.
-Ordering and tie-break rules are persisted and deterministic.
+Ordering and tie-break rules are persisted and deterministic. The verifier
+compares all six retained snapshot copies of each benchmark row by row and
+compares trades where present before emitting the single logical benchmark
+record.
 
 ### `rankings.json`
 
@@ -402,21 +474,25 @@ Verify an unpacked comparison without the source runs:
 
 ```bash
 python scripts/verify_unified_price_model_comparison.py \
-  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02
 ```
 
 This verifies safe paths, the exact manifest inventory, checksums, schemas,
-contracts, source-manifest copies, date alignment, row-level predictions,
-baseline predictions, ledgers, recomputed metrics, rankings, summary, and
-report consistency. Packs are bounded to 256 files and 64 MiB of uncompressed
-payload. Verification does not load a fitted model or require TensorFlow.
+contracts, the digest-allowlisted redacted vertical certificate, copied source
+manifests, recursive portable-content hygiene, date alignment, row-level
+predictions, baseline predictions, the two raw market files, all six signal
+files, every model and benchmark ledger, full `Decimal` semantic replay,
+recomputed metrics, rankings, summary, and report consistency. Packs are
+bounded to 256 files and 64 MiB of uncompressed payload. Verification does not
+load a fitted model, invoke inference, rerun a production backtest, require
+TensorFlow, or import Matplotlib or another plotting backend.
 
 For stronger local custody verification, provide all three original source
 roots together. Supplying only some of them is invalid.
 
 ```bash
 python scripts/verify_unified_price_model_comparison.py \
-  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01 \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
   --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --lstm-run artifacts/lstm_experiments/LSTM-20261024-OGDC-price-only-02
@@ -439,8 +515,8 @@ ratios are rejected. Verify both together offline:
 
 ```bash
 python scripts/verify_unified_price_model_comparison.py \
-  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip \
-  --checksum artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip.sha256
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02.zip \
+  --checksum artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02.zip.sha256
 ```
 
 ZIP verification authenticates the archive before reading it, rejects unsafe
@@ -459,6 +535,10 @@ sensitive to market regime, thresholds, class balance, fees, execution rules,
 and unmodeled dividends or corporate-action adjustment. The pack makes no
 causal claim and does not show that a model will generalize to another period,
 stock, feature family, or portfolio policy.
+
+This comparison is price-only: it does not integrate, aggregate, or evaluate
+sentiment. Its presentation contract is tabular/report-only; the pack contains
+no plots and the build and verification paths do not import Matplotlib.
 
 Validation selection, shared project holdout prediction rankings, and
 simulated portfolio rankings answer different questions. They must not be

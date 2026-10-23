@@ -38,7 +38,7 @@ evidence, follow [Current Implementation Status](CURRENT_IMPLEMENTATION_STATUS.m
 | Leakage-safe experiment foundation | Chronological target-date splits, train-only learned transforms, ordered features, fixed seeds, immutable manifests, exact inventories, and distinct feature/target/signal/execution dates are enforced. |
 | Price-only baselines | Three Random Forest variants (`M-001`–`M-003`) and one XGBoost variant (`M-004`) use the same frozen OGDC evidence and comparison contract. |
 | Price-only LSTM | The optional TensorFlow workflow trains `M-005` and `M-006`, selects on validation evidence, performs one post-freeze test pass, backtests independent ledgers, and publishes a sealed run. |
-| Unified price-only comparison | A deterministic read-only builder and offline verifier recompute M-001–M-006, reference-baseline, model-portfolio, cash-only, and controlled buy-and-hold metrics from checksum-bound persisted evidence. The exact common dates, assumptions, separate rankings, portable ZIP, and checksum are sealed without retraining, inference, or backtest execution. |
+| Unified price-only comparison | A deterministic read-only builder and offline verifier recompute M-001–M-006, reference-baseline, model-portfolio, cash-only, and controlled buy-and-hold metrics from checksum-bound persisted evidence. The portable evidence now includes two raw market files and six policy-signal files so exact `Decimal` policy, execution, accounting, and benchmark semantics can be replayed without retraining, inference, or invoking the production backtest runner. The output remains price-only and tabular/report-only. |
 | Policy, portfolio, and backtesting | Threshold policy, next-session-open execution, fees, independent strategy ledgers, cash-only and controlled buy-and-hold benchmarks, trades, snapshots, drawdowns, and reports are implemented. |
 | OGDC vertical slice | One collision-refusing command connects acquisition, preparation, training, prediction, policy, simulation, validation, and reports for daily OGDC data. |
 | Results delivery | A read-only `/api/v1` validates immutable vertical-slice artifacts; the React/TypeScript/Plotly dashboard presents history, model and portfolio comparisons, experiment detail, provenance, limitations, and the disclaimer. |
@@ -94,7 +94,8 @@ These paths are local, generated, and ignored by Git.
 | OGDC vertical slice | `VSL-20261020-OGDC-main-02` | Completed `PASS` demonstration run. |
 | Baseline training | `TRN-20261020-191815-624662-nogit` | Frozen input, split, registered models, predictions, reports, and exact inventory used by the vertical slice and LSTM comparison. |
 | LSTM comparison | `LSTM-20261024-OGDC-price-only-02` | Certified `PASS` result. Its `run_manifest.json` uses schema `1.0`; its authoritative `final_summary.json` uses schema `1.1` and carries the final status. The earlier `LSTM-20261024-OGDC-price-only-01` run is immutable pre-hardening history, not the certified result. Run-manifest SHA-256: `e475e077f375071c79ce8743425831d8cd9cf5ceb37f42eca0acfa65a100f3d0`; ZIP SHA-256: `f9d3ef10bb80528388a9137e7f169a7d870e7429f779f46e074a6254a26d8821`. |
-| Unified price-only comparison | `CMP-20261024-OGDC-price-only-01` | Schema-`1.0` `PASS` pack derived only from the three authoritative price-only sources. Both the 57-file directory and portable ZIP passed semantic replay and external-source verification. ZIP SHA-256: `6482b22da616907f1f9bc1b6fc621f5a193b0bffeb3d41ad59ab353595ab2129`. |
+| Unified price-only comparison | `CMP-20261024-OGDC-price-only-02` | Authoritative hardened pack derived only from the three authoritative price-only sources. It uses a digest-allowlisted redacted vertical certificate, recursively enforces portable-content hygiene, and replays all model and benchmark portfolio semantics from two raw market files and six signals. Verified file count: `65`; ZIP SHA-256: `8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`. |
+| Superseded comparison draft | `CMP-20261024-OGDC-price-only-01` | Non-portable historical draft retained only as provenance. It predates the hardened certificate, recursive hygiene, and complete independent portfolio-semantic replay requirements and must not be distributed or cited as current authority. |
 | Accepted RSS acquisition | `NEWS-20261022-131242-5ddffd2d` | Historical accepted run, retained for evidence and sentiment input. It predates current news sealing/schema contracts and must not be relabelled as a current verifier pass. |
 | Retained GDELT DOC acquisition | `NEWS-20261023-060000-gdelt-ogdc2` | Sealed `PARTIAL/WARN`; its exact permission-reviewed metadata controls are allowlisted, but acquisition is incomplete. |
 | Historical RSS coverage | `COVERAGE-20261023-120000-real0002` | Immutable coverage-v2 `NO_OVERLAP`; passed only at its producing revision. |
@@ -145,6 +146,12 @@ Registered model identities are:
 
 ### Unified price-only comparison
 
+- `CMP-20261024-OGDC-price-only-02` is the authoritative comparison identity.
+  Its immutable ZIP SHA-256 is
+  `8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+  and its verified total file count is `65`.
+  `CMP-20261024-OGDC-price-only-01` is a superseded, non-portable historical
+  draft.
 - The validation-only rule selects `M-001` across all six models at balanced
   accuracy `0.5302041802585478`; within the LSTM family, validation prefers
   `M-005` at `0.4792799323426362`.
@@ -161,6 +168,17 @@ Registered model identities are:
 - These are separate outcomes. Shared project holdout prediction rankings do
   not replace validation selection, and portfolio results do not select a
   prediction model.
+- The hardened verifier binds the comparison to a digest-allowlisted redacted
+  vertical certificate, two raw market files, six signal files, and all
+  independent ledgers. It performs full `Decimal` policy, execution,
+  accounting, return, drawdown, and fee replay without model inference or a
+  production backtest. Metrics expose exactly two logical benchmark rows,
+  cash-only and controlled buy-and-hold, each retaining six ledger-provenance
+  records.
+- Portable-content hygiene is recursive. Default CLI results use relative
+  artifact names, failures omit a traceback, and opt-in debug diagnostics are
+  sanitized. The price-only pack has no sentiment integration, no plots, and
+  no Matplotlib import; presentation is tabular/report-only.
 
 ### News, sentiment, and contemporaneous evidence
 
@@ -184,17 +202,21 @@ Registered model identities are:
 The last certified LSTM checkout reported `1,036 passed, 1 skipped` backend
 tests, 57 passing frontend tests, and passing frontend lint/build, `pip check`,
 `compileall`, and diff checks. That is retained validation evidence for source
-commit `2bd20ed`. This comparison branch reports `1,082 passed, 1 skipped`
-backend tests with six dependency deprecation warnings, 57 passing frontend
-tests, and passing frontend lint/build, `pip check`, `compileall`, focused
-comparison/documentation tests, and diff checks. The frontend build retains its
-known large-chunk warning.
+commit `2bd20ed`. Before the `-02` hardening changes, this comparison branch
+reported `1,082 passed, 1 skipped` backend tests with six dependency
+deprecation warnings, 57 passing frontend tests, and passing frontend
+lint/build, `pip check`, `compileall`, focused comparison/documentation tests,
+and diff checks. Final hardened-regression results must replace this historical
+branch checkpoint before publication. The frontend build retains its known
+large-chunk warning.
 
 ## Active and open work
 
-- The unified comparison pack is active on
+- The hardened unified comparison pack is active on
   `feature/unified-price-model-comparison`; its generated canonical artifacts
-  remain local and Git-ignored.
+  remain local and Git-ignored. The verified `-02` custody digest is
+  `8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+  and its total file count is `65`.
 - GitHub reports zero open issues at this snapshot.
 - Legacy PR #1 (`feature/v0.1-data-quality`) and PR #2
   (`feature/ogdc-rf-training-stage`) remain open. Their work appears superseded
@@ -218,15 +240,16 @@ known large-chunk warning.
    The retained price run is a checksum-bound reconstruction of a legacy real
    cache, not a fresh provider response or third-party signature.
 4. **Research scope:** conclusions cover one stock, daily data, one split, one
-   period, one fixed trading policy, and a reused shared holdout. Verified
+   period, one fixed trading policy, and a reused shared project holdout. Verified
    `high`/`low` values are absent, corporate-action adjustment is unknown, and
    dividends are not modeled.
 5. **Missing research layers:** SHAP, general entity/sector/event graphs,
    multi-stock evaluation, daily sentiment aggregation, and controlled
    price-plus-sentiment comparison are not complete.
 6. **Delivery gap:** the certified LSTM run remains separate from the
-   vertical-slice API and dashboard, while the verified unified comparison is
-   a local, Git-ignored derived artifact. There is no fixture-backed read-only
+   vertical-slice API and dashboard, while the hardened unified comparison is
+   a local, Git-ignored derived artifact pending final `-02` regeneration. There
+   is no fixture-backed read-only
    LSTM or unified-comparison API and no unified six-model dashboard
    presentation.
 7. **Operational scope:** there is no production database service,

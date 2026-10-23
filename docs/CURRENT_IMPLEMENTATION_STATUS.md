@@ -17,7 +17,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Leakage-safe experiment data | The versioned path distinguishes `feature_date` and next-session `target_date`, splits chronologically by target date, fits learned transforms on training data only, records feature order and seeds, and preserves immutable input and model evidence. |
 | Versioned model comparison | `M-001`, `M-002`, and `M-003` are Random Forest variants; `M-004` is XGBoost. All four use the same daily OGDC feature set, target, split dates, and held-out test observations. Each has a unique registered model identity and checksum-protected artifacts. The later M-005/M-006 comparison reused those 184 dates and the already-exposed baseline outcomes, making the period the shared project holdout. |
 | Price-only LSTM comparison | The isolated optional-TensorFlow workflow adds `M-005`, a 20-session/64-unit baseline with dropout `0.20`, and `M-006`, the same sequence length and hidden width with stronger dropout and recurrent regularization. It reuses the frozen OGDC input and split evidence, fits preprocessing on training data only, chooses the preferred variant from validation evidence, evaluates test data post-freeze, and publishes immutable run artifacts. Certified CPU run `LSTM-20261024-OGDC-price-only-02` completed from clean commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f`; its local, Git-ignored `final_summary.json` is authoritative. |
-| Unified price-only comparison | The evidence-only builder accepts exactly `VSL-20261020-OGDC-main-02`, `TRN-20261020-191815-624662-nogit`, and `LSTM-20261024-OGDC-price-only-02`; recomputes prediction, reference-baseline, and portfolio metrics from persisted rows; preserves separate validation, shared project holdout, return, drawdown, and fee outcomes; and publishes collision-refusing directory/ZIP/checksum artifacts. Canonical local pack `CMP-20261024-OGDC-price-only-01` verifies offline without TensorFlow, model loading, retraining, inference, or backtest execution. |
+| Unified price-only comparison | The evidence-only builder accepts exactly `VSL-20261020-OGDC-main-02`, `TRN-20261020-191815-624662-nogit`, and `LSTM-20261024-OGDC-price-only-02`; recomputes prediction and reference-baseline metrics; and reconstructs policy, execution, trades, accounting, returns, drawdowns, and fees with exact `Decimal` arithmetic from two raw market files and six signal files. It preserves separate validation, shared project holdout, and portfolio outcomes and publishes collision-refusing directory/ZIP/checksum artifacts. Authoritative local identity `CMP-20261024-OGDC-price-only-02` verifies offline without TensorFlow, model loading, retraining, inference, the production backtest runner, or Matplotlib. It is price-only and tabular/report-only. |
 | Decision and simulation | Predictions pass through a separate threshold policy into separate long-only portfolio ledgers. The retained run uses buy at `probability_up >= 0.60`, sell at `probability_up <= 0.40`, a 50% maximum allocation, whole shares, 10-basis-point execution fees, next-session-open execution, and close valuation. |
 | Independent comparisons | Each model has its own experiment, portfolio, trades, cash, holdings, and snapshots. Cash-only and 50%-allocated buy-and-hold benchmarks use the common test window and cost assumptions. |
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
@@ -27,7 +27,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
-| Verification | Independent verification of reviewed PR head `4d7084b` produced `609 passed, 1 skipped` in the artifact-present checkout, where only optional TensorFlow/LSTM skipped and the retained-artifact integration ran. Its clean Git clone produced `608 passed, 2 skipped`; optional TensorFlow/LSTM and the absent local-real-run artifact integration skipped. These remain historical pre-fix results. The hardened certified LSTM source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f` completed with `1036 passed, 1 skipped` in the backend and `57 passed` in the frontend. The unified comparison branch completes with `1082 passed, 1 skipped` in the backend and `57 passed` in the frontend, plus passing frontend lint/build, `pip check`, bytecode compilation, focused comparison/documentation tests, and diff checks. The backend reports six dependency deprecation warnings, the frontend build retains its known large-chunk warning, and the skip is the Windows-only junction test on macOS. |
+| Verification | Independent verification of reviewed PR head `4d7084b` produced `609 passed, 1 skipped` in the artifact-present checkout, where only optional TensorFlow/LSTM skipped and the retained-artifact integration ran. Its clean Git clone produced `608 passed, 2 skipped`; optional TensorFlow/LSTM and the absent local-real-run artifact integration skipped. These remain historical pre-fix results. The hardened certified LSTM source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f` completed with `1036 passed, 1 skipped` in the backend and `57 passed` in the frontend. Before `CMP-20261024-OGDC-price-only-02` hardening, the unified comparison branch completed with `1082 passed, 1 skipped` in the backend and `57 passed` in the frontend, plus passing frontend lint/build, `pip check`, bytecode compilation, focused comparison/documentation tests, and diff checks. Final hardening regressions are pending this snapshot. The backend reported six dependency deprecation warnings, the frontend build retained its known large-chunk warning, and the skip was the Windows-only junction test on macOS. |
 
 ## Retained real-run evidence
 
@@ -73,8 +73,7 @@ validation-selected variant.
 
 The same date window and the M-001–M-004 outcomes were already exposed before
 the LSTM run. “Post-freeze” therefore describes the M-005/M-006 selection
-order; this is repeated evaluation on a shared project holdout, not a globally
-untouched test.
+order; this is repeated evaluation on the shared project holdout.
 
 The `M-005` portfolio ended at PKR 96,359.29 (-3.64071%) and the `M-006`
 portfolio at PKR 96,110.91 (-3.88909%). Neither beat buy-and-hold at PKR
@@ -83,6 +82,32 @@ portfolio at PKR 96,110.91 (-3.88909%). Neither beat buy-and-hold at PKR
 local and ignored by Git; its `final_summary.json` is the source of record.
 These are academic simulation results, not financial advice. Follow
 [`LSTM_PRICE_ONLY_EXPERIMENTS.md`](LSTM_PRICE_ONLY_EXPERIMENTS.md).
+
+### Authoritative unified comparison evidence
+
+`CMP-20261024-OGDC-price-only-02` is the authoritative hardened comparison
+identity. Its immutable ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and its verified total file count is `65`.
+`CMP-20261024-OGDC-price-only-01` is a superseded, non-portable historical
+draft and is not current publication evidence.
+
+The pack replaces the host-path-bearing vertical manifest with a
+digest-allowlisted redacted certificate, then recursively scans every text
+member for non-portable paths and credential material. It carries two raw
+market files and six signal files and performs independent full `Decimal`
+semantic replay of policy thresholds, next-open execution, allocations, fees,
+trades, close valuation, cash, holdings, P&L, returns, and drawdowns. It does
+not run inference or invoke the production backtest.
+
+The metrics artifact contains exactly two logical benchmark rows, cash-only
+and controlled buy-and-hold. Each row retains six ledger-provenance records for
+the independent model-associated benchmark evidence. CLI success output uses
+relative names and an explicit path base; default failures omit tracebacks and
+opt-in debug diagnostics are sanitized. This comparison does not integrate
+sentiment, includes no plots, and does not import Matplotlib; its presentation
+is tabular/report-only. Selection, shared project holdout prediction metrics,
+and portfolio outcomes remain distinct findings.
 
 ### Accepted news-ingestion execution
 

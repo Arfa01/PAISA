@@ -451,11 +451,19 @@ PY
 ## Unified price-only comparison
 
 The retained `PAISA-RM-003` comparison derives M-001 through M-006 metrics
-from persisted prediction and portfolio evidence. It neither retrains models
-nor reruns backtests. Its 184 dates are the reused **shared project holdout**,
-not a fresh independent holdout. See
+from persisted prediction, raw market, signal, and portfolio evidence. It
+neither retrains models, invokes inference, nor calls the production backtest
+runner. Its 184 dates are the reused **shared project holdout**, not a fresh
+independent holdout. The comparison is price-only and tabular/report-only: it
+does not integrate sentiment, emit plots, or import Matplotlib. See
 [`UNIFIED_PRICE_MODEL_COMPARISON.md`](UNIFIED_PRICE_MODEL_COMPARISON.md) for the
 schema and interpretation contract.
+
+Use only `CMP-20261024-OGDC-price-only-02` for current generation and
+verification. `CMP-20261024-OGDC-price-only-01` is a superseded, non-portable
+historical draft. The final `-02` ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and its verified total file count is `65`.
 
 Build the canonical immutable directory, portable ZIP, and ZIP checksum from
 the three authoritative completed source roots:
@@ -463,7 +471,7 @@ the three authoritative completed source roots:
 ```bash
 source .venv/bin/activate
 python scripts/build_unified_price_model_comparison.py \
-  --comparison-id CMP-20261024-OGDC-price-only-01 \
+  --comparison-id CMP-20261024-OGDC-price-only-02 \
   --output-dir artifacts/model_comparisons \
   --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
@@ -475,7 +483,7 @@ rebind it to the original sources:
 
 ```bash
 python scripts/verify_unified_price_model_comparison.py \
-  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01 \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
   --training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --lstm-run artifacts/lstm_experiments/LSTM-20261024-OGDC-price-only-02
@@ -485,9 +493,22 @@ The ZIP/sidecar pair is portable and can be verified without the source roots:
 
 ```bash
 python scripts/verify_unified_price_model_comparison.py \
-  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip \
-  --checksum artifacts/model_comparisons/CMP-20261024-OGDC-price-only-01.zip.sha256
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02.zip \
+  --checksum artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02.zip.sha256
 ```
+
+The hardened verifier authenticates a digest-allowlisted redacted vertical
+certificate, recursively rejects non-portable paths and credential material,
+and requires exactly two raw market files plus six signal files. It then
+performs independent full `Decimal` replay of model and benchmark policy,
+execution, accounting, return, drawdown, and fee semantics. Metrics retain
+exactly two logical benchmark rows; each row names six independent ledger
+provenance records.
+
+Normal command output reports artifact names relative to an explicit path base
+so it can be copied into support logs. Default failures are concise JSON and do
+not include a traceback. Pass `--debug` only for local diagnosis; its traceback
+is still sanitized before display.
 
 Run the full offline Python and frontend validation matrix before handoff:
 

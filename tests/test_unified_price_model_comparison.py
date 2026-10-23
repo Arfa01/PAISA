@@ -3,10 +3,14 @@ from __future__ import annotations
 import csv
 from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 import shutil
 import stat
+import subprocess
+import sys
 from typing import Any, Callable
 import zipfile
 
@@ -19,7 +23,6 @@ import paisa.experiments.trainer as trainer_module
 import paisa.experiments.unified_comparison as comparison
 from paisa.experiments.artifacts import TrainingRunEvidence, sha256_file, write_json
 from paisa.experiments.evaluation import PREDICTION_COLUMNS
-from paisa.experiments.lstm_runner import DirectoryInventoryEvidence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +56,25 @@ def _write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> No
         writer = csv.DictWriter(output, fieldnames=columns, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _replace_csv_cell(
+    path: Path, *, row_index: int, column: str, value: str
+) -> None:
+    _replace_csv_cells(path, row_index=row_index, values={column: value})
+
+
+def _replace_csv_cells(
+    path: Path, *, row_index: int, values: dict[str, str]
+) -> None:
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        columns = list(reader.fieldnames or ())
+        rows = [dict(row) for row in reader]
+    assert set(values).issubset(columns)
+    assert 0 <= row_index < len(rows)
+    rows[row_index].update(values)
+    _write_csv(path, columns, rows)
 
 
 def _prediction_rows(model_id: str, probabilities: list[float]) -> list[dict[str, Any]]:
@@ -163,6 +185,45 @@ def _inventory_payload(
     }
 
 
+def _portable_certificate_sha256(
+    snapshots: comparison.SourceSnapshots,
+) -> str:
+    payload = {
+        "schema_version": comparison.SCHEMA_VERSION,
+        "artifact_type": "paisa_source_integrity_certificate",
+        "source_role": "baseline_vertical_slice",
+        "run_id": snapshots.vertical.directory.name,
+        "source_manifest": {
+            "name": "manifest.json",
+            "sha256": snapshots.vertical.manifest_sha256,
+        },
+        "projection_policy": "allowlisted_fields_v1",
+        "raw_manifest_included": False,
+        "source_assertions": {
+            "schema_version": "1.0",
+            "status": "PASS",
+            "symbol": "OGDC",
+            "model_training_run_id": snapshots.training.run_id,
+            "registered_model_ids": dict(snapshots.training.model_ids),
+            "disclaimer": comparison.ACADEMIC_DISCLAIMER,
+        },
+        "artifact_inventory": {
+            "algorithm": "sha256",
+            "root": ".",
+            "excludes": ["manifest.json"],
+            "files": [
+                {"path": relative, "sha256": checksum}
+                for relative, checksum in snapshots.vertical.files
+            ],
+        },
+        "disclaimer": comparison.ACADEMIC_DISCLAIMER,
+    }
+    encoded = json.dumps(
+        payload, indent=2, sort_keys=True, allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _make_synthetic_sources(root: Path) -> tuple[
     comparison.SourceSnapshots,
     dict[str, dict[str, str]],
@@ -225,7 +286,7 @@ def _make_synthetic_sources(root: Path) -> tuple[
     write_json(split_manifest, training / "split_manifest.json")
     write_json(split_manifest, lstm / "split_manifest.json")
 
-    prices = root / "prices.csv"
+    prices = vertical / "input_snapshot" / "psx_prices.csv"
     _write_csv(
         prices,
         ["date", "ticker", "open", "close"],
@@ -235,6 +296,9 @@ def _make_synthetic_sources(root: Path) -> tuple[
             {"date": "2026-01-12", "ticker": "OGDC", "open": "104.00", "close": "101.00"},
         ],
     )
+    lstm_prices = lstm / "frozen_input" / "OGDC_prices.csv"
+    lstm_prices.parent.mkdir(parents=True)
+    shutil.copyfile(prices, lstm_prices)
     for variant_id in comparison.MODEL_VARIANTS:
         if variant_id in comparison.BASELINE_VARIANTS:
             experiment_id = (
@@ -340,7 +404,7 @@ def _make_synthetic_sources(root: Path) -> tuple[
             for variant_id in comparison.BASELINE_VARIANTS
         ),
     )
-    vertical_evidence = DirectoryInventoryEvidence(
+    vertical_evidence = comparison.DirectoryInventoryEvidence(
         directory=vertical.resolve(),
         manifest_sha256=vertical_sha,
         files=vertical_entries,
@@ -359,6 +423,11 @@ def _make_synthetic_sources(root: Path) -> tuple[
         baseline_vertical_slice_id=vertical.name,
         baseline_vertical_manifest_sha256=vertical_sha,
     )
+    snapshots = comparison.SourceSnapshots(
+        training=training_evidence,
+        vertical=vertical_evidence,
+        lstm=lstm_evidence,
+    )
     authority = {
         "baseline_training": {
             "run_id": training.name,
@@ -367,15 +436,12 @@ def _make_synthetic_sources(root: Path) -> tuple[
         "baseline_vertical_slice": {
             "run_id": vertical.name,
             "manifest_sha256": vertical_sha,
+            "portable_certificate_sha256": _portable_certificate_sha256(snapshots),
         },
         "lstm": {"run_id": lstm.name, "manifest_sha256": lstm_sha},
     }
     return (
-        comparison.SourceSnapshots(
-            training=training_evidence,
-            vertical=vertical_evidence,
-            lstm=lstm_evidence,
-        ),
+        snapshots,
         authority,
     )
 
@@ -405,9 +471,9 @@ def portable_fixture(tmp_path_factory: pytest.TempPathFactory) -> PortableFixtur
         patch.undo()
     return PortableFixture(
         output_root=output_root,
-        pack=Path(result["artifact_directory"]),
-        archive=Path(result["zip_path"]),
-        checksum=Path(result["checksum_path"]),
+        pack=output_root / result["artifact_directory"],
+        archive=output_root / result["zip_path"],
+        checksum=output_root / result["checksum_path"],
         authority=authority,
         snapshots=snapshots,
     )
@@ -495,6 +561,20 @@ def _reseal_copied_source_evidence(
             pack_path=manifest_pack_path,
             checksum=root_checksum,
         )
+    elif role == "baseline_vertical_slice":
+        certificate_pack_path = (
+            "evidence/source_manifests/"
+            "baseline_vertical_manifest_certificate.json"
+        )
+        certificate_path = pack / certificate_pack_path
+        certificate = json.loads(certificate_path.read_text(encoding="utf-8"))
+        _replace_inventory_checksum(
+            certificate,
+            source_path=evidence_record["source_path"],
+            checksum=evidence_checksum,
+        )
+        write_json(certificate, certificate_path)
+        root_checksum = sha256_file(certificate_path)
     elif role == "lstm":
         nested_pack_path = (
             "evidence/source_manifests/lstm_artifact_manifest.json"
@@ -544,11 +624,18 @@ def _reseal_copied_source_evidence(
         source for source in source_roots["sources"] if source["role"] == role
     ]
     assert len(matching_roots) == 1
-    matching_roots[0]["integrity_root_sha256"] = root_checksum
+    if role == "baseline_vertical_slice":
+        matching_roots[0]["integrity_root_pack_sha256"] = root_checksum
+    else:
+        matching_roots[0]["integrity_root_sha256"] = root_checksum
+        matching_roots[0]["integrity_root_pack_sha256"] = root_checksum
     write_json(source_roots, source_roots_path)
     _reseal_pack(pack)
     authority = deepcopy(fixture.authority)
-    authority[role]["manifest_sha256"] = root_checksum
+    if role == "baseline_vertical_slice":
+        authority[role]["portable_certificate_sha256"] = root_checksum
+    else:
+        authority[role]["manifest_sha256"] = root_checksum
     return authority
 
 
@@ -578,8 +665,8 @@ def test_actual_authoritative_sources_build_and_verify_without_retraining(
         lstm_run=LSTM_RUN,
     )
     verified = comparison.verify_unified_comparison_pack(
-        result["zip_path"],
-        checksum=result["checksum_path"],
+        output_root / result["zip_path"],
+        checksum=output_root / result["checksum_path"],
         training_run=TRAINING_RUN,
         vertical_slice=VERTICAL_SLICE,
         lstm_run=LSTM_RUN,
@@ -590,9 +677,39 @@ def test_actual_authoritative_sources_build_and_verify_without_retraining(
         "portable_evidence_and_external_sources"
     )
     assert result["holdout_context"]["common_count"] == 184
-    assert result["reported_outcomes"]["validation_selected_model"][
-        "variant_id"
-    ] == "M-001"
+    outcomes = result["reported_outcomes"]
+    assert outcomes["validation_selected_model"]["variant_id"] == "M-001"
+    assert outcomes["validation_selected_model"]["balanced_accuracy"] == pytest.approx(
+        0.5302041802585478
+    )
+    assert outcomes["lstm_validation_preferred_model"]["variant_id"] == "M-005"
+    assert outcomes["best_shared_holdout_balanced_accuracy"]["variant_id"] == (
+        "M-006"
+    )
+    assert outcomes["best_shared_holdout_balanced_accuracy"][
+        "balanced_accuracy"
+    ] == pytest.approx(0.544251447477254)
+    assert outcomes["best_shared_holdout_f1"]["variant_id"] == "M-005"
+    assert outcomes["best_shared_holdout_f1"]["f1"] == pytest.approx(
+        0.6396761133603239
+    )
+    assert outcomes["best_simulated_model_portfolio"]["variant_id"] == "M-002"
+    assert outcomes["best_simulated_model_portfolio"]["ending_equity"] == (
+        "105987.04"
+    )
+    assert outcomes["lowest_drawdown_model_portfolio"]["variant_id"] == "M-003"
+    assert outcomes["lowest_drawdown_model_portfolio"][
+        "maximum_drawdown"
+    ] == pytest.approx(0.0118467)
+    assert outcomes["lowest_fee_model_portfolio"]["variant_id"] == "M-003"
+    assert outcomes["lowest_fee_model_portfolio"]["fees_paid"] == "98.93"
+    assert outcomes["cash_only_benchmark"]["ending_equity"] == "100000.00"
+    assert outcomes["cash_only_benchmark"]["total_return"] == 0.0
+    assert outcomes["buy_and_hold_result"]["ending_equity"] == "106247.89"
+    assert outcomes["buy_and_hold_result"]["total_return"] == pytest.approx(
+        0.0624789
+    )
+    assert outcomes["any_model_beat_buy_and_hold"]["value"] is False
 
 
 def test_directory_zip_and_checksum_are_independently_verifiable(
@@ -615,6 +732,106 @@ def test_directory_zip_and_checksum_are_independently_verifiable(
         encoding="ascii"
     ).split()[0]
     assert directory["comparison_id"] == archive["comparison_id"]
+
+
+def test_benchmarks_are_two_logical_rows_with_six_ledger_provenance_entries(
+    portable_fixture: PortableFixture,
+) -> None:
+    metrics = json.loads(
+        (portable_fixture.pack / "metrics.json").read_text(encoding="utf-8")
+    )
+    rows = metrics["benchmark_portfolio_metrics"]
+
+    assert [row["benchmark_id"] for row in rows] == ["cash-only", "buy-and-hold"]
+    assert len(rows) == 2
+    all_portfolio_ids: list[str] = []
+    for row in rows:
+        provenance = row["ledger_provenance"]
+        assert len(provenance) == 6
+        assert [entry["variant_id"] for entry in provenance] == list(
+            comparison.MODEL_VARIANTS
+        )
+        assert len({entry["portfolio_id"] for entry in provenance}) == 6
+        all_portfolio_ids.extend(entry["portfolio_id"] for entry in provenance)
+        for entry in provenance:
+            for field in ("config_path", "snapshots_path", "trades_path"):
+                value = entry[field]
+                if value is None:
+                    assert row["benchmark_id"] == "cash-only"
+                    assert field == "trades_path"
+                    continue
+                relative = Path(value)
+                assert not relative.is_absolute()
+                assert ".." not in relative.parts
+                assert (portable_fixture.pack / relative).is_file()
+
+    assert len(all_portfolio_ids) == 12
+    assert len(set(all_portfolio_ids)) == 12
+
+
+@pytest.mark.parametrize("comparison_id", ["CON", "CMP-trailing."])
+def test_comparison_id_rejects_reserved_or_trailing_dot_names(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    comparison_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="filesystem-safe identifier"):
+        comparison.build_unified_price_model_comparison(
+            comparison_id=comparison_id,
+            output_dir=tmp_path / "rejected-id",
+            training_run=portable_fixture.snapshots.training.run_directory,
+            vertical_slice=portable_fixture.snapshots.vertical.directory,
+            lstm_run=portable_fixture.snapshots.lstm.directory,
+        )
+
+
+def test_build_and_verify_results_use_only_relative_portable_paths(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_fixture_builder(monkeypatch, portable_fixture)
+    output_root = tmp_path.resolve() / "relative-results"
+    result = comparison.build_unified_price_model_comparison(
+        comparison_id="CMP-relative-results",
+        output_dir=output_root,
+        training_run=portable_fixture.snapshots.training.run_directory,
+        vertical_slice=portable_fixture.snapshots.vertical.directory,
+        lstm_run=portable_fixture.snapshots.lstm.directory,
+    )
+
+    assert result["path_base"] == "output_root"
+    for field in ("artifact_directory", "zip_path", "checksum_path"):
+        relative = Path(result[field])
+        assert not relative.is_absolute()
+        assert (output_root / relative).exists()
+
+    pack = output_root / result["artifact_directory"]
+    verified = comparison.verify_unified_comparison_pack(pack)
+    assert verified["path_base"] == "input_parent"
+    assert verified["pack"] == pack.name
+    assert not Path(verified["pack"]).is_absolute()
+
+
+def test_verifier_import_does_not_load_matplotlib() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import paisa.experiments.unified_comparison; "
+                "loaded = sorted(name for name in sys.modules "
+                "if name == 'matplotlib' or name.startswith('matplotlib.')); "
+                "assert not loaded, loaded"
+            ),
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_builder_refuses_an_existing_directory_zip_or_checksum(
@@ -680,7 +897,9 @@ def test_builder_never_loads_models_retrains_or_reruns_backtests(
         lstm_run=portable_fixture.snapshots.lstm.directory,
         create_zip=False,
     )
-    pack = Path(result["artifact_directory"])
+    pack = (tmp_path.resolve() / "no-execution-output") / result[
+        "artifact_directory"
+    ]
     assert result["zip_path"] is None
     assert not any(
         path.suffix.lower() in {".joblib", ".keras", ".h5", ".pkl"}
@@ -735,6 +954,106 @@ def test_resealed_nested_lstm_inventory_is_rejected_when_not_bound_by_run_root(
 
     with pytest.raises(ValueError, match="not bound by its run manifest"):
         comparison.verify_unified_comparison_pack(pack)
+
+
+def test_resealed_allowlisted_vertical_certificate_tampering_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _trust_fixture(monkeypatch, portable_fixture)
+    pack = _copy_pack(portable_fixture, tmp_path)
+    certificate_path = (
+        pack
+        / "evidence/source_manifests/"
+        "baseline_vertical_manifest_certificate.json"
+    )
+    certificate = json.loads(certificate_path.read_text(encoding="utf-8"))
+    certificate["source_assertions"]["status"] = "FAIL"
+    write_json(certificate, certificate_path)
+    tampered_certificate_sha256 = sha256_file(certificate_path)
+
+    source_roots_path = pack / "source_roots.json"
+    source_roots = json.loads(source_roots_path.read_text(encoding="utf-8"))
+    vertical_sources = [
+        source
+        for source in source_roots["sources"]
+        if source["role"] == "baseline_vertical_slice"
+    ]
+    assert len(vertical_sources) == 1
+    vertical_sources[0][
+        "integrity_root_pack_sha256"
+    ] = tampered_certificate_sha256
+    write_json(source_roots, source_roots_path)
+    _reseal_pack(pack)
+
+    with pytest.raises(
+        ValueError,
+        match="Copied integrity root mismatch for baseline_vertical_slice",
+    ):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        {"context": {"source": "/Users/alice/private/evidence.csv"}},
+        {"context": {"source": r"C:\Users\alice\private\evidence.csv"}},
+        {"context": {"source": "//server/share/private/evidence.csv"}},
+        {"context": {"url": "https://opaque-token@example.test/private"}},
+        {"context": {"api_key": "fixture-secret-value"}},
+        {"context": {"token": "fixture-token-value"}},
+        {"context": {"secret": "fixture-secret-value"}},
+        {"context": {"private_key": "fixture-private-key-value"}},
+    ],
+    ids=(
+        "posix-host-path",
+        "windows-host-path",
+        "forward-slash-unc",
+        "token-only-url-userinfo",
+        "api-key",
+        "token-assignment",
+        "secret-assignment",
+        "private-key-assignment",
+    ),
+)
+def test_recursive_portable_text_scan_rejects_host_paths_and_credentials(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_value: dict[str, Any],
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    relative = "evidence/portfolios/M-001/config.json"
+    path = pack / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nested_diagnostic"] = unsafe_value
+    write_json(payload, path)
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="baseline_vertical_slice",
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(ValueError, match="host-path or credential data"):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+def test_portable_text_scan_allows_relative_paths_public_urls_and_placeholders(
+    tmp_path: Path,
+) -> None:
+    write_json(
+        {
+            "relative_path": "evidence/market_data/prices.csv",
+            "public_url": "https://example.test/public/path",
+            "token": "<redacted-credential>",
+        },
+        tmp_path / "safe.json",
+    )
+
+    comparison._assert_no_prohibited_claims(tmp_path)
 
 
 def test_incomplete_manifest_inventory_is_rejected(
@@ -872,6 +1191,363 @@ def test_resealed_prediction_evidence_must_match_ticker_split_and_scope_contract
     monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
 
     with pytest.raises(ValueError, match=message):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+@pytest.mark.parametrize(
+    ("role", "relative", "row_index", "column", "value", "message"),
+    [
+        (
+            "baseline_vertical_slice",
+            "evidence/portfolios/M-001/signals.csv",
+            0,
+            "reason",
+            "tampered_signal_reason",
+            "Persisted signal semantics mismatch for M-001",
+        ),
+        (
+            "baseline_vertical_slice",
+            "evidence/portfolios/M-001/signals.csv",
+            0,
+            "probability_up",
+            "0.59",
+            "Persisted signal semantics mismatch for M-001",
+        ),
+        (
+            "baseline_vertical_slice",
+            "evidence/portfolios/M-001/signals.csv",
+            0,
+            "target_allocation",
+            "0.49",
+            "Persisted signal semantics mismatch for M-001",
+        ),
+        (
+            "baseline_vertical_slice",
+            "evidence/market_data/baseline_psx_prices.csv",
+            1,
+            "close",
+            "104.00",
+            "Baseline and LSTM market observations disagree",
+        ),
+        (
+            "baseline_vertical_slice",
+            "evidence/portfolios/M-001/portfolio_snapshots.csv",
+            1,
+            "realized_profit_loss",
+            "1.00",
+            "Portfolio state transition mismatch for M-001",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "fee",
+            "0.01",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "quantity",
+            "1",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "execution_date",
+            "2026-01-12",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "reference_price",
+            "101.00",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "execution_price",
+            "101.00",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "cash_after_trade",
+            "50000.00",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "lstm",
+            "evidence/portfolios/M-005/trades.csv",
+            0,
+            "shares_after_trade",
+            "1",
+            "Persisted trade semantics mismatch for M-005",
+        ),
+        (
+            "baseline_vertical_slice",
+            "evidence/portfolios/M-001/benchmarks/cash_only_snapshots.csv",
+            1,
+            "realized_profit_loss",
+            "1.00",
+            "Cash-only benchmark must remain independently funded and flat",
+        ),
+        (
+            "lstm",
+            (
+                "evidence/portfolios/M-005/benchmarks/"
+                "buy_and_hold_trades.csv"
+            ),
+            0,
+            "quantity",
+            "1",
+            "Buy-and-hold entry does not match first-target open execution",
+        ),
+    ],
+    ids=(
+        "signal-reason",
+        "signal-threshold-probability",
+        "signal-allocation",
+        "market-close",
+        "strategy-snapshot",
+        "trade-fee",
+        "trade-quantity",
+        "trade-execution-date",
+        "trade-reference-price",
+        "trade-execution-price",
+        "trade-cash-transition",
+        "trade-share-transition",
+        "cash-benchmark",
+        "buy-and-hold-trade",
+    ),
+)
+def test_resealed_ledger_semantic_tampering_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    relative: str,
+    row_index: int,
+    column: str,
+    value: str,
+    message: str,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    _replace_csv_cell(
+        pack / relative,
+        row_index=row_index,
+        column=column,
+        value=value,
+    )
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role=role,
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(ValueError, match=message):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+def test_resealed_same_flat_session_price_tampering_in_both_sources_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    baseline_relative = "evidence/market_data/baseline_psx_prices.csv"
+    lstm_relative = "evidence/market_data/lstm_ogdc_prices.csv"
+    for relative in (baseline_relative, lstm_relative):
+        _replace_csv_cell(
+            pack / relative,
+            row_index=2,
+            column="close",
+            value="100.00",
+        )
+
+    baseline_authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="baseline_vertical_slice",
+        evidence_pack_path=baseline_relative,
+    )
+    lstm_authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="lstm",
+        evidence_pack_path=lstm_relative,
+    )
+    authority = deepcopy(portable_fixture.authority)
+    authority["baseline_vertical_slice"] = baseline_authority[
+        "baseline_vertical_slice"
+    ]
+    authority["lstm"] = lstm_authority["lstm"]
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(
+        ValueError, match="Portfolio state transition mismatch for M-001"
+    ):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+@pytest.mark.parametrize("case", ["cash", "shares"])
+def test_resealed_strategy_opening_state_tampering_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    relative = "evidence/portfolios/M-001/portfolio_snapshots.csv"
+    path = pack / relative
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        columns = list(reader.fieldnames or ())
+        rows = [dict(row) for row in reader]
+    opening = rows[0]
+    if case == "cash":
+        cash = Decimal(opening["cash"]) - Decimal("1.00")
+        opening["cash"] = f"{cash:.2f}"
+        opening["total_equity"] = f"{cash + Decimal(opening['position_value']):.2f}"
+    else:
+        shares = int(opening["shares"]) + 1
+        position = Decimal(shares) * Decimal(opening["market_price"])
+        opening["shares"] = str(shares)
+        opening["position_value"] = f"{position:.2f}"
+        opening["total_equity"] = f"{Decimal(opening['cash']) + position:.2f}"
+    _write_csv(path, columns, rows)
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="baseline_vertical_slice",
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(ValueError, match="Opening portfolio state mismatch for M-001"):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+@pytest.mark.parametrize("case", ["cash", "shares"])
+def test_resealed_strategy_snapshot_transition_tampering_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    relative = "evidence/portfolios/M-001/portfolio_snapshots.csv"
+    path = pack / relative
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        columns = list(reader.fieldnames or ())
+        rows = [dict(row) for row in reader]
+    transition = rows[1]
+    if case == "cash":
+        cash = Decimal(transition["cash"]) + Decimal("1.00")
+        transition["cash"] = f"{cash:.2f}"
+        transition["total_equity"] = (
+            f"{cash + Decimal(transition['position_value']):.2f}"
+        )
+    else:
+        shares = int(transition["shares"]) + 1
+        position = Decimal(shares) * Decimal(transition["market_price"])
+        transition["shares"] = str(shares)
+        transition["position_value"] = f"{position:.2f}"
+        transition["total_equity"] = (
+            f"{Decimal(transition['cash']) + position:.2f}"
+        )
+    _write_csv(path, columns, rows)
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="baseline_vertical_slice",
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(
+        ValueError, match="Portfolio state transition mismatch for M-001"
+    ):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+def test_resealed_valid_but_wrong_signal_action_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    relative = "evidence/portfolios/M-001/signals.csv"
+    _replace_csv_cells(
+        pack / relative,
+        row_index=0,
+        values={
+            "action": "HOLD",
+            "target_allocation": "",
+            "reason": "inside_neutral_band",
+        },
+    )
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="baseline_vertical_slice",
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(
+        ValueError, match="Persisted signal semantics mismatch for M-001"
+    ):
+        comparison.verify_unified_comparison_pack(pack)
+
+
+@pytest.mark.parametrize("case", ["missing", "second"])
+def test_resealed_buy_and_hold_trade_count_tampering_is_rejected(
+    portable_fixture: PortableFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    pack = _copy_pack(portable_fixture, tmp_path)
+    relative = (
+        "evidence/portfolios/M-005/benchmarks/buy_and_hold_trades.csv"
+    )
+    path = pack / relative
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        columns = list(reader.fieldnames or ())
+        rows = [dict(row) for row in reader]
+    assert len(rows) == 1
+    if case == "missing":
+        rows.clear()
+    else:
+        second = dict(rows[0])
+        second["trade_id"] = f"{second['trade_id']}-second"
+        rows.append(second)
+    _write_csv(path, columns, rows)
+    authority = _reseal_copied_source_evidence(
+        pack,
+        portable_fixture,
+        role="lstm",
+        evidence_pack_path=relative,
+    )
+    monkeypatch.setattr(comparison, "AUTHORITATIVE_SOURCE_ROOTS", authority)
+
+    with pytest.raises(
+        ValueError, match="Buy-and-hold benchmark must contain one controlled entry"
+    ):
         comparison.verify_unified_comparison_pack(pack)
 
 

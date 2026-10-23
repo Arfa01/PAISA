@@ -143,21 +143,46 @@ caller-supplied run is never silently resealed.
 
 ### Unified price-model comparison pack
 
-The derived M-001 through M-006 price-only comparison is a read-only evidence
-transform, not a training, inference, policy, or backtesting component. It
-accepts only the explicitly allowlisted completed training, vertical-slice, and
-LSTM roots; validates their integrity roots and relationships; and copies only
-the persisted prediction, split, portfolio-configuration, snapshot, and trade
-evidence needed for offline replay. Fitted model binaries and raw price data do
-not belong in this pack.
+The authoritative derived M-001 through M-006 price-only comparison is
+`CMP-20261024-OGDC-price-only-02`. It is a read-only evidence transform, not a
+training, inference, production-policy, or production-backtesting component.
+`CMP-20261024-OGDC-price-only-01` is retained only as a superseded,
+non-portable historical draft and is not acceptable publication evidence.
+
+The builder accepts only the explicitly allowlisted completed training,
+vertical-slice, and LSTM roots and validates their integrity roots and
+relationships. Training and LSTM source manifests are copied byte-for-byte.
+The vertical-slice raw manifest is deliberately excluded because it embeds
+host-local paths; the pack instead carries a digest-allowlisted, redacted
+certificate containing the source-manifest name and SHA-256, an allowlisted
+projection of semantic assertions, and the complete source artifact inventory.
+The source record distinguishes byte-copy roots from this deterministic
+redacted projection.
+
+The portable evidence includes persisted split and prediction rows, two raw
+market CSVs, one policy configuration and one signal CSV for each of the six
+models, and each independent model and benchmark ledger. The two market files
+must prove the same ordered 185-session opening-and-holdout price vector. Raw
+market prices and persisted policy outputs are therefore required evidence;
+fitted model binaries, caches, and provider credentials are excluded.
 
 Prediction metrics are recomputed from copied prediction rows. The
 majority-class baseline derives its class from training labels, while the
 previous-direction baseline uses the persisted prior row whose `target_date`
-equals the scored row's `feature_date`. Portfolio metrics are recomputed from
-the copied snapshots and trades without re-executing a decision policy. All six
-strategy ledgers and their cash-only and buy-and-hold ledgers retain distinct
-portfolio IDs even when benchmark economics agree.
+equals the scored row's `feature_date`. Portfolio verification independently
+replays the policy, next-session-open execution, allocation constraints, fees,
+trades, close marks, cash, holdings, realized and unrealized P&L, returns, and
+drawdowns with exact `Decimal` arithmetic and the declared rounding rule. It
+compares that reconstruction row-by-row and trade-by-trade with copied evidence
+without importing or invoking the production backtest runner.
+
+The metrics contract exposes exactly two logical benchmark rows: cash-only and
+controlled buy-and-hold. Each logical row carries six ledger-provenance records
+so all independent model-associated benchmark ledgers remain auditable even
+when their economics agree. Every strategy and benchmark ledger retains a
+distinct portfolio ID and snapshot ledger. Provenance binds each benchmark to
+its associated model experiment and configuration; buy-and-hold includes trade
+evidence, while cash-only intentionally has no trade file.
 
 Validation-only selection remains separate from descriptive results on the
 **shared project holdout**. Balanced accuracy, F1, simulated return, drawdown,
@@ -170,10 +195,19 @@ its own `manifest.json`. Publication refuses existing directory, ZIP, or
 checksum destinations. The deterministic ZIP contains one ID-matched top-level
 directory and canonical member metadata; its adjacent checksum sidecar is
 mandatory and is authenticated before archive extraction. The offline verifier
-rejects unsafe paths, links, special or additional files, digest changes, source-identity
-changes, assumption drift, date/label misalignment, persisted-metric drift, and
-any mismatch between the human report and semantic replay. The complete schema,
-commands, and canonical source digests are documented in
+recursively scans every text member and rejects defined host-path and
+credential-like patterns, including file URIs, URL credentials, authorization
+values, and known token or key formats. It also rejects unsafe paths, links,
+special or additional files, digest changes, source-identity changes,
+assumption drift, date/label misalignment, persisted-metric drift, and any
+mismatch between the human report and semantic replay. Normal CLI output identifies artifacts
+relative to an explicit path base; default failures are concise and omit
+tracebacks, while opt-in debug output is still sanitized.
+
+This comparison does not integrate sentiment and has a tabular/report-only
+presentation contract. It contains no plots, and comparison build and verify
+paths must not import Matplotlib. The complete schema, commands, and canonical
+source digests are documented in
 [`UNIFIED_PRICE_MODEL_COMPARISON.md`](UNIFIED_PRICE_MODEL_COMPARISON.md).
 
 ## A. Model artifact contract

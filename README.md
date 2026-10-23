@@ -27,7 +27,7 @@ proposal and early-v0 context.
 | [October 2026 progress report](docs/PROGRESS_REPORT_OCTOBER_2026.md) | Dated delivery summary, verified results, test evidence, and next milestones. |
 | [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
 | [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
-| [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Immutable M-001–M-006 comparison pack, semantic verifier, portable ZIP/checksum, and separate outcome interpretation. |
+| [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Authoritative `CMP-20261024-OGDC-price-only-02` M-001–M-006 pack, full offline semantic replay, portable ZIP/checksum, and separate tabular outcomes. |
 | [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
 | [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |

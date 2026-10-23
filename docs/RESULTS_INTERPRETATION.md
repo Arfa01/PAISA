@@ -150,11 +150,24 @@ trading.
 
 ## Unified M-001 through M-006 comparison
 
-The immutable comparison pack `CMP-20261024-OGDC-price-only-01` extends the
-price-only review to the two LSTM variants without retraining a model or
-rerunning a backtest. It recomputes metrics from persisted prediction rows and
-portfolio ledgers. All six models share 182 validation dates and the exact 184
-dates from `2025-12-16` through `2026-09-15` in the **shared project holdout**.
+The authoritative immutable comparison pack
+`CMP-20261024-OGDC-price-only-02` extends the price-only review to the two LSTM
+variants without retraining a model, invoking inference, or calling the
+production backtest runner. `CMP-20261024-OGDC-price-only-01` is a superseded,
+non-portable historical draft and is not current publication evidence. The
+final `-02` ZIP SHA-256 is
+`8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
+and its verified total file count is `65`.
+
+The hardened pack recomputes prediction metrics from persisted rows and uses
+two raw market files plus six signal files to replay policy, execution, trades,
+accounting, return, drawdown, and fees with exact `Decimal` arithmetic. Its
+vertical-slice integrity root is represented by a digest-allowlisted redacted
+certificate, and portable-content hygiene scans all text recursively. The
+metrics expose exactly two logical benchmark rows, cash-only and controlled
+buy-and-hold, each with six independent ledger-provenance records. All six
+models share 182 validation dates and the exact 184 dates from `2025-12-16`
+through `2026-09-15` in the **shared project holdout**.
 That period and its M-001 through M-004 results had been exposed previously, so
 the shared project holdout is comparative evidence rather than a fresh
 independent performance estimate.
@@ -181,6 +194,11 @@ holdout F1, `M-002` has the highest simulated model-portfolio return, and
 `M-003` has the lowest model-portfolio drawdown and fees. The controlled
 buy-and-hold comparator uses the same 50% allocation constraint as the model
 portfolios; it is not a fully invested benchmark.
+
+This is a price-only, tabular/report-only comparison. It does not integrate
+sentiment, contains no plots, and does not import Matplotlib. CLI results use
+relative artifact names; default failures omit tracebacks and opt-in debug
+diagnostics are sanitized.
 
 See [the unified comparison contract](UNIFIED_PRICE_MODEL_COMPARISON.md) for
 the authoritative source bindings, complete schemas, verification commands,

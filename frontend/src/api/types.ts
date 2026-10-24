@@ -512,18 +512,36 @@ export interface UnifiedComparisonDetailResponse
 }
 
 export interface UnifiedSourcesResponse extends UnifiedComparisonContext {
-  sources: Array<{
-    role: string;
-    artifact_type: string;
-    run_id: string;
-    integrity_root_sha256: string;
-    payload_file_count: number;
-    integrity_root_derivation: string;
-  }>;
+  sources: [
+    {
+      role: "baseline_training";
+      artifact_type: "model_training_run";
+      run_id: string;
+      integrity_root_sha256: string;
+      payload_file_count: number;
+      integrity_root_derivation: "byte_copy";
+    },
+    {
+      role: "baseline_vertical_slice";
+      artifact_type: "vertical_slice";
+      run_id: string;
+      integrity_root_sha256: string;
+      payload_file_count: number;
+      integrity_root_derivation: "deterministic_redacted_projection";
+    },
+    {
+      role: "lstm";
+      artifact_type: "lstm_price_only_experiment";
+      run_id: string;
+      integrity_root_sha256: string;
+      payload_file_count: number;
+      integrity_root_derivation: "byte_copy";
+    },
+  ];
   relationships: {
-    vertical_slice_uses_training_run: boolean;
-    lstm_uses_training_run: boolean;
-    lstm_uses_vertical_slice: boolean;
+    vertical_slice_uses_training_run: true;
+    lstm_uses_training_run: true;
+    lstm_uses_vertical_slice: true;
   };
 }
 
@@ -603,9 +621,9 @@ export interface UnifiedPredictionMetricRow {
   f1: number;
   matthews_corrcoef: number | null;
   roc_auc: number | null;
-  brier_score: number | null;
+  brier_score: number;
   log_loss: number | null;
-  expected_calibration_error: number | null;
+  expected_calibration_error: number;
   selection_eligible: boolean;
   metric_warnings: string[];
   class_counts: Record<string, number>;

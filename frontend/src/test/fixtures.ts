@@ -735,18 +735,76 @@ function registeredModelId(model: UnifiedModelVariant): string {
   return `registered-${model.toLowerCase()}`;
 }
 
+type FixtureConfusionMatrix = [[number, number], [number, number]];
+
+const fixtureModelConfusionMatrices: Record<
+  "validation" | "shared project holdout",
+  Record<UnifiedModelVariant, FixtureConfusionMatrix>
+> = {
+  validation: {
+    "M-001": [[61, 32], [53, 36]],
+    "M-002": [[43, 50], [41, 48]],
+    "M-003": [[61, 32], [56, 33]],
+    "M-004": [[46, 47], [45, 44]],
+    "M-005": [[16, 77], [19, 70]],
+    "M-006": [[34, 59], [37, 52]],
+  },
+  "shared project holdout": {
+    "M-001": [[82, 11], [78, 13]],
+    "M-002": [[72, 21], [66, 25]],
+    "M-003": [[82, 11], [79, 12]],
+    "M-004": [[60, 33], [60, 31]],
+    "M-005": [[16, 77], [12, 79]],
+    "M-006": [[44, 49], [35, 56]],
+  },
+};
+
+function fixtureClassificationMetrics(confusionMatrix: FixtureConfusionMatrix) {
+  const [[trueNegative, falsePositive], [falseNegative, truePositive]] = confusionMatrix;
+  const support = trueNegative + falsePositive + falseNegative + truePositive;
+  const actualNegative = trueNegative + falsePositive;
+  const actualPositive = falseNegative + truePositive;
+  const predictedPositive = falsePositive + truePositive;
+  const f1Denominator = 2 * truePositive + falsePositive + falseNegative;
+  const matthewsDenominator = Math.sqrt(
+    (truePositive + falsePositive) *
+      (truePositive + falseNegative) *
+      (trueNegative + falsePositive) *
+      (trueNegative + falseNegative),
+  );
+  return {
+    row_count: support,
+    support,
+    accuracy: (trueNegative + truePositive) / support,
+    balanced_accuracy: actualNegative > 0 && actualPositive > 0
+      ? (trueNegative / actualNegative + truePositive / actualPositive) / 2
+      : null,
+    precision: predictedPositive > 0 ? truePositive / predictedPositive : 0,
+    recall: actualPositive > 0 ? truePositive / actualPositive : 0,
+    f1: f1Denominator > 0 ? (2 * truePositive) / f1Denominator : 0,
+    matthews_corrcoef: actualNegative > 0 && actualPositive > 0
+      ? matthewsDenominator > 0
+        ? (truePositive * trueNegative - falsePositive * falseNegative) /
+          matthewsDenominator
+        : 0
+      : null,
+    class_counts: { "0": actualNegative, "1": actualPositive },
+    predicted_class_counts: {
+      "0": trueNegative + falseNegative,
+      "1": predictedPositive,
+    },
+    confusion_matrix: confusionMatrix,
+  };
+}
+
 function predictionMetric(
   model: UnifiedModelVariant,
   scope: "validation" | "shared project holdout",
   index: number,
 ): UnifiedPredictionMetricRow {
-  const rowCount = scope === "validation" ? 182 : 184;
-  const classZero = scope === "validation" ? 93 : 93;
-  const classOne = rowCount - classZero;
-  const trueNegative = 50;
-  const falsePositive = classZero - trueNegative;
-  const falseNegative = 40;
-  const truePositive = classOne - falseNegative;
+  const classification = fixtureClassificationMetrics(
+    fixtureModelConfusionMatrices[scope][model],
+  );
   return {
     competitor_id: model,
     competitor_type: "model",
@@ -754,29 +812,13 @@ function predictionMetric(
     algorithm: algorithmFor(model),
     configuration_family: configurationFamilies[model],
     evaluation_scope: scope,
-    row_count: rowCount,
-    support: rowCount,
-    accuracy: 0.49 + index * 0.01,
-    balanced_accuracy: model === "M-003" ? null : 0.48 + index * 0.01,
-    precision: 0.45 + index * 0.01,
-    recall: 0.44 + index * 0.01,
-    f1: 0.43 + index * 0.02,
-    matthews_corrcoef: model === "M-003" ? null : 0.02 + index * 0.01,
-    roc_auc: model === "M-003" ? null : 0.5 + index * 0.01,
+    ...classification,
+    roc_auc: 0.5 + index * 0.01,
     brier_score: 0.25,
     log_loss: 0.7,
     expected_calibration_error: 0.05,
     selection_eligible: true,
     metric_warnings: [],
-    class_counts: { "0": classZero, "1": classOne },
-    predicted_class_counts: {
-      "0": trueNegative + falseNegative,
-      "1": falsePositive + truePositive,
-    },
-    confusion_matrix: [
-      [trueNegative, falsePositive],
-      [falseNegative, truePositive],
-    ],
   };
 }
 
@@ -785,14 +827,22 @@ function referenceMetric(
   scope: "validation" | "shared project holdout",
 ): UnifiedPredictionMetricRow {
   const base = predictionMetric("M-001", scope, 0);
+  const confusionMatrix: FixtureConfusionMatrix = competitorId === "majority-class-baseline"
+    ? scope === "validation"
+      ? [[93, 0], [89, 0]]
+      : [[93, 0], [91, 0]]
+    : scope === "validation"
+      ? [[43, 50], [50, 39]]
+      : [[49, 44], [43, 48]];
   return {
     ...base,
+    ...fixtureClassificationMetrics(confusionMatrix),
     competitor_id: competitorId,
     competitor_type: "reference_baseline",
     registered_model_id: null,
     algorithm: null,
     configuration_family: null,
-    selection_eligible: false,
+    selection_eligible: true,
   };
 }
 

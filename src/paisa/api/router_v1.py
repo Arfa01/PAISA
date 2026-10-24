@@ -58,7 +58,7 @@ router = APIRouter(prefix="/api/v1", tags=["experiment-results-v1"])
 MAX_TABLE_LIMIT = 1000
 MAX_PRICE_LIMIT = 5000
 T = TypeVar("T")
-_WEB_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_WEB_URL = re.compile(r"(?:https?|wss?|ftp)://[^\s\"'<>]+", re.IGNORECASE)
 _FILE_URI = re.compile(r"\bfile:(?://)?[^\s\"'<>]*", re.IGNORECASE)
 _POSIX_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?:[^\s\"'<>]*)")
 _UNC_PATH = re.compile(
@@ -68,6 +68,11 @@ _ROOTED_WINDOWS_PATH = re.compile(
     r"(?<![A-Za-z0-9\\])\\(?!\\)[^\\/\s\"'<>]+\\[^\s\"'<>]*"
 )
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
+_EXECUTABLE_MODEL_REFERENCE = re.compile(
+    r"\.(?:joblib|pkl|pickle|keras|h5|hdf5|onnx|pt|pth|pb|ckpt|safetensors)"
+    r"(?=$|[^A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 def _assert_no_absolute_local_paths(value: Any) -> None:
@@ -75,12 +80,15 @@ def _assert_no_absolute_local_paths(value: Any) -> None:
         for match in _WEB_URL.finditer(value):
             parsed_url = urlsplit(match.group(0))
             url_metadata = unquote(f"{parsed_url.query} {parsed_url.fragment}")
+            decoded_url_path = unquote(parsed_url.path)
             if (
                 _FILE_URI.search(url_metadata)
                 or _POSIX_ABSOLUTE_PATH.search(url_metadata)
                 or _UNC_PATH.search(url_metadata)
                 or _ROOTED_WINDOWS_PATH.search(url_metadata)
                 or _WINDOWS_ABSOLUTE_PATH.search(url_metadata)
+                or _EXECUTABLE_MODEL_REFERENCE.search(url_metadata)
+                or _EXECUTABLE_MODEL_REFERENCE.search(decoded_url_path)
             ):
                 raise ArtifactIntegrityError(
                     "Artifact response URL contains a prohibited absolute local path"

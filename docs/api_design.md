@@ -113,16 +113,51 @@ path fragments.
 The unified endpoints project the authoritative immutable M-001 through M-006
 pack into typed JSON. They validate the manifest, exact 64-entry payload
 inventory, every SHA-256 digest, completion state, cross-file identities,
-six-model cardinality, benchmark cardinality, finite/null metrics, and the
-academic disclaimer. They reject traversal, symlink escape, executable model
-payloads, extra or missing files, and local absolute paths in responses.
+six-model cardinality, benchmark cardinality, bounded metric domains,
+confusion-matrix/count/metric reconciliation, and the academic disclaimer.
+Acceptance is also pinned to the same authoritative
+training, vertical-slice, and LSTM source IDs and manifest digests used by the
+offline comparison verifier; a self-consistent resealed pack from other source
+roots is rejected. In addition, the top-level `manifest.json` bytes must match
+the code-defined comparison-ID-to-SHA-256 certificate. The retained production
+certificate authorizes only `CMP-20261024-OGDC-price-only-02` with manifest
+digest
+`e4b0b12bb565fa6df1f23b7e8855f84569ffcefb795c36c4bfeb4a1e2c82849d`.
+This prevents an otherwise canonical-source pack from changing a
+probability-derived metric and authorizing the change by merely rebuilding its
+self-checksummed manifest. Every copied evidence member must also match its exact
+role, source path, purpose, and SHA-256 in those anchored source inventories,
+including reconciliation of the nested LSTM inventory. They reject traversal,
+symlink escape, executable model
+payloads or public-text references, extra or missing files, and local absolute,
+UNC, or file-URI paths in responses.
+
+On platforms that provide descriptor-relative, no-follow traversal, every
+configured-root component is opened from the filesystem anchor and the run tree
+remains pinned for the complete validation read. Every field in one response is
+then projected from that single validated snapshot. This prevents an ancestor or
+configured-root rename from redirecting a request after validation has begun.
+Regular members are opened nonblocking before their descriptor type is checked,
+so a regular-file-to-FIFO swap cannot stall a worker. A captured comparison tree
+is limited to 128 total directory and file entries and eight relative path
+components; both limits are enforced while scanning and before deeper recursion.
+The unified endpoints fail closed when that traversal guarantee is unavailable.
+Completed comparison roots and their parent directories should still be owned
+by a separate publisher and mounted read-only for the API identity.
+
+The configured source and comparison-manifest authorities are copied and deeply
+frozen when an `ArtifactRepository` is constructed, so cached validation cannot
+observe later caller mutations. Tests may inject deterministic authorities only
+through an explicit `RepositorySettings` instance. Environment-backed production
+repository construction has no authority-override input and continues to use the
+code-defined certificates, preserving its existing root/default cache partition.
 
 A request does not retrain, infer, recompute a metric, replay a portfolio, or
 deserialize a model. The canonical pack is explicitly tabular and declares
 `plots_included: false`; its detail response therefore names the persisted data
 endpoints that a client may visualize instead of fabricating plot artifacts.
 Every applicable response retains the exact term **shared project holdout**.
-Validation selection, shared-holdout classification, simulated portfolio,
+Validation selection, shared project holdout classification, simulated portfolio,
 drawdown, fee, cash-only, and buy-and-hold outcomes stay separate. The API does
 not expose a universal winner.
 

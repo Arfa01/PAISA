@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { ApiError } from "../api/client";
+import { ApiError, PaisaApiClient } from "../api/client";
 import {
   COMPARISON_ID,
   DISCLAIMER,
@@ -42,8 +42,8 @@ describe("UnifiedComparisonView", () => {
       "Best shared project holdout balanced accuracy",
       "Best shared project holdout F1",
       "Best model portfolio",
-      "Lowest drawdown",
-      "Lowest fees",
+      "Lowest-drawdown model portfolio",
+      "Lowest-fee model portfolio",
       "Buy-and-hold",
       "Any model beat buy-and-hold?",
     ]) {
@@ -58,6 +58,44 @@ describe("UnifiedComparisonView", () => {
     expect(screen.getByLabelText("Academic simulation disclaimer")).toHaveTextContent(
       DISCLAIMER,
     );
+  });
+
+  it("uses the exact shared project holdout term in visible and accessible labels", async () => {
+    const client = makeMockClient();
+    const { container } = render(<UnifiedComparisonView client={client} />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Shared project holdout confusion matrices",
+      }),
+    ).toBeInTheDocument();
+    for (const label of [
+      "Shared project holdout observations",
+      "Shared project holdout target start",
+      "Shared project holdout target end",
+    ]) {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    }
+    const evidenceTable = screen.getByRole("table", {
+      name: "Unified six-model prediction and portfolio metrics",
+    });
+    for (const column of [
+      "Shared project holdout accuracy",
+      "Shared project holdout balanced accuracy",
+      "Shared project holdout F1",
+    ]) {
+      expect(
+        within(evidenceTable).getByRole("columnheader", { name: column }),
+      ).toBeInTheDocument();
+    }
+    for (const model of UNIFIED_MODELS) {
+      expect(
+        screen.getByRole("table", {
+          name: `${model} shared project holdout confusion matrix`,
+        }),
+      ).toBeInTheDocument();
+    }
+    expect(container.textContent).not.toMatch(/shared holdout/i);
   });
 
   it("uses persisted summary outcomes instead of deriving cards from metric rows", async () => {
@@ -101,6 +139,55 @@ describe("UnifiedComparisonView", () => {
     expect(container).not.toHaveTextContent("Infinity");
     expect(container).not.toHaveTextContent("joblib");
     expect(container).not.toHaveTextContent("/Users/");
+  });
+
+  it.each([
+    "models/private.joblib",
+    "models/private.joblib/metadata",
+    "models\\private.joblib\\metadata",
+    "models/private.joblib.",
+    "models/private.pb",
+    "//server/share/model.keras",
+    "See https://example.test/report?source=/Users/private/report.csv",
+    "See https://example.test/report?source=%2FUsers%2Fprivate%2Freport.csv",
+    "See https://example.test/models/private%2Ejoblib",
+  ])("rejects renderable prohibited limitation text: %s", async (unsafeText) => {
+    const data = makeUnifiedComparisonData();
+    data.summary.limitations = [unsafeText];
+    const responses = new Map<string, unknown>([
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}`, data.detail],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/sources`, data.sources],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/summary`, data.summary],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/prediction-metrics`, data.predictionMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/validation-metrics`, data.validationMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/portfolio-metrics`, data.portfolioMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/prediction-rankings`, data.predictionRankings],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/portfolio-rankings`, data.portfolioRankings],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/common-date-contract`, data.commonDateContract],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/confusion-matrices`, data.confusionMatrices],
+    ]);
+    vi.stubGlobal("fetch", vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/v1/unified-comparisons") {
+        return Promise.resolve(new Response(JSON.stringify(makeUnifiedComparisonList()), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }));
+      }
+      return Promise.resolve(new Response(JSON.stringify(responses.get(url.pathname)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    }));
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    const { container } = render(<UnifiedComparisonView client={client} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The PAISA API response contained prohibited path or model-binary data.",
+    );
+    expect(container).not.toHaveTextContent(unsafeText);
   });
 
   it("shows an inventory loading state, error state, and empty state without fallback data", async () => {

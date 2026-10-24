@@ -250,7 +250,7 @@ function UnifiedComparisonResults({ data }: { data: UnifiedComparisonData }) {
             <dd>{formatInteger(data.commonDateContract.validation.common_count)}</dd>
           </div>
           <div>
-            <dt>Shared holdout observations</dt>
+            <dt>Shared project holdout observations</dt>
             <dd>
               {formatInteger(
                 data.commonDateContract.shared_project_holdout.common_count,
@@ -258,11 +258,11 @@ function UnifiedComparisonResults({ data }: { data: UnifiedComparisonData }) {
             </dd>
           </div>
           <div>
-            <dt>Shared holdout target start</dt>
+            <dt>Shared project holdout target start</dt>
             <dd>{data.commonDateContract.shared_project_holdout.target_start}</dd>
           </div>
           <div>
-            <dt>Shared holdout target end</dt>
+            <dt>Shared project holdout target end</dt>
             <dd>{data.commonDateContract.shared_project_holdout.target_end}</dd>
           </div>
         </dl>
@@ -303,14 +303,14 @@ function UnifiedComparisonResults({ data }: { data: UnifiedComparisonData }) {
             details={`${formatPkr(outcomes.best_simulated_model_portfolio.ending_equity)} · ${formatPercent(outcomes.best_simulated_model_portfolio.total_return)}`}
           />
           <OutcomeCard
-            label="Lowest drawdown"
+            label="Lowest-drawdown model portfolio"
             primary={outcomes.lowest_drawdown_model_portfolio.variant_id}
             details={formatPercent(
               outcomes.lowest_drawdown_model_portfolio.maximum_drawdown,
             )}
           />
           <OutcomeCard
-            label="Lowest fees"
+            label="Lowest-fee model portfolio"
             primary={outcomes.lowest_fee_model_portfolio.variant_id}
             details={formatPkr(outcomes.lowest_fee_model_portfolio.fees_paid)}
           />
@@ -353,9 +353,9 @@ function UnifiedComparisonResults({ data }: { data: UnifiedComparisonData }) {
                 <th scope="col">Configuration family</th>
                 <th scope="col">Validation balanced accuracy</th>
                 <th scope="col">Validation F1</th>
-                <th scope="col">Shared holdout accuracy</th>
-                <th scope="col">Shared holdout balanced accuracy</th>
-                <th scope="col">Shared holdout F1</th>
+                <th scope="col">Shared project holdout accuracy</th>
+                <th scope="col">Shared project holdout balanced accuracy</th>
+                <th scope="col">Shared project holdout F1</th>
                 <th scope="col">Ending equity</th>
                 <th scope="col">Portfolio return</th>
                 <th scope="col">Maximum drawdown</th>
@@ -440,14 +440,18 @@ function UnifiedComparisonResults({ data }: { data: UnifiedComparisonData }) {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Classification counts</p>
-            <h2 id="confusion-matrices-title">Shared holdout confusion matrices</h2>
+            <h2 id="confusion-matrices-title">
+              Shared project holdout confusion matrices
+            </h2>
           </div>
         </div>
         <div className="unified-matrix-grid">
           {data.confusionMatrices.shared_project_holdout_models.map((row) => (
             <article className="comparison-card" key={row.competitor_id}>
               <span>{row.competitor_id}</span>
-              <table aria-label={`${row.competitor_id} shared holdout confusion matrix`}>
+              <table
+                aria-label={`${row.competitor_id} shared project holdout confusion matrix`}
+              >
                 <thead>
                   <tr>
                     <th scope="col">Actual / predicted</th>

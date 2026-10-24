@@ -5,30 +5,63 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from urllib.parse import quote
 
 import joblib
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
+import paisa.api.artifact_repository as artifact_repository_module
 from paisa.api.artifact_repository import (
     ACADEMIC_DISCLAIMER,
+    ArtifactIntegrityError,
     ArtifactRepository,
     InvalidIdentifierError,
     RepositorySettings,
     get_artifact_repository,
     settings_from_environment,
 )
+from paisa.api.classification_metrics import binary_metrics_from_confusion_matrix
 from paisa.api.main import app
+from paisa.api.schemas import (
+    UnifiedBenchmarkPortfolioMetric,
+    UnifiedConfusionMatrixRow,
+    UnifiedModelPortfolioMetric,
+    UnifiedPredictionMetricRow,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 COMPARISON_ID = "CMP-api-unified-fixture"
 MODEL_IDS = tuple(f"M-{index:03d}" for index in range(1, 7))
 REFERENCE_BASELINES = ("majority-class-baseline", "previous-direction-baseline")
+FIXTURE_SOURCE_AUTHORITY = {
+    "baseline_training": {
+        "run_id": "TRN-api-fixture",
+        "manifest_sha256": (
+            "b0a75925b804b60c17aa5d9dcac6c86d2ad14dad986a39d1ad068d9a02bdbf44"
+        ),
+    },
+    "baseline_vertical_slice": {
+        "run_id": "VSL-api-fixture",
+        "manifest_sha256": "2" * 64,
+        "portable_certificate_sha256": (
+            "6d79bd8980f0dfe756f9a5ab79c81a0cea68e6eb589d3f71847e521da0ab9920"
+        ),
+    },
+    "lstm": {
+        "run_id": "LSTM-api-fixture",
+        "manifest_sha256": (
+            "b4978b8d73d97e20158bb1825c5ef11467b2c7905675996c77852a037e4d2713"
+        ),
+    },
+}
 PORTFOLIO_FILES = (
     "config.json",
     "signals.csv",
@@ -104,7 +137,19 @@ def _label(model_id: str) -> str:
 
 def _prediction_metric(model_id: str, scope: str, index: int) -> dict[str, Any]:
     row_count = 2
-    accuracy = 0.50 + index / 100
+    confusion_matrix = {
+        1: [[0, 1], [1, 0]],
+        2: [[1, 0], [1, 0]],
+        3: [[0, 1], [1, 0]],
+        4: [[0, 1], [0, 1]],
+        5: [[1, 0], [1, 0]],
+        6: [[1, 0], [0, 1]],
+    }[index]
+    classification = binary_metrics_from_confusion_matrix(confusion_matrix)
+    predicted_class_counts = {
+        "0": confusion_matrix[0][0] + confusion_matrix[1][0],
+        "1": confusion_matrix[0][1] + confusion_matrix[1][1],
+    }
     return {
         "competitor_id": model_id,
         "competitor_type": "model",
@@ -118,20 +163,15 @@ def _prediction_metric(model_id: str, scope: str, index: int) -> dict[str, Any]:
         "class_distribution": {"0": 1, "1": 1},
         "complete_class_coverage": True,
         "observed_classes": [0, 1],
-        "predicted_class_counts": {"0": 1, "1": 1},
-        "predicted_class_distribution": {"0": 1, "1": 1},
+        "predicted_class_counts": predicted_class_counts,
+        "predicted_class_distribution": predicted_class_counts,
         "selection_eligible": True,
         "average": "binary",
         "positive_label": 1,
         "zero_division": 0,
-        "confusion_matrix": [[1, 0], [0, 1]],
-        "accuracy": accuracy,
-        "balanced_accuracy": accuracy,
-        "precision": 1.0,
-        "recall": 1.0,
-        "f1": 0.55 + index / 100,
-        "matthews_corrcoef": 1.0,
-        "roc_auc": None if model_id == "M-006" else 0.75,
+        "confusion_matrix": confusion_matrix,
+        **classification,
+        "roc_auc": 0.75,
         "brier_score": 0.2,
         "log_loss": 0.6,
         "expected_calibration_error": 0.1,
@@ -148,6 +188,15 @@ def _prediction_metric(model_id: str, scope: str, index: int) -> dict[str, Any]:
 
 def _baseline_metric(baseline_id: str, scope: str, index: int) -> dict[str, Any]:
     row = _prediction_metric("M-001", scope, index)
+    confusion_matrix = (
+        [[1, 0], [1, 0]]
+        if baseline_id == "majority-class-baseline"
+        else [[0, 1], [1, 0]]
+    )
+    predicted_class_counts = {
+        "0": confusion_matrix[0][0] + confusion_matrix[1][0],
+        "1": confusion_matrix[0][1] + confusion_matrix[1][1],
+    }
     row.update(
         {
             "competitor_id": baseline_id,
@@ -155,7 +204,11 @@ def _baseline_metric(baseline_id: str, scope: str, index: int) -> dict[str, Any]
             "registered_model_id": None,
             "algorithm": None,
             "label": None,
-            "selection_eligible": False,
+            "selection_eligible": True,
+            "confusion_matrix": confusion_matrix,
+            "predicted_class_counts": predicted_class_counts,
+            "predicted_class_distribution": predicted_class_counts,
+            **binary_metrics_from_confusion_matrix(confusion_matrix),
         }
     )
     return row
@@ -181,7 +234,7 @@ def _portfolio_metric(model_id: str, index: int) -> dict[str, Any]:
         "average_loss": None,
         "turnover": 0.1 * index,
         "fees_paid": f"{index * 10:.2f}",
-        "time_in_market": 0.2 * index,
+        "time_in_market": 0.15 * index,
         "excess_return_vs_cash_only": total_return,
         "excess_return_vs_buy_and_hold": total_return - 0.07,
     }
@@ -229,7 +282,18 @@ def _benchmark_metric(benchmark_id: str) -> dict[str, Any]:
 
 
 def _prediction_rankings(rows: list[dict[str, Any]], metric: str) -> list[dict[str, Any]]:
-    ordered = sorted(rows, key=lambda row: (-float(row[metric]), row["competitor_id"]))
+    tie_breakers = (
+        ("balanced_accuracy", "f1", "accuracy")
+        if metric == "balanced_accuracy"
+        else ("f1", "balanced_accuracy", "accuracy")
+    )
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            *(-float(row[key]) for key in tie_breakers),
+            row["registered_model_id"] or row["competitor_id"],
+        ),
+    )
     return [
         {
             "rank": rank,
@@ -650,16 +714,134 @@ def _make_comparison_pack(root: Path) -> Path:
             else:
                 path.write_text("fixture\n", encoding="utf-8")
 
-    training_manifest_path = (
-        run_directory
-        / "evidence/source_manifests/baseline_training_run_manifest.json"
+    training_manifest_relative = (
+        "evidence/source_manifests/baseline_training_run_manifest.json"
     )
+    vertical_certificate_relative = (
+        "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
+    )
+    lstm_manifest_relative = "evidence/source_manifests/lstm_run_manifest.json"
+    lstm_artifact_manifest_relative = (
+        "evidence/source_manifests/lstm_artifact_manifest.json"
+    )
+
+    def binding(relative: str) -> tuple[str, str, str]:
+        fixed = {
+            training_manifest_relative: (
+                "baseline_training",
+                "run_manifest.json",
+                "source_integrity_root",
+            ),
+            lstm_manifest_relative: (
+                "lstm",
+                "run_manifest.json",
+                "source_integrity_root",
+            ),
+            lstm_artifact_manifest_relative: (
+                "lstm",
+                "artifact_manifest.json",
+                "source_payload_inventory",
+            ),
+            "evidence/splits/baseline_split_manifest.json": (
+                "baseline_training",
+                "split_manifest.json",
+                "chronological_split_membership",
+            ),
+            "evidence/splits/lstm_split_manifest.json": (
+                "lstm",
+                "split_manifest.json",
+                "lstm_sequence_split_membership",
+            ),
+            "evidence/market_data/baseline_psx_prices.csv": (
+                "baseline_vertical_slice",
+                "input_snapshot/psx_prices.csv",
+                "portfolio_market_observations",
+            ),
+            "evidence/market_data/lstm_ogdc_prices.csv": (
+                "lstm",
+                "frozen_input/OGDC_prices.csv",
+                "portfolio_market_observations",
+            ),
+        }
+        if relative in fixed:
+            return fixed[relative]
+        parts = Path(relative).parts
+        if parts[:2] == ("evidence", "predictions"):
+            model_id = parts[2]
+            role = "baseline_training" if model_id in MODEL_IDS[:4] else "lstm"
+            return (
+                role,
+                f"models/{_registered_model_id(model_id)}/predictions_all_splits.csv",
+                "model_prediction_rows",
+            )
+        if parts[:2] == ("evidence", "portfolios"):
+            model_id = parts[2]
+            suffix = "/".join(parts[3:])
+            if model_id in MODEL_IDS[:4]:
+                role = "baseline_vertical_slice"
+                prefix = f"experiments/VSL-api-fixture-{model_id.lower()}"
+            else:
+                role = "lstm"
+                prefix = f"backtests/LSTM-api-fixture-{model_id.lower()}"
+            return (
+                role,
+                f"{prefix}/{suffix}",
+                "portfolio_configuration"
+                if suffix == "config.json"
+                else "portfolio_ledger",
+            )
+        raise AssertionError(f"Missing fixture evidence binding for {relative}")
+
+    def source_inventory(
+        files: dict[str, str], *, excludes: list[str]
+    ) -> dict[str, object]:
+        return {
+            "algorithm": "sha256",
+            "root": ".",
+            "excludes": excludes,
+            "files": [
+                {"path": path, "sha256": digest}
+                for path, digest in sorted(files.items())
+            ],
+        }
+
+    source_files: dict[str, dict[str, str]] = {
+        "baseline_training": {},
+        "baseline_vertical_slice": {},
+        "lstm": {},
+    }
+    copied_root_files = {
+        training_manifest_relative,
+        vertical_certificate_relative,
+        lstm_manifest_relative,
+        lstm_artifact_manifest_relative,
+    }
+    for relative in sorted(EVIDENCE_FILES - copied_root_files):
+        role, source_path, _purpose = binding(relative)
+        source_files[role][source_path] = _sha256(run_directory / relative)
+
+    lstm_artifact_manifest_path = run_directory / lstm_artifact_manifest_relative
+    _write_json(
+        lstm_artifact_manifest_path,
+        source_inventory(
+            source_files["lstm"],
+            excludes=["artifact_manifest.json", "run_manifest.json"],
+        ),
+    )
+    source_files["lstm"]["artifact_manifest.json"] = _sha256(
+        lstm_artifact_manifest_path
+    )
+
+    training_manifest_path = run_directory / training_manifest_relative
     _write_json(
         training_manifest_path,
         {
             "schema_version": "1.0",
             "run_id": "TRN-api-fixture",
-            "artifact_inventory": {"files": [{"path": "fixture"}]},
+            "artifact_inventory": source_inventory(
+                source_files["baseline_training"],
+                excludes=["run_manifest.json"],
+            ),
             "models": [
                 {
                     "variant_id": model_id,
@@ -671,28 +853,47 @@ def _make_comparison_pack(root: Path) -> Path:
     )
     training_source_digest = _sha256(training_manifest_path)
     vertical_source_digest = "2" * 64
+    vertical_certificate_path = run_directory / vertical_certificate_relative
     _write_json(
-        run_directory
-        / "evidence/source_manifests/baseline_vertical_manifest_certificate.json",
+        vertical_certificate_path,
         {
             "schema_version": "1.0",
             "artifact_type": "paisa_source_integrity_certificate",
             "run_id": "VSL-api-fixture",
             "source_role": "baseline_vertical_slice",
-            "raw_manifest_included": False,
-            "artifact_inventory": {"files": [{"path": "fixture"}]},
             "source_manifest": {
                 "name": "manifest.json",
                 "sha256": vertical_source_digest,
             },
+            "projection_policy": "allowlisted_fields_v1",
+            "raw_manifest_included": False,
+            "source_assertions": {
+                "schema_version": "1.0",
+                "status": "PASS",
+                "symbol": "OGDC",
+                "model_training_run_id": "TRN-api-fixture",
+                "registered_model_ids": {
+                    model_id: _registered_model_id(model_id)
+                    for model_id in MODEL_IDS[:4]
+                },
+                "disclaimer": ACADEMIC_DISCLAIMER,
+            },
+            "artifact_inventory": source_inventory(
+                source_files["baseline_vertical_slice"],
+                excludes=["manifest.json"],
+            ),
+            "disclaimer": ACADEMIC_DISCLAIMER,
         },
     )
+    lstm_manifest_path = run_directory / lstm_manifest_relative
     _write_json(
-        run_directory / "evidence/source_manifests/lstm_run_manifest.json",
+        lstm_manifest_path,
         {
             "schema_version": "1.0",
             "run_id": "LSTM-api-fixture",
-            "artifact_inventory": {"files": [{"path": "fixture"}]},
+            "artifact_inventory": source_inventory(
+                source_files["lstm"], excludes=["run_manifest.json"]
+            ),
             "model_ids": {
                 model_id: _registered_model_id(model_id)
                 for model_id in MODEL_IDS[4:]
@@ -708,31 +909,32 @@ def _make_comparison_pack(root: Path) -> Path:
         },
     )
 
+    source_maps = {
+        "baseline_training": {
+            "run_manifest.json": training_source_digest,
+            **source_files["baseline_training"],
+        },
+        "baseline_vertical_slice": {
+            "manifest.json": vertical_source_digest,
+            **source_files["baseline_vertical_slice"],
+        },
+        "lstm": {
+            "run_manifest.json": _sha256(lstm_manifest_path),
+            **source_files["lstm"],
+        },
+    }
     evidence_records = []
-    for relative in sorted(
-        EVIDENCE_FILES
-        - {"evidence/source_manifests/baseline_vertical_manifest_certificate.json"}
-    ):
-        role = (
-            "lstm"
-            if "/M-005/" in relative
-            or "/M-006/" in relative
-            or "lstm_" in relative
-            else "baseline_vertical_slice"
-        )
-        if "baseline_training" in relative or (
-            "predictions/" in relative and "/M-00" in relative and not any(
-                f"/{model}/" in relative for model in MODEL_IDS[-2:]
-            )
-        ):
-            role = "baseline_training"
+    for relative in sorted(EVIDENCE_FILES - {vertical_certificate_relative}):
+        role, source_path, purpose = binding(relative)
+        digest = _sha256(run_directory / relative)
+        assert source_maps[role][source_path] == digest
         evidence_records.append(
             {
                 "source_role": role,
-                "source_path": f"portable/{relative}",
+                "source_path": source_path,
                 "pack_path": relative,
-                "sha256": _sha256(run_directory / relative),
-                "purpose": "portable comparison evidence",
+                "sha256": digest,
+                "purpose": purpose,
                 "derivation": "byte_copy",
             }
         )
@@ -746,7 +948,7 @@ def _make_comparison_pack(root: Path) -> Path:
                 "run_id": "TRN-api-fixture",
                 "integrity_root_name": "run_manifest.json",
                 "integrity_root_sha256": training_source_digest,
-                "payload_file_count": 1,
+                "payload_file_count": len(source_files["baseline_training"]),
                 "integrity_root_pack_path": (
                     "evidence/source_manifests/baseline_training_run_manifest.json"
                 ),
@@ -762,7 +964,7 @@ def _make_comparison_pack(root: Path) -> Path:
                 "run_id": "VSL-api-fixture",
                 "integrity_root_name": "manifest.json",
                 "integrity_root_sha256": vertical_source_digest,
-                "payload_file_count": 1,
+                "payload_file_count": len(source_files["baseline_vertical_slice"]),
                 "integrity_root_pack_path": (
                     "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
                 ),
@@ -780,7 +982,7 @@ def _make_comparison_pack(root: Path) -> Path:
                 "integrity_root_sha256": _sha256(
                     run_directory / "evidence/source_manifests/lstm_run_manifest.json"
                 ),
-                "payload_file_count": 1,
+                "payload_file_count": len(source_files["lstm"]),
                 "integrity_root_pack_path": "evidence/source_manifests/lstm_run_manifest.json",
                 "integrity_root_pack_sha256": _sha256(
                     run_directory / "evidence/source_manifests/lstm_run_manifest.json"
@@ -799,6 +1001,23 @@ def _make_comparison_pack(root: Path) -> Path:
             "revalidated_before_publication": True,
         },
     }
+    observed_authority = {
+        source["role"]: {
+            "run_id": source["run_id"],
+            "manifest_sha256": source["integrity_root_sha256"],
+            **(
+                {
+                    "portable_certificate_sha256": source[
+                        "integrity_root_pack_sha256"
+                    ]
+                }
+                if source["role"] == "baseline_vertical_slice"
+                else {}
+            ),
+        }
+        for source in source_roots["sources"]
+    }
+    assert observed_authority == FIXTURE_SOURCE_AUTHORITY
     _write_json(run_directory / "source_roots.json", source_roots)
     _reseal_pack(run_directory)
     assert {
@@ -814,11 +1033,30 @@ def _settings(
     comparison_root: Path,
     *,
     default_id: str | None = COMPARISON_ID,
+    authorize_fixture: bool = True,
+    manifest_authority: Mapping[str, str] | None = None,
 ) -> RepositorySettings:
     vertical_root = tmp_path / "vertical"
     training_root = tmp_path / "training"
     vertical_root.mkdir(exist_ok=True)
     training_root.mkdir(exist_ok=True)
+    source_authority = (
+        {
+            role: dict(identity)
+            for role, identity in FIXTURE_SOURCE_AUTHORITY.items()
+        }
+        if authorize_fixture
+        else None
+    )
+    effective_manifest_authority = (
+        dict(manifest_authority)
+        if manifest_authority is not None
+        else {
+            COMPARISON_ID: _sha256(
+                comparison_root / COMPARISON_ID / "manifest.json"
+            )
+        }
+    )
     return RepositorySettings(
         repository_root=REPOSITORY_ROOT,
         vertical_slice_root=vertical_root,
@@ -826,6 +1064,8 @@ def _settings(
         default_vertical_slice_run_id=None,
         unified_comparison_root=comparison_root.resolve(),
         default_unified_comparison_run_id=default_id,
+        unified_comparison_source_authority=source_authority,
+        unified_comparison_manifest_authority=effective_manifest_authority,
     )
 
 
@@ -850,6 +1090,10 @@ def _api_client(settings: RepositorySettings) -> Iterator[TestClient]:
 
 @pytest.fixture
 def comparison_pack(tmp_path: Path) -> tuple[Path, Path]:
+    if not artifact_repository_module._SUPPORTS_SECURE_DIR_FD:
+        pytest.skip(
+            "Unified comparison reads fail closed without secure dir-fd traversal"
+        )
     comparison_root = tmp_path / "comparisons"
     comparison_root.mkdir()
     return comparison_root, _make_comparison_pack(comparison_root)
@@ -988,7 +1232,7 @@ def test_exactly_six_models_once_and_shared_holdout_language(
     )
 
 
-def test_summary_keeps_outcomes_separate_and_preserves_null_metrics(
+def test_summary_keeps_outcomes_separate_and_preserves_nullable_portfolio_metrics(
     comparison_pack: tuple[Path, Path], tmp_path: Path
 ) -> None:
     comparison_root, _run_directory = comparison_pack
@@ -1015,9 +1259,7 @@ def test_summary_keeps_outcomes_separate_and_preserves_null_metrics(
     assert "universal winner" not in serialized
     assert "universal_winner" not in serialized
     assert summary["reported_outcomes"]["any_model_beat_buy_and_hold"]["value"] is False
-    assert next(
-        row for row in predictions["models"] if row["competitor_id"] == "M-006"
-    )["roc_auc"] is None
+    assert all(row["roc_auc"] is not None for row in predictions["models"])
     assert next(
         row for row in portfolios["models"] if row["variant_id"] == "M-001"
     )["sharpe_ratio"] is None
@@ -1117,6 +1359,449 @@ def test_nonfinite_json_is_rejected_even_when_resealed(
     assert detail.status_code == 409
 
 
+def test_resealed_probability_metric_is_rejected_by_manifest_authority(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    trusted_manifest_digest = _sha256(run_directory / "manifest.json")
+    metrics_path = run_directory / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["validation_model_metrics"][0]["roc_auc"] = 0.99
+    _write_json(metrics_path, metrics)
+    _reseal_pack(run_directory)
+
+    settings = _settings(
+        tmp_path,
+        comparison_root,
+        manifest_authority={COMPARISON_ID: trusted_manifest_digest},
+    )
+    with _api_client(settings) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert detail.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("collection", "field", "value"),
+    [
+        ("validation_model_metrics", "accuracy", 1.5),
+        ("validation_model_metrics", "f1", -0.1),
+        ("validation_model_metrics", "matthews_corrcoef", 1.01),
+        ("validation_model_metrics", "brier_score", 1.01),
+        ("validation_model_metrics", "log_loss", -0.01),
+        ("model_portfolio_metrics", "maximum_drawdown", -0.01),
+        ("model_portfolio_metrics", "volatility", -0.01),
+        ("model_portfolio_metrics", "number_of_trades", -1),
+        ("model_portfolio_metrics", "win_rate", 5.0),
+        ("model_portfolio_metrics", "turnover", -0.01),
+        ("model_portfolio_metrics", "fees_paid", "-0.01"),
+        ("model_portfolio_metrics", "time_in_market", 1.01),
+    ],
+)
+def test_resealed_out_of_domain_metrics_are_rejected(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    collection: str,
+    field: str,
+    value: object,
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    metrics_path = run_directory / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics[collection][0][field] = value
+    _write_json(metrics_path, metrics)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert detail.status_code == 409
+
+
+def test_resealed_confusion_counts_must_reconcile(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    metrics_path = run_directory / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["validation_model_metrics"][0]["confusion_matrix"] = [
+        [1, 0],
+        [1, 0],
+    ]
+    _write_json(metrics_path, metrics)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert detail.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("collection", "field", "value"),
+    [
+        ("validation_model_metrics", "accuracy", 0.25),
+        ("validation_reference_baseline_metrics", "f1", 0.25),
+    ],
+)
+def test_resealed_within_range_metrics_must_reconcile_with_confusion_matrix(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    collection: str,
+    field: str,
+    value: float,
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    metrics_path = run_directory / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics[collection][0][field] = value
+    _write_json(metrics_path, metrics)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert detail.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("selection_eligible", False),
+        ("metric_warnings", ["single_class_actuals"]),
+        ("roc_auc", None),
+        ("log_loss", None),
+        ("brier_score", None),
+        ("expected_calibration_error", None),
+    ],
+)
+def test_resealed_metrics_must_preserve_producer_class_coverage_semantics(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    metrics_path = run_directory / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["validation_model_metrics"][0][field] = value
+    _write_json(metrics_path, metrics)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert detail.status_code == 409
+
+
+def _prediction_response_row() -> dict[str, Any]:
+    raw = _prediction_metric("M-001", "validation", 1)
+    return {
+        "competitor_id": raw["competitor_id"],
+        "competitor_type": raw["competitor_type"],
+        "registered_model_id": raw["registered_model_id"],
+        "algorithm": raw["algorithm"],
+        "configuration_family": raw["label"],
+        "evaluation_scope": raw["evaluation_scope"],
+        **{
+            key: raw[key]
+            for key in (
+                "row_count",
+                "support",
+                "accuracy",
+                "balanced_accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "matthews_corrcoef",
+                "roc_auc",
+                "brier_score",
+                "log_loss",
+                "expected_calibration_error",
+                "selection_eligible",
+                "metric_warnings",
+                "class_counts",
+                "predicted_class_counts",
+                "confusion_matrix",
+            )
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("accuracy", -0.01),
+        ("balanced_accuracy", 1.01),
+        ("precision", 1.01),
+        ("recall", -0.01),
+        ("f1", 99.0),
+        ("matthews_corrcoef", -1.01),
+        ("roc_auc", 1.01),
+        ("brier_score", -0.01),
+        ("log_loss", -0.01),
+        ("expected_calibration_error", 1.01),
+    ],
+)
+def test_prediction_response_schema_rejects_out_of_domain_metrics(
+    field: str, value: float
+) -> None:
+    row = _prediction_response_row()
+    row[field] = value
+
+    with pytest.raises(ValidationError):
+        UnifiedPredictionMetricRow.model_validate(row)
+
+
+def test_prediction_response_schema_accepts_metric_boundaries() -> None:
+    lower = _prediction_response_row()
+    lower.update(
+        {
+            "accuracy": 0.0,
+            "balanced_accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "matthews_corrcoef": -1.0,
+            "roc_auc": 0.0,
+            "brier_score": 0.0,
+            "log_loss": 0.0,
+            "expected_calibration_error": 0.0,
+            "confusion_matrix": [[0, 1], [1, 0]],
+        }
+    )
+    assert UnifiedPredictionMetricRow.model_validate(lower)
+
+    upper = _prediction_response_row()
+    for field in (
+        "accuracy",
+        "balanced_accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "roc_auc",
+        "brier_score",
+        "expected_calibration_error",
+    ):
+        upper[field] = 1.0
+    upper["matthews_corrcoef"] = 1.0
+    upper["confusion_matrix"] = [[1, 0], [0, 1]]
+    assert UnifiedPredictionMetricRow.model_validate(upper)
+
+
+def test_prediction_response_schema_reconciles_confusion_counts() -> None:
+    row = _prediction_response_row()
+    row["predicted_class_counts"] = {"0": 2, "1": 0}
+
+    with pytest.raises(ValidationError):
+        UnifiedPredictionMetricRow.model_validate(row)
+
+    with pytest.raises(ValidationError):
+        UnifiedConfusionMatrixRow.model_validate(
+            {
+                "competitor_id": "M-001",
+                "competitor_type": "model",
+                "registered_model_id": _registered_model_id("M-001"),
+                "evaluation_scope": "validation",
+                "class_labels": [0, 1],
+                "confusion_matrix": [[1, 0], [0, 0]],
+                "support": 2,
+            }
+        )
+
+
+@pytest.mark.parametrize("competitor_type", ["model", "reference_baseline"])
+def test_prediction_response_schema_rejects_within_range_metric_contradictions(
+    competitor_type: str,
+) -> None:
+    row = _prediction_response_row()
+    if competitor_type == "reference_baseline":
+        row.update(
+            {
+                "competitor_id": "majority-class-baseline",
+                "competitor_type": competitor_type,
+                "registered_model_id": None,
+                "algorithm": None,
+                "configuration_family": None,
+            }
+        )
+    row["accuracy"] = 0.25
+
+    with pytest.raises(ValidationError, match="confusion matrix"):
+        UnifiedPredictionMetricRow.model_validate(row)
+
+
+def test_prediction_response_schema_enforces_single_class_semantics() -> None:
+    row = _prediction_response_row()
+    row.update(
+        {
+            "accuracy": 1.0,
+            "balanced_accuracy": None,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "matthews_corrcoef": None,
+            "roc_auc": None,
+            "log_loss": None,
+            "selection_eligible": False,
+            "metric_warnings": ["single_class_actuals"],
+            "class_counts": {"0": 2, "1": 0},
+            "predicted_class_counts": {"0": 2, "1": 0},
+            "confusion_matrix": [[2, 0], [0, 0]],
+        }
+    )
+    assert UnifiedPredictionMetricRow.model_validate(row)
+
+    for field, value in (
+        ("selection_eligible", True),
+        ("metric_warnings", []),
+        ("roc_auc", 0.5),
+        ("log_loss", 0.5),
+    ):
+        contradictory = dict(row)
+        contradictory[field] = value
+        with pytest.raises(ValidationError):
+            UnifiedPredictionMetricRow.model_validate(contradictory)
+
+
+def test_prediction_response_schema_rejects_unsafe_classification_counts() -> None:
+    row = _prediction_response_row()
+    oversized = 10_000_001
+    row.update(
+        {
+            "row_count": oversized,
+            "support": oversized,
+            "class_counts": {"0": oversized - 1, "1": 1},
+            "predicted_class_counts": {"0": oversized - 1, "1": 1},
+            "confusion_matrix": [[oversized - 1, 0], [0, 1]],
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "matthews_corrcoef": 1.0,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        UnifiedPredictionMetricRow.model_validate(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("maximum_drawdown", -0.01),
+        ("volatility", -0.01),
+        ("number_of_trades", -1),
+        ("win_rate", 1.01),
+        ("turnover", -0.01),
+        ("fees_paid", "-0.01"),
+        ("time_in_market", 1.01),
+    ],
+)
+def test_portfolio_response_schema_rejects_out_of_domain_metrics(
+    field: str, value: object
+) -> None:
+    raw = _portfolio_metric("M-001", 1)
+    raw["variant_id"] = raw.pop("competitor_id")
+    raw.pop("competitor_type")
+    raw[field] = value
+
+    with pytest.raises(ValidationError):
+        UnifiedModelPortfolioMetric.model_validate(raw)
+
+
+def test_benchmark_response_schema_rejects_out_of_domain_metrics() -> None:
+    raw = _benchmark_metric("buy-and-hold")
+    raw.pop("competitor_type")
+    raw.pop("ledger_provenance")
+    raw["ledger_count"] = 6
+    raw["fees_paid"] = "-1.00"
+
+    with pytest.raises(ValidationError):
+        UnifiedBenchmarkPortfolioMetric.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "//server/share/model.keras",
+        "models/private.joblib",
+        "models/private.joblib.",
+        "models/private.joblib/metadata",
+        r"models\private.joblib\metadata",
+        "models/private.safetensors/index.json",
+        "file:///private/model.joblib",
+        "file:///private/report.csv",
+        "path=/etc/passwd",
+        r"path:C:\secret",
+        "source:file:///tmp/x",
+        r"source:file:C:\private\report.csv",
+        "note,/Users/private/report.csv",
+        "note;//server/share/report.csv",
+        "See https://example.test/report?source=/Users/private/report.csv",
+        "See https://example.test/report?source=%2FUsers%2Fprivate%2Freport.csv",
+        "See https://example.test/models/private%2Ejoblib",
+    ],
+)
+def test_renderable_public_text_rejects_paths_and_model_binaries(
+    comparison_pack: tuple[Path, Path], tmp_path: Path, unsafe_text: str
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    summary_path = run_directory / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["limitations"].append(unsafe_text)
+    _write_json(summary_path, summary)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        summary_response = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}/summary"
+        )
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert summary_response.status_code == 409
+    assert unsafe_text not in summary_response.text
+
+
+def test_renderable_public_text_allows_web_urls(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    summary_path = run_directory / "final_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    allowed_text = [
+        "See https://models.example.test/usr/local/share/model-card.html",
+        "See wss://models.example.test/usr/local/share/model-card.html",
+        "See ftp://models.example.test/usr/local/share/model-card.html",
+        "profile:academic_research",
+    ]
+    summary["limitations"].extend(allowed_text)
+    _write_json(summary_path, summary)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        summary_response = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}/summary"
+        )
+
+    assert summary_response.status_code == 200
+    assert all(
+        item in summary_response.json()["limitations"] for item in allowed_text
+    )
+
+
 def test_malformed_and_traversal_identifiers_cannot_escape_root(
     comparison_pack: tuple[Path, Path], tmp_path: Path
 ) -> None:
@@ -1174,6 +1859,109 @@ def test_member_symlink_escape_is_rejected_and_omitted(
     assert detail.status_code == 409
 
 
+@pytest.mark.skipif(
+    os.name == "nt"
+    or not hasattr(os, "O_NONBLOCK")
+    or not hasattr(os, "mkfifo")
+    or os.mkfifo not in os.supports_dir_fd,
+    reason="FIFO descriptor-relative swap is a POSIX regression test",
+)
+def test_regular_file_fifo_swap_is_opened_nonblocking_and_rejected(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    repository = ArtifactRepository(_settings(tmp_path, comparison_root))
+    real_stat = artifact_repository_module.os.stat
+    real_open = artifact_repository_module.os.open
+    swapped = False
+    saw_nonblocking_open = False
+
+    def swapping_stat(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal swapped
+        observed = real_stat(
+            path,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if (
+            path == "metrics.json"
+            and dir_fd is not None
+            and follow_symlinks is False
+            and not swapped
+        ):
+            os.unlink(path, dir_fd=dir_fd)
+            os.mkfifo(path, mode=0o600, dir_fd=dir_fd)
+            swapped = True
+        return observed
+
+    def guarded_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal saw_nonblocking_open
+        if path == "metrics.json" and dir_fd is not None and swapped:
+            saw_nonblocking_open = bool(flags & os.O_NONBLOCK)
+            if not saw_nonblocking_open:
+                raise OSError("refusing a potentially blocking FIFO open")
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifact_repository_module.os, "stat", swapping_stat)
+    monkeypatch.setattr(artifact_repository_module.os, "open", guarded_open)
+
+    with pytest.raises(ArtifactIntegrityError):
+        repository.load_unified_summary(COMPARISON_ID)
+
+    assert swapped is True
+    assert saw_nonblocking_open is True
+
+
+def test_comparison_tree_entry_limit_is_enforced_during_scan(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    overflow = run_directory / "overflow"
+    overflow.mkdir()
+    for index in range(artifact_repository_module._UNIFIED_MAX_TREE_ENTRIES):
+        (overflow / f"entry-{index:03d}").touch()
+    repository = ArtifactRepository(_settings(tmp_path, comparison_root))
+
+    with pytest.raises(ArtifactIntegrityError) as captured:
+        repository.load_unified_summary(COMPARISON_ID)
+
+    assert captured.value.__cause__ is not None
+    assert "entry limit" in str(captured.value.__cause__)
+
+
+def test_comparison_tree_depth_limit_is_enforced_before_recursion(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    nested = run_directory
+    for index in range(artifact_repository_module._UNIFIED_MAX_TREE_DEPTH + 1):
+        nested = nested / f"depth-{index}"
+        nested.mkdir()
+    repository = ArtifactRepository(_settings(tmp_path, comparison_root))
+
+    with pytest.raises(ArtifactIntegrityError) as captured:
+        repository.load_unified_summary(COMPARISON_ID)
+
+    assert captured.value.__cause__ is not None
+    assert "depth limit" in str(captured.value.__cause__)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Covered by the Windows junction test")
 def test_configured_root_symlink_escape_is_rejected(tmp_path: Path) -> None:
     outside_root = tmp_path / "outside-comparisons"
     outside_root.mkdir()
@@ -1201,6 +1989,380 @@ def test_configured_root_symlink_escape_is_rejected(tmp_path: Path) -> None:
     assert detail.status_code == 409
     assert str(outside_root) not in listing.text
     assert str(outside_root) not in detail.text
+
+
+def test_configured_root_ancestor_swap_cannot_redirect_a_pinned_read(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    outside_root = tmp_path / "outside-comparisons"
+    outside_run = _make_comparison_pack(outside_root)
+    outside_summary_path = outside_run / "final_summary.json"
+    outside_summary = json.loads(outside_summary_path.read_text(encoding="utf-8"))
+    outside_summary["limitations"].append("outside-root-sentinel")
+    _write_json(outside_summary_path, outside_summary)
+    _reseal_pack(outside_run)
+
+    settings = _settings(tmp_path, comparison_root)
+    repository = ArtifactRepository(settings)
+    displaced_root = tmp_path / "displaced-comparisons"
+    real_open = artifact_repository_module.os.open
+    swapped = False
+
+    def swapping_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == COMPARISON_ID and dir_fd is not None and not swapped:
+            comparison_root.rename(displaced_root)
+            os.symlink(outside_root, comparison_root, target_is_directory=True)
+            swapped = True
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifact_repository_module.os, "open", swapping_open)
+
+    summary = repository.load_unified_summary(COMPARISON_ID)
+
+    assert swapped is True
+    assert "outside-root-sentinel" not in summary["limitations"]
+
+
+def test_detail_projects_a_single_validated_snapshot(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    repository = ArtifactRepository(_settings(tmp_path, comparison_root))
+    validate = repository._validate_unified_comparison
+    calls = 0
+
+    def counted_validate(comparison_id: str, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return validate(comparison_id, **kwargs)
+
+    monkeypatch.setattr(
+        repository, "_validate_unified_comparison", counted_validate
+    )
+
+    detail = repository.load_unified_comparison_detail(COMPARISON_ID)
+
+    assert detail["comparison_id"] == COMPARISON_ID
+    assert calls == 1
+
+
+def test_cached_signature_walk_oserror_fails_closed_without_leaking_details(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    settings = _settings(tmp_path, comparison_root)
+
+    with _api_client(settings) as client:
+        warm = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}/summary"
+        )
+        assert warm.status_code == 200
+
+        def failing_signature(_descriptor: int) -> tuple[tuple[object, ...], ...]:
+            raise OSError("private signature-walk detail")
+
+        monkeypatch.setattr(
+            artifact_repository_module,
+            "_descriptor_tree_signature",
+            failing_signature,
+        )
+        response = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}/summary"
+        )
+
+    assert response.status_code == 409
+    assert "private signature-walk detail" not in response.text
+
+
+def test_root_enumeration_oserror_fails_closed_without_leaking_details(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    settings = _settings(tmp_path, comparison_root)
+
+    with _api_client(settings) as client:
+        def failing_scandir(_descriptor: int) -> object:
+            raise OSError("private root-enumeration detail")
+
+        monkeypatch.setattr(
+            artifact_repository_module.os,
+            "scandir",
+            failing_scandir,
+        )
+        response = client.get("/api/v1/unified-comparisons")
+
+    assert response.status_code == 409
+    assert "private root-enumeration detail" not in response.text
+
+
+def test_internally_consistent_non_authoritative_sources_are_rejected(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    settings = _settings(tmp_path, comparison_root, authorize_fixture=False)
+
+    with _api_client(settings) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert detail.status_code == 409
+
+
+def test_repository_snapshots_and_deep_freezes_source_authority(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    mutable_authority = {
+        role: dict(identity)
+        for role, identity in FIXTURE_SOURCE_AUTHORITY.items()
+    }
+    settings = replace(
+        _settings(tmp_path, comparison_root),
+        unified_comparison_source_authority=mutable_authority,
+    )
+    repository = ArtifactRepository(settings)
+
+    assert repository.load_unified_summary(COMPARISON_ID)["status"] == "PASS"
+    mutable_authority["lstm"]["run_id"] = "LSTM-no-longer-authorized"
+
+    assert repository.load_unified_summary(COMPARISON_ID)["status"] == "PASS"
+    with pytest.raises(TypeError):
+        repository.settings.unified_comparison_source_authority["lstm"][  # type: ignore[index]
+            "run_id"
+        ] = "LSTM-cannot-mutate-snapshot"
+    with pytest.raises(ArtifactIntegrityError):
+        ArtifactRepository(settings).load_unified_summary(COMPARISON_ID)
+
+
+def test_resealed_evidence_substitution_remains_bound_to_authoritative_source(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    evidence_relative = "evidence/predictions/M-006/predictions_all_splits.csv"
+    evidence_path = run_directory / evidence_relative
+    evidence_path.write_text(
+        "pre-hardening-lstm-01-substitution\n", encoding="utf-8"
+    )
+    substituted_digest = _sha256(evidence_path)
+
+    source_path = run_directory / "source_roots.json"
+    sources = json.loads(source_path.read_text(encoding="utf-8"))
+    for evidence in sources["evidence_files"]:
+        if evidence["pack_path"] == evidence_relative:
+            evidence["sha256"] = substituted_digest
+            break
+    else:  # pragma: no cover - fixture authoring guard
+        raise AssertionError("M-006 prediction evidence binding is missing")
+    _write_json(source_path, sources)
+    _reseal_pack(run_directory)
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["rows"] == []
+    assert detail.status_code == 409
+    assert "pre-hardening-lstm-01-substitution" not in detail.text
+
+
+def test_consistently_rewritten_sources_cannot_self_authorize(
+    comparison_pack: tuple[Path, Path], tmp_path: Path
+) -> None:
+    comparison_root, run_directory = comparison_pack
+    training_path = (
+        run_directory
+        / "evidence/source_manifests/baseline_training_run_manifest.json"
+    )
+    training = json.loads(training_path.read_text(encoding="utf-8"))
+    training["run_id"] = "TRN-rewritten"
+    _write_json(training_path, training)
+    training_digest = _sha256(training_path)
+
+    vertical_path = (
+        run_directory
+        / "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
+    )
+    vertical = json.loads(vertical_path.read_text(encoding="utf-8"))
+    vertical["run_id"] = "VSL-rewritten"
+    vertical["source_manifest"]["sha256"] = "3" * 64
+    vertical["source_assertions"]["model_training_run_id"] = "TRN-rewritten"
+    for entry in vertical["artifact_inventory"]["files"]:
+        entry["path"] = entry["path"].replace(
+            "experiments/VSL-api-fixture-",
+            "experiments/VSL-rewritten-",
+        )
+    _write_json(vertical_path, vertical)
+    vertical_certificate_digest = _sha256(vertical_path)
+
+    lstm_artifact_path = (
+        run_directory
+        / "evidence/source_manifests/lstm_artifact_manifest.json"
+    )
+    lstm_artifact = json.loads(lstm_artifact_path.read_text(encoding="utf-8"))
+    for entry in lstm_artifact["files"]:
+        entry["path"] = entry["path"].replace(
+            "backtests/LSTM-api-fixture-",
+            "backtests/LSTM-rewritten-",
+        )
+    _write_json(lstm_artifact_path, lstm_artifact)
+    lstm_artifact_digest = _sha256(lstm_artifact_path)
+
+    lstm_path = run_directory / "evidence/source_manifests/lstm_run_manifest.json"
+    lstm = json.loads(lstm_path.read_text(encoding="utf-8"))
+    lstm["run_id"] = "LSTM-rewritten"
+    lstm["baseline_training_run"] = {
+        "run_id": "TRN-rewritten",
+        "manifest_sha256": training_digest,
+    }
+    lstm["baseline_vertical_slice"] = {
+        "run_id": "VSL-rewritten",
+        "manifest_sha256": "3" * 64,
+    }
+    for entry in lstm["artifact_inventory"]["files"]:
+        entry["path"] = entry["path"].replace(
+            "backtests/LSTM-api-fixture-",
+            "backtests/LSTM-rewritten-",
+        )
+        if entry["path"] == "artifact_manifest.json":
+            entry["sha256"] = lstm_artifact_digest
+    _write_json(lstm_path, lstm)
+    lstm_digest = _sha256(lstm_path)
+
+    source_path = run_directory / "source_roots.json"
+    sources = json.loads(source_path.read_text(encoding="utf-8"))
+    rewritten_authority = {
+        "baseline_training": {
+            "run_id": "TRN-rewritten",
+            "manifest_sha256": training_digest,
+        },
+        "baseline_vertical_slice": {
+            "run_id": "VSL-rewritten",
+            "manifest_sha256": "3" * 64,
+            "portable_certificate_sha256": vertical_certificate_digest,
+        },
+        "lstm": {
+            "run_id": "LSTM-rewritten",
+            "manifest_sha256": lstm_digest,
+        },
+    }
+    for source in sources["sources"]:
+        authority = rewritten_authority[source["role"]]
+        source["run_id"] = authority["run_id"]
+        source["integrity_root_sha256"] = authority["manifest_sha256"]
+        source["integrity_root_pack_sha256"] = (
+            authority.get("portable_certificate_sha256")
+            or authority["manifest_sha256"]
+        )
+    rewritten_evidence_hashes = {
+        training_path.relative_to(run_directory).as_posix(): training_digest,
+        lstm_artifact_path.relative_to(run_directory).as_posix(): (
+            lstm_artifact_digest
+        ),
+        lstm_path.relative_to(run_directory).as_posix(): lstm_digest,
+    }
+    for evidence in sources["evidence_files"]:
+        evidence["source_path"] = evidence["source_path"].replace(
+            "experiments/VSL-api-fixture-",
+            "experiments/VSL-rewritten-",
+        ).replace(
+            "backtests/LSTM-api-fixture-",
+            "backtests/LSTM-rewritten-",
+        )
+        if evidence["pack_path"] in rewritten_evidence_hashes:
+            evidence["sha256"] = rewritten_evidence_hashes[evidence["pack_path"]]
+    _write_json(source_path, sources)
+    _reseal_pack(run_directory)
+
+    rewritten_settings = replace(
+        _settings(tmp_path, comparison_root),
+        unified_comparison_source_authority=rewritten_authority,
+    )
+    with _api_client(rewritten_settings) as client:
+        internally_consistent = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}"
+        )
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        authoritative = client.get(
+            f"/api/v1/unified-comparisons/{COMPARISON_ID}"
+        )
+
+    assert internally_consistent.status_code == 200
+    assert authoritative.status_code == 409
+
+
+def test_missing_secure_descriptor_support_fails_closed(
+    comparison_pack: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison_root, _run_directory = comparison_pack
+    monkeypatch.setattr(
+        artifact_repository_module, "_SUPPORTS_SECURE_DIR_FD", False
+    )
+
+    with _api_client(_settings(tmp_path, comparison_root)) as client:
+        listing = client.get("/api/v1/unified-comparisons")
+        detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+
+    assert listing.status_code == 409
+    assert detail.status_code == 409
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_configured_root_windows_junction_fails_closed(tmp_path: Path) -> None:
+    outside_root = tmp_path / "junction-target"
+    outside_root.mkdir()
+    _make_comparison_pack(outside_root)
+    junction = tmp_path / "comparison-junction"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside_root)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("This Windows environment cannot create directory junctions")
+    vertical_root = tmp_path / "vertical"
+    training_root = tmp_path / "training"
+    vertical_root.mkdir()
+    training_root.mkdir()
+    settings = RepositorySettings(
+        repository_root=REPOSITORY_ROOT,
+        vertical_slice_root=vertical_root,
+        model_training_root=training_root,
+        default_vertical_slice_run_id=None,
+        unified_comparison_root=junction,
+        default_unified_comparison_run_id=COMPARISON_ID,
+    )
+    try:
+        with _api_client(settings) as client:
+            listing = client.get("/api/v1/unified-comparisons")
+            detail = client.get(f"/api/v1/unified-comparisons/{COMPARISON_ID}")
+        assert listing.status_code == 409
+        assert detail.status_code == 409
+    finally:
+        os.rmdir(junction)
 
 
 def test_resealed_source_digest_contradiction_is_rejected(
@@ -1402,6 +2564,10 @@ def test_executable_model_members_are_rejected_even_when_inventoried(
     assert detail.status_code == 409
 
 
+@pytest.mark.skipif(
+    not artifact_repository_module._SUPPORTS_SECURE_DIR_FD,
+    reason="Unified comparison reads fail closed without secure dir-fd traversal",
+)
 def test_default_is_explicit_and_empty_root_is_not_guessed(tmp_path: Path) -> None:
     comparison_root = tmp_path / "comparisons"
     comparison_root.mkdir()

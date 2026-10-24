@@ -426,7 +426,7 @@ describe("PaisaApiClient response validation", () => {
 
     await expect(client.getHistoricalPrices(RUN_ID)).rejects.toMatchObject({
       kind: "malformed",
-      message: "The PAISA API response contained prohibited local-path data.",
+      message: "The PAISA API response contained prohibited path or model-binary data.",
     });
   });
 
@@ -435,7 +435,7 @@ describe("PaisaApiClient response validation", () => {
     unsafeRun.model_training_run_id = "/srv/paisa/models/model.joblib";
     const safeRun = makeRunListItem();
     safeRun.model_training_run_id =
-      "https://models.example.test/usr/local/share/model.joblib";
+      "https://models.example.test/usr/local/share/model-card.html";
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(makeRunList([unsafeRun])))
@@ -445,7 +445,7 @@ describe("PaisaApiClient response validation", () => {
 
     await expect(client.listRuns()).rejects.toMatchObject({
       kind: "malformed",
-      message: "The PAISA API response contained prohibited local-path data.",
+      message: "The PAISA API response contained prohibited path or model-binary data.",
     });
     await expect(client.listRuns()).resolves.toMatchObject({
       rows: [{ model_training_run_id: safeRun.model_training_run_id }],
@@ -552,11 +552,11 @@ describe("PaisaApiClient response validation", () => {
     });
   });
 
-  it("strips unknown joblib fields and rejects absolute paths in unified responses", async () => {
+  it("strips unknown fields and rejects prohibited paths in unified responses", async () => {
     const data = makeUnifiedComparisonData();
-    const withUnknownBinary = {
+    const withUnknownField = {
       ...data.detail,
-      model_binary: "models/private.joblib",
+      internal_note: "redacted metadata",
     };
     const withAbsolutePath = {
       ...data.detail,
@@ -564,16 +564,57 @@ describe("PaisaApiClient response validation", () => {
     };
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(withUnknownBinary))
+      .mockResolvedValueOnce(jsonResponse(withUnknownField))
       .mockResolvedValueOnce(jsonResponse(withAbsolutePath));
     vi.stubGlobal("fetch", fetchMock);
     const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
 
     const parsed = await client.getUnifiedComparison(COMPARISON_ID);
-    expect(parsed).not.toHaveProperty("model_binary");
+    expect(parsed).not.toHaveProperty("internal_note");
     await expect(client.getUnifiedComparison(COMPARISON_ID)).rejects.toMatchObject({
       kind: "malformed",
-      message: "The PAISA API response contained prohibited local-path data.",
+      message: "The PAISA API response contained prohibited path or model-binary data.",
+    });
+  });
+
+  it.each([
+    "models/private.joblib",
+    "models/private.joblib/metadata",
+    "models\\private.joblib\\metadata",
+    "models/private.joblib.",
+    "models/private.pb",
+    "//server/share/model.keras",
+    "note,/Users/private/report.csv",
+    "note;//server/share/report.csv",
+    "source:file:C:\\private\\report.csv",
+    "See https://example.test/report?source=/Users/private/report.csv",
+    "See https://example.test/report?source=%2FUsers%2Fprivate%2Freport.csv",
+    "See https://example.test/models/private%2Ejoblib",
+  ])("rejects prohibited data in a schema-approved rendered field: %s", async (unsafeText) => {
+    const summary = makeUnifiedComparisonData().summary;
+    summary.limitations = [unsafeText];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(summary)));
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getUnifiedSummary(COMPARISON_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API response contained prohibited path or model-binary data.",
+    });
+  });
+
+  it("allows ordinary profile text in a rendered unified field", async () => {
+    const summary = makeUnifiedComparisonData().summary;
+    summary.limitations = [
+      "profile:academic_research",
+      "See https://models.example.test/usr/local/share/model-card.html",
+      "See wss://models.example.test/usr/local/share/model-card.html",
+      "See ftp://models.example.test/usr/local/share/model-card.html",
+    ];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(summary)));
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.getUnifiedSummary(COMPARISON_ID)).resolves.toMatchObject({
+      limitations: summary.limitations,
     });
   });
 });

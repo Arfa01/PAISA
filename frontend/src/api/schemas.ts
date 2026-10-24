@@ -1,15 +1,28 @@
 import { z } from "zod";
 
+import { containsProhibitedPublicArtifactText } from "./publicText";
+
 const finite = z.number().finite();
 const nullableFinite = finite.nullable();
 const probability = finite.min(0).max(1);
+const nullableProbability = probability.nullable();
+const signedUnit = finite.min(-1).max(1);
+const nullableSignedUnit = signedUnit.nullable();
+const nonNegativeFinite = finite.nonnegative();
+const nullableNonNegativeFinite = nonNegativeFinite.nullable();
 const integer = z.number().int();
 const nonNegativeInteger = integer.nonnegative();
-const text = z.string();
+const text = z.string().refine(
+  (value) => !containsProhibitedPublicArtifactText(value),
+  { message: "public text must not expose local paths or executable model artifacts" },
+);
 const MAX_TABLE_PAGE_SIZE = 1_000;
 const MAX_PRICE_PAGE_SIZE = 5_000;
 const MAX_UNPAGINATED_COLLECTION_SIZE = 1_000;
+const MAX_CLASSIFICATION_COUNT = 10_000_000;
+const CLASSIFICATION_METRIC_TOLERANCE = 1e-9;
 const money = z.string().regex(/^-?\d+\.\d{2}$/);
+const nonNegativeMoney = z.string().regex(/^\d+\.\d{2}$/);
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
@@ -743,18 +756,36 @@ export const unifiedComparisonDetailSchema = z.object({
 
 export const unifiedSourcesSchema = z.object({
   ...unifiedContextShape,
-  sources: z.array(z.object({
-    role: text,
-    artifact_type: text,
-    run_id: text,
-    integrity_root_sha256: sha256,
-    payload_file_count: integer.positive(),
-    integrity_root_derivation: text,
-  })).length(3),
+  sources: z.tuple([
+    z.object({
+      role: z.literal("baseline_training"),
+      artifact_type: z.literal("model_training_run"),
+      run_id: text.regex(/^TRN-[A-Za-z0-9][A-Za-z0-9._-]*$/),
+      integrity_root_sha256: sha256,
+      payload_file_count: integer.positive(),
+      integrity_root_derivation: z.literal("byte_copy"),
+    }),
+    z.object({
+      role: z.literal("baseline_vertical_slice"),
+      artifact_type: z.literal("vertical_slice"),
+      run_id: text.regex(/^VSL-[A-Za-z0-9][A-Za-z0-9._-]*$/),
+      integrity_root_sha256: sha256,
+      payload_file_count: integer.positive(),
+      integrity_root_derivation: z.literal("deterministic_redacted_projection"),
+    }),
+    z.object({
+      role: z.literal("lstm"),
+      artifact_type: z.literal("lstm_price_only_experiment"),
+      run_id: text.regex(/^LSTM-[A-Za-z0-9][A-Za-z0-9._-]*$/),
+      integrity_root_sha256: sha256,
+      payload_file_count: integer.positive(),
+      integrity_root_derivation: z.literal("byte_copy"),
+    }),
+  ]),
   relationships: z.object({
-    vertical_slice_uses_training_run: z.boolean(),
-    lstm_uses_training_run: z.boolean(),
-    lstm_uses_vertical_slice: z.boolean(),
+    vertical_slice_uses_training_run: z.literal(true),
+    lstm_uses_training_run: z.literal(true),
+    lstm_uses_vertical_slice: z.literal(true),
   }),
 });
 
@@ -763,9 +794,9 @@ const unifiedPredictionOutcomeSchema = z.object({
   registered_model_id: text,
   criterion: text,
   scope: text,
-  accuracy: finite,
-  balanced_accuracy: nullableFinite,
-  f1: finite,
+  accuracy: probability,
+  balanced_accuracy: nullableProbability,
+  f1: probability,
 });
 
 const unifiedPortfolioOutcomeSchema = z.object({
@@ -775,19 +806,19 @@ const unifiedPortfolioOutcomeSchema = z.object({
   criterion: text,
   ending_equity: money,
   total_return: finite,
-  maximum_drawdown: finite,
-  fees_paid: money,
+  maximum_drawdown: probability,
+  fees_paid: nonNegativeMoney,
 });
 
 const unifiedBenchmarkOutcomeSchema = z.object({
   initial_equity: money,
   ending_equity: money,
   total_return: finite,
-  maximum_drawdown: finite,
-  volatility: nullableFinite,
+  maximum_drawdown: probability,
+  volatility: nullableNonNegativeFinite,
   sharpe_ratio: nullableFinite,
   number_of_trades: nonNegativeInteger,
-  fees_paid: money,
+  fees_paid: nonNegativeMoney,
 });
 
 export const unifiedSummarySchema = z.object({
@@ -818,34 +849,164 @@ export const unifiedSummarySchema = z.object({
   }),
 });
 
+const classificationCount = nonNegativeInteger.safe().max(MAX_CLASSIFICATION_COUNT);
+const positiveClassificationCount = integer
+  .positive()
+  .safe()
+  .max(MAX_CLASSIFICATION_COUNT);
 const countPair = z.object({
-  "0": nonNegativeInteger,
-  "1": nonNegativeInteger,
+  "0": classificationCount,
+  "1": classificationCount,
 });
 const confusionMatrix = z.tuple([
-  z.tuple([nonNegativeInteger, nonNegativeInteger]),
-  z.tuple([nonNegativeInteger, nonNegativeInteger]),
+  z.tuple([classificationCount, classificationCount]),
+  z.tuple([classificationCount, classificationCount]),
 ]);
 const unifiedPredictionMetricShape = {
   evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
-  row_count: integer.positive(),
-  support: integer.positive(),
-  accuracy: finite,
-  balanced_accuracy: nullableFinite,
-  precision: finite,
-  recall: finite,
-  f1: finite,
-  matthews_corrcoef: nullableFinite,
-  roc_auc: nullableFinite,
-  brier_score: nullableFinite,
-  log_loss: nullableFinite,
-  expected_calibration_error: nullableFinite,
+  row_count: positiveClassificationCount,
+  support: positiveClassificationCount,
+  accuracy: probability,
+  balanced_accuracy: nullableProbability,
+  precision: probability,
+  recall: probability,
+  f1: probability,
+  matthews_corrcoef: nullableSignedUnit,
+  roc_auc: nullableProbability,
+  brier_score: probability,
+  log_loss: nullableNonNegativeFinite,
+  expected_calibration_error: probability,
   selection_eligible: z.boolean(),
   metric_warnings: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
   class_counts: countPair,
   predicted_class_counts: countPair,
   confusion_matrix: confusionMatrix,
 };
+type ReconciledPredictionMetric = {
+  row_count: number;
+  support: number;
+  accuracy: number;
+  balanced_accuracy: number | null;
+  precision: number;
+  recall: number;
+  f1: number;
+  matthews_corrcoef: number | null;
+  roc_auc: number | null;
+  log_loss: number | null;
+  selection_eligible: boolean;
+  metric_warnings: string[];
+  class_counts: { "0": number; "1": number };
+  predicted_class_counts: { "0": number; "1": number };
+  confusion_matrix: [[number, number], [number, number]];
+};
+
+function metricsAreClose(left: number, right: number): boolean {
+  return Math.abs(left - right) <= CLASSIFICATION_METRIC_TOLERANCE * Math.max(
+    1,
+    Math.abs(left),
+    Math.abs(right),
+  );
+}
+
+function reconcilePredictionMetrics(
+  value: ReconciledPredictionMetric,
+  context: z.RefinementCtx,
+): void {
+  const [[trueNegative, falsePositive], [falseNegative, truePositive]] =
+    value.confusion_matrix;
+  if (
+    value.support !== value.row_count ||
+    value.class_counts["0"] + value.class_counts["1"] !== value.row_count ||
+    value.predicted_class_counts["0"] + value.predicted_class_counts["1"] !== value.row_count ||
+    trueNegative + falsePositive + falseNegative + truePositive !== value.row_count ||
+    value.class_counts["0"] !== trueNegative + falsePositive ||
+    value.class_counts["1"] !== falseNegative + truePositive ||
+    value.predicted_class_counts["0"] !== trueNegative + falseNegative ||
+    value.predicted_class_counts["1"] !== falsePositive + truePositive
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "prediction metric counts must reconcile",
+    });
+    return;
+  }
+
+  const actualNegative = trueNegative + falsePositive;
+  const actualPositive = falseNegative + truePositive;
+  const predictedPositive = falsePositive + truePositive;
+  const f1Denominator = 2 * truePositive + falsePositive + falseNegative;
+  const completeClassCoverage = actualNegative > 0 && actualPositive > 0;
+  const matthewsDenominator = Math.sqrt(
+    (truePositive + falsePositive) *
+      (truePositive + falseNegative) *
+      (trueNegative + falsePositive) *
+      (trueNegative + falseNegative),
+  );
+  const expected: Record<
+    "accuracy" | "balanced_accuracy" | "precision" | "recall" | "f1" | "matthews_corrcoef",
+    number | null
+  > = {
+    accuracy: (trueNegative + truePositive) / value.support,
+    balanced_accuracy: completeClassCoverage
+      ? (trueNegative / actualNegative + truePositive / actualPositive) / 2
+      : null,
+    precision: predictedPositive > 0 ? truePositive / predictedPositive : 0,
+    recall: actualPositive > 0 ? truePositive / actualPositive : 0,
+    f1: f1Denominator > 0 ? (2 * truePositive) / f1Denominator : 0,
+    matthews_corrcoef: completeClassCoverage
+      ? matthewsDenominator > 0
+        ? (truePositive * trueNegative - falsePositive * falseNegative) /
+          matthewsDenominator
+        : 0
+      : null,
+  };
+
+  for (const metricName of Object.keys(expected) as Array<keyof typeof expected>) {
+    const reported = value[metricName];
+    const derived = expected[metricName];
+    const agrees = derived === null
+      ? reported === null
+      : reported !== null && metricsAreClose(reported, derived);
+    if (!agrees) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${metricName} must reconcile with the confusion matrix`,
+        path: [metricName],
+      });
+    }
+  }
+
+  if (value.selection_eligible !== completeClassCoverage) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "selection_eligible must equal complete actual-class coverage",
+      path: ["selection_eligible"],
+    });
+  }
+  if (
+    value.metric_warnings.includes("single_class_actuals") !==
+    !completeClassCoverage
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "single_class_actuals warning must match actual-class coverage",
+      path: ["metric_warnings"],
+    });
+  }
+  if (
+    completeClassCoverage
+      ? value.roc_auc === null || value.log_loss === null
+      : value.roc_auc !== null || value.log_loss !== null
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: completeClassCoverage
+        ? "roc_auc and log_loss must be defined with both actual classes"
+        : "roc_auc and log_loss must be null for single-class actuals",
+      path: ["roc_auc"],
+    });
+  }
+}
 const unifiedModelPredictionMetricSchema = z.object({
   competitor_id: unifiedVariant,
   competitor_type: z.literal("model"),
@@ -853,19 +1014,7 @@ const unifiedModelPredictionMetricSchema = z.object({
   algorithm: text,
   configuration_family: text,
   ...unifiedPredictionMetricShape,
-}).superRefine((value, context) => {
-  if (
-    value.support !== value.row_count ||
-    value.class_counts["0"] + value.class_counts["1"] !== value.row_count ||
-    value.predicted_class_counts["0"] + value.predicted_class_counts["1"] !== value.row_count ||
-    value.confusion_matrix.flat().reduce((total, cell) => total + cell, 0) !== value.row_count
-  ) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "prediction metric counts must reconcile",
-    });
-  }
-});
+}).superRefine(reconcilePredictionMetrics);
 const unifiedReferencePredictionMetricSchema = z.object({
   competitor_id: unifiedReferenceBaseline,
   competitor_type: z.literal("reference_baseline"),
@@ -873,7 +1022,7 @@ const unifiedReferencePredictionMetricSchema = z.object({
   algorithm: z.null(),
   configuration_family: z.null(),
   ...unifiedPredictionMetricShape,
-});
+}).superRefine(reconcilePredictionMetrics);
 
 function unifiedMetricsSchema(expectedScope: "validation" | "shared project holdout") {
   return z.object({
@@ -921,16 +1070,16 @@ const unifiedModelPortfolioMetricSchema = z.object({
   initial_equity: money,
   ending_equity: money,
   total_return: finite,
-  maximum_drawdown: finite,
-  volatility: nullableFinite,
+  maximum_drawdown: probability,
+  volatility: nullableNonNegativeFinite,
   sharpe_ratio: nullableFinite,
   number_of_trades: nonNegativeInteger,
-  win_rate: nullableFinite,
+  win_rate: nullableProbability,
   average_gain: money.nullable(),
   average_loss: money.nullable(),
-  turnover: finite,
-  fees_paid: money,
-  time_in_market: finite,
+  turnover: nonNegativeFinite,
+  fees_paid: nonNegativeMoney,
+  time_in_market: probability,
   excess_return_vs_cash_only: finite,
   excess_return_vs_buy_and_hold: finite,
 });
@@ -939,16 +1088,16 @@ const unifiedBenchmarkPortfolioMetricSchema = z.object({
   initial_equity: money,
   ending_equity: money,
   total_return: finite,
-  maximum_drawdown: finite,
-  volatility: nullableFinite,
+  maximum_drawdown: probability,
+  volatility: nullableNonNegativeFinite,
   sharpe_ratio: nullableFinite,
   number_of_trades: nonNegativeInteger,
-  win_rate: nullableFinite,
+  win_rate: nullableProbability,
   average_gain: money.nullable(),
   average_loss: money.nullable(),
-  turnover: finite,
-  fees_paid: money,
-  time_in_market: finite,
+  turnover: nonNegativeFinite,
+  fees_paid: nonNegativeMoney,
+  time_in_market: probability,
   ledger_count: z.literal(6),
 });
 export const unifiedPortfolioMetricsSchema = z.object({
@@ -981,9 +1130,9 @@ const unifiedPredictionRankingRowSchema = z.object({
   rank: integer.positive(),
   competitor_id: unifiedVariant,
   registered_model_id: text,
-  accuracy: finite,
-  balanced_accuracy: nullableFinite,
-  f1: finite,
+  accuracy: probability,
+  balanced_accuracy: nullableProbability,
+  f1: probability,
 });
 export const unifiedPredictionRankingsSchema = z.object({
   ...unifiedContextShape,
@@ -1003,9 +1152,9 @@ const unifiedPortfolioRankingRowSchema = z.object({
   competitor_id: unifiedVariant,
   registered_model_id: text,
   total_return: nullableFinite,
-  maximum_drawdown: nullableFinite,
+  maximum_drawdown: nullableProbability,
   sharpe_ratio: nullableFinite,
-  fees_paid: money.nullable(),
+  fees_paid: nonNegativeMoney.nullable(),
   number_of_trades: nonNegativeInteger.nullable(),
 });
 export const unifiedPortfolioRankingsSchema = z.object({
@@ -1079,7 +1228,7 @@ const unifiedModelConfusionRowSchema = z.object({
   evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
   class_labels: z.tuple([z.literal(0), z.literal(1)]),
   confusion_matrix: confusionMatrix,
-  support: integer.positive(),
+  support: positiveClassificationCount,
 });
 const unifiedReferenceConfusionRowSchema = z.object({
   competitor_id: unifiedReferenceBaseline,
@@ -1088,7 +1237,7 @@ const unifiedReferenceConfusionRowSchema = z.object({
   evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
   class_labels: z.tuple([z.literal(0), z.literal(1)]),
   confusion_matrix: confusionMatrix,
-  support: integer.positive(),
+  support: positiveClassificationCount,
 });
 export const unifiedConfusionMatricesSchema = z.object({
   ...unifiedContextShape,

@@ -966,6 +966,9 @@ def test_path_traversal_attempts_cannot_select_runs_or_experiments(
         "path->/tmp/private",
         "path|/tmp/private",
         "path-/tmp/private",
+        "https://example.test/report?source=/Users/private/report.csv",
+        "https://example.test/report?source=%2FUsers%2Fprivate%2Freport.csv",
+        "https://example.test/models/private%2Ejoblib",
     ],
 )
 def test_response_guard_rejects_all_absolute_local_path_forms(value: str) -> None:
@@ -975,6 +978,8 @@ def test_response_guard_rejects_all_absolute_local_path_forms(value: str) -> Non
 
 def test_response_guard_allows_public_web_urls() -> None:
     _assert_no_absolute_local_paths("See https://example.test/api/v1/results for details")
+    _assert_no_absolute_local_paths("See wss://example.test/usr/local/feed for details")
+    _assert_no_absolute_local_paths("See ftp://example.test/usr/local/report.csv for details")
 
 
 def test_response_guard_scans_mapping_keys() -> None:

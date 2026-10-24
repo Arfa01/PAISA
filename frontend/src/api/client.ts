@@ -1,5 +1,6 @@
 import type { ZodType } from "zod";
 
+import { containsProhibitedPublicArtifactText } from "./publicText";
 import {
   benchmarksSchema,
   drawdownsSchema,
@@ -80,28 +81,6 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
-}
-
-const NETWORK_URL_PATTERN = /\b(?:https?|wss?|ftp):\/\/[^\s"'<>]+/gi;
-const LOCAL_PATH_PATTERNS = [
-  /file:(?:\/\/)?[^\s"'<>]*/i,
-  /(?:^|[\s(`'"=:>])\/(?!\/)[^\s"'<>),;]+/,
-  /(?:^|[\s(`'"=:>])[A-Za-z]:[\\/][^\s"'<>)]*/,
-  /(?:^|[\s(`'"=:>])\\\\[^\\\s"'<>]+\\[^\s"'<>)]*/,
-];
-
-function containsAbsoluteLocalPath(value: unknown): boolean {
-  if (typeof value === "string") {
-    const withoutWebUrls = value.replace(NETWORK_URL_PATTERN, "");
-    return LOCAL_PATH_PATTERNS.some((pattern) => pattern.test(withoutWebUrls));
-  }
-  if (Array.isArray(value)) return value.some(containsAbsoluteLocalPath);
-  if (value && typeof value === "object") {
-    return Object.entries(value).some(
-      ([key, nested]) => containsAbsoluteLocalPath(key) || containsAbsoluteLocalPath(nested),
-    );
-  }
-  return false;
 }
 
 function safeHttpMessage(status: number): string {
@@ -245,9 +224,9 @@ export class PaisaApiClient {
       if (!response.ok) {
         throw new ApiError(safeHttpMessage(response.status), "http", response.status);
       }
-      if (containsAbsoluteLocalPath(payload)) {
+      if (containsProhibitedPublicArtifactText(payload)) {
         throw new ApiError(
-          "The PAISA API response contained prohibited local-path data.",
+          "The PAISA API response contained prohibited path or model-binary data.",
           "malformed",
           response.status,
         );

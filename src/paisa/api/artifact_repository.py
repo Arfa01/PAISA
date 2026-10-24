@@ -17,16 +17,24 @@ import re
 import stat
 import threading
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
+from urllib.parse import unquote, urlsplit
 
+from paisa.api.classification_metrics import validate_confusion_derived_metrics
 from paisa.experiments.artifacts import (
     TrainingRunEvidence,
     validate_training_run_artifacts,
+)
+from paisa.experiments.unified_authority import (
+    AUTHORITATIVE_COMPARISON_MANIFESTS,
+    AUTHORITATIVE_SOURCE_ROOTS,
+    expected_evidence_bindings,
 )
 
 
@@ -43,6 +51,8 @@ _SUPPORTS_SECURE_DIR_FD = (
     hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
     and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.scandir in os.supports_fd
 )
 _MODEL_VARIANTS = ("M-001", "M-002", "M-003", "M-004")
 _UNIFIED_MODEL_VARIANTS = (
@@ -100,6 +110,9 @@ _UNIFIED_EVIDENCE_FILES = {
 }
 _UNIFIED_EXPECTED_FILES = _UNIFIED_AUTHORED_FILES | _UNIFIED_EVIDENCE_FILES
 _UNIFIED_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+_UNIFIED_MAX_CLASSIFICATION_COUNT = 10_000_000
+_UNIFIED_MAX_TREE_ENTRIES = 128
+_UNIFIED_MAX_TREE_DEPTH = 8
 _EXECUTABLE_MODEL_SUFFIXES = {
     ".joblib",
     ".pkl",
@@ -185,6 +198,8 @@ class RepositorySettings:
     default_vertical_slice_run_id: str | None
     unified_comparison_root: Path | None = None
     default_unified_comparison_run_id: str | None = None
+    unified_comparison_source_authority: Mapping[str, Mapping[str, str]] | None = None
+    unified_comparison_manifest_authority: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +218,6 @@ class ValidatedRun:
 @dataclass(frozen=True, slots=True)
 class ValidatedUnifiedComparison:
     comparison_id: str
-    directory: Path
     manifest: dict[str, Any]
     summary: dict[str, Any]
     contract: dict[str, Any]
@@ -213,6 +227,30 @@ class ValidatedUnifiedComparison:
     rankings: dict[str, Any]
     artifact_paths: frozenset[str]
     signature: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(slots=True)
+class _PinnedArtifactTree:
+    """One descriptor-pinned view of a comparison run's regular files."""
+
+    descriptors: dict[str, int]
+    signature: tuple[tuple[Any, ...], ...]
+
+    def close(self) -> None:
+        for descriptor in self.descriptors.values():
+            os.close(descriptor)
+        self.descriptors.clear()
+
+    def read(
+        self, relative: str, *, label: str, max_bytes: int | None = None
+    ) -> bytes:
+        descriptor = self.descriptors.get(relative)
+        if descriptor is None:
+            raise ValueError(f"{label} is missing or has an unsafe path")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return _read_regular_descriptor(
+            descriptor, label=label, max_bytes=max_bytes
+        )
 
 
 def _repository_root() -> Path:
@@ -383,6 +421,175 @@ def _open_regular_bytes_beneath(
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _regular_open_flags() -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_absolute_directory_descriptor(path: Path) -> int:
+    """Open every absolute-path component without following links.
+
+    The returned descriptor pins the selected directory even if a local writer
+    later renames an ancestor.  Platforms without descriptor-relative,
+    no-follow traversal fail closed instead of reverting to check-then-open.
+    """
+
+    if not _SUPPORTS_SECURE_DIR_FD:
+        raise NotImplementedError(
+            "Secure configured-root descriptor traversal is unavailable"
+        )
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute() or not absolute.anchor:
+        raise ValueError("Configured artifact root must be absolute")
+    flags = _directory_open_flags()
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_child_directory_descriptor(parent: int, name: str) -> int:
+    descriptor = os.open(name, _directory_open_flags(), dir_fd=parent)
+    try:
+        metadata = os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError("Artifact path component is not a directory")
+    return descriptor
+
+
+def _signature_record(relative: str, metadata: os.stat_result) -> tuple[Any, ...]:
+    return (
+        relative,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _capture_pinned_artifact_tree(root_descriptor: int) -> _PinnedArtifactTree:
+    """Capture a run tree and retain every regular-file descriptor.
+
+    Names are traversed only relative to already-open directories.  Files are
+    read later through the retained descriptors, so a rename cannot redirect a
+    checksum or JSON read to a different tree.
+    """
+
+    root_metadata = os.fstat(root_descriptor)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("Artifact root must be a directory")
+    records: list[tuple[Any, ...]] = [_signature_record(".", root_metadata)]
+    descriptors: dict[str, int] = {}
+    entry_count = 0
+
+    def visit(directory_descriptor: int, prefix: PurePosixPath) -> None:
+        nonlocal entry_count
+        names: list[str] = []
+        with os.scandir(directory_descriptor) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > _UNIFIED_MAX_TREE_ENTRIES:
+                    raise ValueError(
+                        "Unified comparison artifact tree exceeds the entry limit"
+                    )
+                name = entry.name
+                if not name or "/" in name or name in {".", ".."}:
+                    raise ValueError(
+                        "Artifact tree contains an unsafe entry name"
+                    )
+                names.append(name)
+        for name in sorted(names):
+            relative_path = prefix / name
+            if len(relative_path.parts) > _UNIFIED_MAX_TREE_DEPTH:
+                raise ValueError(
+                    "Unified comparison artifact tree exceeds the depth limit"
+                )
+            relative = relative_path.as_posix()
+            observed = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(observed.st_mode):
+                raise ValueError(
+                    f"Artifact tree contains a symbolic link: {relative}"
+                )
+            if stat.S_ISDIR(observed.st_mode):
+                child = _open_child_directory_descriptor(
+                    directory_descriptor, name
+                )
+                try:
+                    metadata = os.fstat(child)
+                    records.append(_signature_record(relative, metadata))
+                    visit(child, relative_path)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(observed.st_mode):
+                raise ValueError(
+                    f"Artifact tree contains a special file: {relative}"
+                )
+            descriptor = os.open(
+                name, _regular_open_flags(), dir_fd=directory_descriptor
+            )
+            try:
+                metadata = os.fstat(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            if not stat.S_ISREG(metadata.st_mode):
+                os.close(descriptor)
+                raise ValueError(
+                    f"Artifact tree contains a non-regular file: {relative}"
+                )
+            records.append(_signature_record(relative, metadata))
+            descriptors[relative] = descriptor
+
+    try:
+        visit(root_descriptor, PurePosixPath())
+        return _PinnedArtifactTree(
+            descriptors=descriptors,
+            signature=tuple(sorted(records, key=lambda item: item[0])),
+        )
+    except BaseException:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        raise
+
+
+def _descriptor_tree_signature(
+    root_descriptor: int,
+) -> tuple[tuple[Any, ...], ...]:
+    captured = _capture_pinned_artifact_tree(root_descriptor)
+    try:
+        return captured.signature
+    finally:
+        captured.close()
 
 
 def _decode_json(payload: bytes, *, label: str) -> dict[str, Any]:
@@ -702,10 +909,105 @@ def _strict_float(value: Any, *, field: str, nullable: bool = False) -> float | 
     return result
 
 
+def _bounded_float(
+    value: Any,
+    *,
+    field: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    nullable: bool = False,
+) -> float | None:
+    """Validate a finite persisted metric against its semantic domain."""
+
+    result = _strict_float(value, field=field, nullable=nullable)
+    if result is None:
+        return None
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{field} must be greater than or equal to {minimum}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{field} must be less than or equal to {maximum}")
+    return result
+
+
+def _nonnegative_money(
+    value: Any, *, field: str, nullable: bool = False
+) -> str | None:
+    result = _money(value, field=field, nullable=nullable)
+    if result is not None and Decimal(result) < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return result
+
+
+_PUBLIC_NETWORK_URL = re.compile(
+    r"\b(?:https?|wss?|ftp)://[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_PUBLIC_ABSOLUTE_PATH = re.compile(
+    r"(?:"
+    r"(?:^|[^A-Za-z0-9_/])/{1,2}(?=\S)"
+    r"|(?:^|[^A-Za-z0-9_\\])\\\\(?=\S)"
+    r"|(?:^|[^A-Za-z0-9_])[A-Za-z]:[\\/]"
+    r"|(?:^|[^A-Za-z0-9_])file:"
+    r")",
+    re.IGNORECASE,
+)
+_PUBLIC_EXECUTABLE_MODEL_REFERENCE = re.compile(
+    r"\.(?:joblib|pkl|pickle|keras|h5|hdf5|onnx|pt|pth|pb|ckpt|safetensors)"
+    r"(?=$|[^A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _public_url_contains_prohibited_artifact_text(value: str) -> bool:
+    """Inspect URL metadata without treating an ordinary URL path as local."""
+
+    for match in _PUBLIC_NETWORK_URL.finditer(value):
+        parsed = urlsplit(match.group(0))
+        metadata = unquote(f"{parsed.query} {parsed.fragment}")
+        decoded_path = unquote(parsed.path)
+        if (
+            _PUBLIC_ABSOLUTE_PATH.search(metadata)
+            or _PUBLIC_EXECUTABLE_MODEL_REFERENCE.search(metadata)
+            or _PUBLIC_EXECUTABLE_MODEL_REFERENCE.search(decoded_path)
+        ):
+            return True
+    return False
+
+
+def _validate_public_text_tree(value: Any, *, field: str) -> None:
+    """Reject local paths and executable-model references from public text."""
+
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _validate_public_text_tree(child, field=f"{field}.{key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_public_text_tree(child, field=f"{field}[{index}]")
+        return
+    if not isinstance(value, str):
+        return
+    without_network_urls = _PUBLIC_NETWORK_URL.sub("", value)
+    if (
+        _public_url_contains_prohibited_artifact_text(value)
+        or _PUBLIC_ABSOLUTE_PATH.search(without_network_urls)
+    ):
+        raise ValueError(f"{field} must not expose an absolute filesystem path")
+    if _PUBLIC_EXECUTABLE_MODEL_REFERENCE.search(value):
+        raise ValueError(f"{field} must not expose an executable model reference")
+
+
 def _strict_integer(value: Any, *, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be a JSON integer")
     return value
+
+
+def _nonnegative_integer(value: Any, *, field: str) -> int:
+    result = _strict_integer(value, field=field)
+    if result < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return result
 
 
 def _string_array(value: Any, *, field: str) -> list[str]:
@@ -765,11 +1067,99 @@ def _parse_unified_inventory(
     return tuple(parsed)
 
 
+def _frozen_unified_source_authority(
+    configured: Mapping[str, Mapping[str, str]] | None,
+) -> Mapping[str, Mapping[str, str]]:
+    raw_authority: object = (
+        AUTHORITATIVE_SOURCE_ROOTS if configured is None else configured
+    )
+    if not isinstance(raw_authority, Mapping):
+        raise ArtifactIntegrityError(
+            "Unified comparison source authority is malformed"
+        )
+    authority = dict(raw_authority)
+    expected_roles = {
+        "baseline_training",
+        "baseline_vertical_slice",
+        "lstm",
+    }
+    if set(authority) != expected_roles:
+        raise ArtifactIntegrityError(
+            "Unified comparison source authority is incomplete"
+        )
+    normalized: dict[str, Mapping[str, str]] = {}
+    for role in sorted(expected_roles):
+        raw_identity = authority[role]
+        if not isinstance(raw_identity, Mapping):
+            raise ArtifactIntegrityError(
+                "Unified comparison source authority is malformed"
+            )
+        identity = dict(raw_identity)
+        expected_keys = {"run_id", "manifest_sha256"}
+        if role == "baseline_vertical_slice":
+            expected_keys.add("portable_certificate_sha256")
+        if set(identity) != expected_keys:
+            raise ArtifactIntegrityError(
+                "Unified comparison source authority is malformed"
+            )
+        normalized_identity: dict[str, str] = {}
+        for key, value in identity.items():
+            if key == "run_id":
+                normalized_identity[key] = _validate_identifier(
+                    value, field=f"{role} authority run ID"
+                )
+            else:
+                digest = _sha256_string(
+                    value, field=f"{role} authority {key}"
+                )
+                assert digest is not None
+                normalized_identity[key] = digest
+        normalized[role] = MappingProxyType(normalized_identity)
+    return MappingProxyType(normalized)
+
+
+def _frozen_unified_manifest_authority(
+    configured: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    raw_authority: object = (
+        AUTHORITATIVE_COMPARISON_MANIFESTS
+        if configured is None
+        else configured
+    )
+    if not isinstance(raw_authority, Mapping):
+        raise ArtifactIntegrityError(
+            "Unified comparison manifest authority is malformed"
+        )
+    normalized: dict[str, str] = {}
+    for comparison_id, value in dict(raw_authority).items():
+        safe_id = _validate_identifier(
+            comparison_id, field="comparison manifest authority ID"
+        )
+        digest = _sha256_string(
+            value, field=f"{safe_id} authorized manifest SHA-256"
+        )
+        assert digest is not None
+        normalized[safe_id] = digest
+    return MappingProxyType(dict(sorted(normalized.items())))
+
+
 class ArtifactRepository:
     """Validate and project immutable result artifacts into API-safe values."""
 
     def __init__(self, settings: RepositorySettings):
-        self.settings = settings
+        source_authority = _frozen_unified_source_authority(
+            settings.unified_comparison_source_authority
+        )
+        manifest_authority = _frozen_unified_manifest_authority(
+            settings.unified_comparison_manifest_authority
+        )
+        self.settings = replace(
+            settings,
+            unified_comparison_source_authority=source_authority,
+            unified_comparison_manifest_authority=manifest_authority,
+        )
+        self._comparison_source_authority = source_authority
+        self._comparison_manifest_authority = manifest_authority
         self._cache: dict[str, ValidatedRun] = {}
         self._comparison_cache: dict[str, ValidatedUnifiedComparison] = {}
         self._lock = threading.RLock()
@@ -844,7 +1234,7 @@ class ArtifactRepository:
         try:
             vertical_signature = _tree_signature(directory)
             training_signature = _tree_signature(cached.training_evidence.run_directory)
-        except ValueError:
+        except (OSError, ValueError):
             return None
         if (
             vertical_signature == cached.vertical_signature
@@ -2907,64 +3297,107 @@ class ArtifactRepository:
     # manifest/checksum/schema boundary without replaying model metrics or
     # portfolio accounting during a GET request.
 
-    def _comparison_directory(self, comparison_id: str) -> Path:
-        safe_id = _validate_identifier(comparison_id, field="comparison_id")
-        root = self.unified_comparison_root
-        _reject_symlink_path_components(root, label="Unified comparison root")
-        candidate = root / safe_id
-        if candidate.is_symlink():
-            raise ArtifactIntegrityError(
-                "Unified comparison run directory is a symbolic link"
-            )
-        if not candidate.exists():
-            raise RunNotFoundError(
-                f"Unified comparison run '{safe_id}' was not found"
-            )
+    def _open_comparison_root_descriptor(self) -> int:
         try:
-            resolved_root = root.resolve(strict=True)
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(resolved_root)
+            return _open_absolute_directory_descriptor(
+                self.unified_comparison_root
+            )
         except FileNotFoundError as exc:
             raise RunNotFoundError(
-                f"Unified comparison run '{safe_id}' was not found"
+                "Configured unified comparison root was not found"
             ) from exc
-        except ValueError as exc:
+        except (NotImplementedError, OSError, ValueError) as exc:
             raise ArtifactIntegrityError(
-                "Unified comparison run escapes its configured root"
+                "Configured unified comparison root cannot be traversed securely"
             ) from exc
-        if not resolved.is_dir():
-            raise RunNotFoundError(
-                f"Unified comparison run '{safe_id}' was not found"
+
+    @staticmethod
+    def _open_comparison_descriptor(
+        root_descriptor: int, comparison_id: str
+    ) -> int:
+        try:
+            return _open_child_directory_descriptor(
+                root_descriptor, comparison_id
             )
-        return resolved
+        except FileNotFoundError as exc:
+            raise RunNotFoundError(
+                f"Unified comparison run '{comparison_id}' was not found"
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                f"Unified comparison run '{comparison_id}' has an unsafe directory"
+            ) from exc
+
+    def _unified_source_authority(self) -> Mapping[str, Mapping[str, str]]:
+        return self._comparison_source_authority
+
+    @staticmethod
+    def _unified_source_inventory(
+        value: Any,
+        *,
+        field: str,
+        expected_excludes: tuple[str, ...],
+    ) -> dict[str, str]:
+        """Parse one authoritative source inventory without touching its files."""
+
+        inventory = _require_mapping(value, field=field)
+        if set(inventory) != {"algorithm", "root", "excludes", "files"}:
+            raise ValueError(
+                f"{field} must contain exactly algorithm, root, excludes, and files"
+            )
+        if inventory.get("algorithm") != "sha256" or inventory.get("root") != ".":
+            raise ValueError(f"{field} must use SHA-256 relative to the artifact root")
+        if inventory.get("excludes") != list(expected_excludes):
+            raise ValueError(f"{field} has an invalid self-exclusion policy")
+        raw_files = inventory.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise ValueError(f"{field}.files must be a non-empty array")
+        parsed: list[tuple[str, str]] = []
+        for index, raw_entry in enumerate(raw_files):
+            entry = _require_mapping(
+                raw_entry, field=f"{field}.files[{index}]"
+            )
+            if set(entry) != {"path", "sha256"}:
+                raise ValueError(
+                    f"{field}.files[{index}] must contain exactly path and sha256"
+                )
+            relative = _safe_relative_path(
+                entry.get("path"), field=f"{field}.files[{index}].path"
+            )
+            digest = _sha256_string(
+                entry.get("sha256"), field=f"{field}.files[{index}].sha256"
+            )
+            parsed.append((relative, digest))
+        if parsed != sorted(parsed) or len({path for path, _ in parsed}) != len(
+            parsed
+        ):
+            raise ValueError(f"{field}.files must be sorted and duplicate-free")
+        return dict(parsed)
 
     def _cached_comparison(
-        self, comparison_id: str, directory: Path
+        self, comparison_id: str, directory_descriptor: int
     ) -> ValidatedUnifiedComparison | None:
         cached = self._comparison_cache.get(comparison_id)
         if cached is None:
             return None
         try:
-            signature = _tree_signature(directory)
-        except ValueError:
+            signature = _descriptor_tree_signature(directory_descriptor)
+        except (OSError, ValueError):
             return None
         return cached if signature == cached.signature else None
 
     @staticmethod
     def _comparison_json(
-        directory: Path,
+        payloads: Mapping[str, bytes],
         inventory: Mapping[str, str],
         relative: str,
     ) -> dict[str, Any]:
         expected = inventory.get(relative)
         if expected is None:
             raise ValueError(f"Required comparison artifact is not inventoried: {relative}")
-        payload = _open_regular_bytes_beneath(
-            directory,
-            relative,
-            label=f"comparison artifact {relative}",
-            max_bytes=_UNIFIED_MAX_PAYLOAD_BYTES,
-        )
+        payload = payloads.get(relative)
+        if payload is None:
+            raise ValueError(f"Required comparison artifact is missing: {relative}")
         if hashlib.sha256(payload).hexdigest() != expected:
             raise ValueError(f"Unified comparison checksum mismatch: {relative}")
         return _decode_json(payload, label=f"comparison artifact {relative}")
@@ -2978,8 +3411,11 @@ class ArtifactRepository:
             label: _strict_integer(count, field=f"{field}.{label}")
             for label, count in mapping.items()
         }
-        if any(count < 0 for count in result.values()):
-            raise ValueError(f"{field} counts must be non-negative")
+        if any(
+            count < 0 or count > _UNIFIED_MAX_CLASSIFICATION_COUNT
+            for count in result.values()
+        ):
+            raise ValueError(f"{field} counts are outside the supported range")
         return result
 
     @classmethod
@@ -3020,7 +3456,11 @@ class ArtifactRepository:
 
         row_count = _strict_integer(row.get("row_count"), field=f"{field}.row_count")
         support = _strict_integer(row.get("support"), field=f"{field}.support")
-        if row_count <= 0 or support != row_count:
+        if (
+            row_count <= 0
+            or row_count > _UNIFIED_MAX_CLASSIFICATION_COUNT
+            or support != row_count
+        ):
             raise ValueError(f"{field} row count and support must agree and be positive")
         class_counts = cls._count_map(row.get("class_counts"), field=f"{field}.class_counts")
         predicted_counts = cls._count_map(
@@ -3033,18 +3473,33 @@ class ArtifactRepository:
         if (
             not isinstance(raw_matrix, list)
             or len(raw_matrix) != 2
-            or any(not isinstance(matrix_row, list) or len(matrix_row) != 2 for matrix_row in raw_matrix)
+            or any(
+                not isinstance(matrix_row, list) or len(matrix_row) != 2
+                for matrix_row in raw_matrix
+            )
         ):
             raise ValueError(f"{field}.confusion_matrix must be a 2x2 array")
         confusion_matrix = [
             [
-                _strict_integer(cell, field=f"{field}.confusion_matrix[{row_index}][{column_index}]")
+                _strict_integer(
+                    cell,
+                    field=(
+                        f"{field}.confusion_matrix[{row_index}]"
+                        f"[{column_index}]"
+                    ),
+                )
                 for column_index, cell in enumerate(matrix_row)
             ]
             for row_index, matrix_row in enumerate(raw_matrix)
         ]
-        if any(cell < 0 for matrix_row in confusion_matrix for cell in matrix_row):
-            raise ValueError(f"{field}.confusion_matrix must be non-negative")
+        if any(
+            cell < 0 or cell > _UNIFIED_MAX_CLASSIFICATION_COUNT
+            for matrix_row in confusion_matrix
+            for cell in matrix_row
+        ):
+            raise ValueError(
+                f"{field}.confusion_matrix cells are outside the supported range"
+            )
         if sum(cell for matrix_row in confusion_matrix for cell in matrix_row) != row_count:
             raise ValueError(f"{field}.confusion_matrix does not reconcile")
         if [sum(matrix_row) for matrix_row in confusion_matrix] != [
@@ -3057,11 +3512,31 @@ class ArtifactRepository:
             for column in range(2)
         ] != [predicted_counts["0"], predicted_counts["1"]]:
             raise ValueError(f"{field}.confusion_matrix predicted-class counts disagree")
+        if (
+            _strict_integer(row.get("positive_label"), field=f"{field}.positive_label") != 1
+            or _require_string(row.get("average"), field=f"{field}.average") != "binary"
+            or _strict_integer(row.get("zero_division"), field=f"{field}.zero_division") != 0
+        ):
+            raise ValueError(f"{field} classification conventions are invalid")
 
         warnings = _string_array(row.get("metric_warnings"), field=f"{field}.metric_warnings")
         selection_eligible = _boolean(
             row.get("selection_eligible"), field=f"{field}.selection_eligible"
         )
+        complete_class_coverage = all(class_counts[label] > 0 for label in ("0", "1"))
+        if (
+            _boolean(
+                row.get("complete_class_coverage"),
+                field=f"{field}.complete_class_coverage",
+            )
+            is not complete_class_coverage
+            or row.get("observed_classes")
+            != [int(label) for label in ("0", "1") if class_counts[label] > 0]
+            or selection_eligible is not complete_class_coverage
+            or ("single_class_actuals" in warnings)
+            != (not complete_class_coverage)
+        ):
+            raise ValueError(f"{field} class-coverage semantics are inconsistent")
         normalized = {
             "competitor_id": competitor_id,
             "competitor_type": competitor_type,
@@ -3075,33 +3550,56 @@ class ArtifactRepository:
             ),
             "row_count": row_count,
             "support": support,
-            "accuracy": _strict_float(row.get("accuracy"), field=f"{field}.accuracy"),
-            "balanced_accuracy": _strict_float(
+            "accuracy": _bounded_float(
+                row.get("accuracy"), field=f"{field}.accuracy", minimum=0.0, maximum=1.0
+            ),
+            "balanced_accuracy": _bounded_float(
                 row.get("balanced_accuracy"),
                 field=f"{field}.balanced_accuracy",
+                minimum=0.0,
+                maximum=1.0,
                 nullable=True,
             ),
-            "precision": _strict_float(row.get("precision"), field=f"{field}.precision"),
-            "recall": _strict_float(row.get("recall"), field=f"{field}.recall"),
-            "f1": _strict_float(row.get("f1"), field=f"{field}.f1"),
-            "matthews_corrcoef": _strict_float(
+            "precision": _bounded_float(
+                row.get("precision"), field=f"{field}.precision", minimum=0.0, maximum=1.0
+            ),
+            "recall": _bounded_float(
+                row.get("recall"), field=f"{field}.recall", minimum=0.0, maximum=1.0
+            ),
+            "f1": _bounded_float(
+                row.get("f1"), field=f"{field}.f1", minimum=0.0, maximum=1.0
+            ),
+            "matthews_corrcoef": _bounded_float(
                 row.get("matthews_corrcoef"),
                 field=f"{field}.matthews_corrcoef",
+                minimum=-1.0,
+                maximum=1.0,
                 nullable=True,
             ),
-            "roc_auc": _strict_float(
-                row.get("roc_auc"), field=f"{field}.roc_auc", nullable=True
+            "roc_auc": _bounded_float(
+                row.get("roc_auc"),
+                field=f"{field}.roc_auc",
+                minimum=0.0,
+                maximum=1.0,
+                nullable=True,
             ),
-            "brier_score": _strict_float(
-                row.get("brier_score"), field=f"{field}.brier_score", nullable=True
+            "brier_score": _bounded_float(
+                row.get("brier_score"),
+                field=f"{field}.brier_score",
+                minimum=0.0,
+                maximum=1.0,
             ),
-            "log_loss": _strict_float(
-                row.get("log_loss"), field=f"{field}.log_loss", nullable=True
+            "log_loss": _bounded_float(
+                row.get("log_loss"),
+                field=f"{field}.log_loss",
+                minimum=0.0,
+                nullable=True,
             ),
-            "expected_calibration_error": _strict_float(
+            "expected_calibration_error": _bounded_float(
                 row.get("expected_calibration_error"),
                 field=f"{field}.expected_calibration_error",
-                nullable=True,
+                minimum=0.0,
+                maximum=1.0,
             ),
             "selection_eligible": selection_eligible,
             "metric_warnings": warnings,
@@ -3109,6 +3607,20 @@ class ArtifactRepository:
             "predicted_class_counts": predicted_counts,
             "confusion_matrix": confusion_matrix,
         }
+        validate_confusion_derived_metrics(
+            normalized,
+            confusion_matrix,
+            field=field,
+        )
+        if complete_class_coverage:
+            if normalized["roc_auc"] is None or normalized["log_loss"] is None:
+                raise ValueError(
+                    f"{field} ROC AUC and log loss must be defined with both actual classes"
+                )
+        elif normalized["roc_auc"] is not None or normalized["log_loss"] is not None:
+            raise ValueError(
+                f"{field} ROC AUC and log loss must be null for single-class actuals"
+            )
         return normalized
 
     @staticmethod
@@ -3126,23 +3638,44 @@ class ArtifactRepository:
             "initial_equity": _money(row.get("initial_equity"), field=f"{field}.initial_equity"),
             "ending_equity": _money(row.get("ending_equity"), field=f"{field}.ending_equity"),
             "total_return": _strict_float(row.get("total_return"), field=f"{field}.total_return"),
-            "maximum_drawdown": _strict_float(
-                row.get("maximum_drawdown"), field=f"{field}.maximum_drawdown"
+            "maximum_drawdown": _bounded_float(
+                row.get("maximum_drawdown"),
+                field=f"{field}.maximum_drawdown",
+                minimum=0.0,
+                maximum=1.0,
             ),
-            "volatility": _strict_float(row.get("volatility"), field=f"{field}.volatility", nullable=True),
+            "volatility": _bounded_float(
+                row.get("volatility"),
+                field=f"{field}.volatility",
+                minimum=0.0,
+                nullable=True,
+            ),
             "sharpe_ratio": _strict_float(
                 row.get("sharpe_ratio"), field=f"{field}.sharpe_ratio", nullable=True
             ),
-            "number_of_trades": _strict_integer(
+            "number_of_trades": _nonnegative_integer(
                 row.get("number_of_trades"), field=f"{field}.number_of_trades"
             ),
-            "win_rate": _strict_float(row.get("win_rate"), field=f"{field}.win_rate", nullable=True),
+            "win_rate": _bounded_float(
+                row.get("win_rate"),
+                field=f"{field}.win_rate",
+                minimum=0.0,
+                maximum=1.0,
+                nullable=True,
+            ),
             "average_gain": _money(row.get("average_gain"), field=f"{field}.average_gain", nullable=True),
             "average_loss": _money(row.get("average_loss"), field=f"{field}.average_loss", nullable=True),
-            "turnover": _strict_float(row.get("turnover"), field=f"{field}.turnover"),
-            "fees_paid": _money(row.get("fees_paid"), field=f"{field}.fees_paid"),
-            "time_in_market": _strict_float(
-                row.get("time_in_market"), field=f"{field}.time_in_market"
+            "turnover": _bounded_float(
+                row.get("turnover"), field=f"{field}.turnover", minimum=0.0
+            ),
+            "fees_paid": _nonnegative_money(
+                row.get("fees_paid"), field=f"{field}.fees_paid"
+            ),
+            "time_in_market": _bounded_float(
+                row.get("time_in_market"),
+                field=f"{field}.time_in_market",
+                minimum=0.0,
+                maximum=1.0,
             ),
             "excess_return_vs_cash_only": _strict_float(
                 row.get("excess_return_vs_cash_only"),
@@ -3244,23 +3777,44 @@ class ArtifactRepository:
             "initial_equity": _money(row.get("initial_equity"), field=f"{field}.initial_equity"),
             "ending_equity": _money(row.get("ending_equity"), field=f"{field}.ending_equity"),
             "total_return": _strict_float(row.get("total_return"), field=f"{field}.total_return"),
-            "maximum_drawdown": _strict_float(
-                row.get("maximum_drawdown"), field=f"{field}.maximum_drawdown"
+            "maximum_drawdown": _bounded_float(
+                row.get("maximum_drawdown"),
+                field=f"{field}.maximum_drawdown",
+                minimum=0.0,
+                maximum=1.0,
             ),
-            "volatility": _strict_float(row.get("volatility"), field=f"{field}.volatility", nullable=True),
+            "volatility": _bounded_float(
+                row.get("volatility"),
+                field=f"{field}.volatility",
+                minimum=0.0,
+                nullable=True,
+            ),
             "sharpe_ratio": _strict_float(
                 row.get("sharpe_ratio"), field=f"{field}.sharpe_ratio", nullable=True
             ),
-            "number_of_trades": _strict_integer(
+            "number_of_trades": _nonnegative_integer(
                 row.get("number_of_trades"), field=f"{field}.number_of_trades"
             ),
-            "win_rate": _strict_float(row.get("win_rate"), field=f"{field}.win_rate", nullable=True),
+            "win_rate": _bounded_float(
+                row.get("win_rate"),
+                field=f"{field}.win_rate",
+                minimum=0.0,
+                maximum=1.0,
+                nullable=True,
+            ),
             "average_gain": _money(row.get("average_gain"), field=f"{field}.average_gain", nullable=True),
             "average_loss": _money(row.get("average_loss"), field=f"{field}.average_loss", nullable=True),
-            "turnover": _strict_float(row.get("turnover"), field=f"{field}.turnover"),
-            "fees_paid": _money(row.get("fees_paid"), field=f"{field}.fees_paid"),
-            "time_in_market": _strict_float(
-                row.get("time_in_market"), field=f"{field}.time_in_market"
+            "turnover": _bounded_float(
+                row.get("turnover"), field=f"{field}.turnover", minimum=0.0
+            ),
+            "fees_paid": _nonnegative_money(
+                row.get("fees_paid"), field=f"{field}.fees_paid"
+            ),
+            "time_in_market": _bounded_float(
+                row.get("time_in_market"),
+                field=f"{field}.time_in_market",
+                minimum=0.0,
+                maximum=1.0,
             ),
             "ledger_count": len(provenance),
         }
@@ -3434,13 +3988,25 @@ class ArtifactRepository:
                     "rank": rank,
                     "competitor_id": competitor,
                     "registered_model_id": registered,
-                    "accuracy": _strict_float(row.get("accuracy"), field=f"{field}[{index}].accuracy"),
-                    "balanced_accuracy": _strict_float(
+                    "accuracy": _bounded_float(
+                        row.get("accuracy"),
+                        field=f"{field}[{index}].accuracy",
+                        minimum=0.0,
+                        maximum=1.0,
+                    ),
+                    "balanced_accuracy": _bounded_float(
                         row.get("balanced_accuracy"),
                         field=f"{field}[{index}].balanced_accuracy",
+                        minimum=0.0,
+                        maximum=1.0,
                         nullable=True,
                     ),
-                    "f1": _strict_float(row.get("f1"), field=f"{field}[{index}].f1"),
+                    "f1": _bounded_float(
+                        row.get("f1"),
+                        field=f"{field}[{index}].f1",
+                        minimum=0.0,
+                        maximum=1.0,
+                    ),
                 }
             )
         if [row["rank"] for row in rows] != list(range(1, len(rows) + 1)):
@@ -3511,15 +4077,26 @@ class ArtifactRepository:
             }
             for metric in ("total_return", "maximum_drawdown", "sharpe_ratio"):
                 if metric in row:
-                    result[metric] = _strict_float(
-                        row.get(metric), field=f"{field}[{index}].{metric}", nullable=True
-                    )
+                    if metric == "maximum_drawdown":
+                        result[metric] = _bounded_float(
+                            row.get(metric),
+                            field=f"{field}[{index}].{metric}",
+                            minimum=0.0,
+                            maximum=1.0,
+                            nullable=True,
+                        )
+                    else:
+                        result[metric] = _strict_float(
+                            row.get(metric),
+                            field=f"{field}[{index}].{metric}",
+                            nullable=True,
+                        )
             if "fees_paid" in row:
-                result["fees_paid"] = _money(
+                result["fees_paid"] = _nonnegative_money(
                     row.get("fees_paid"), field=f"{field}[{index}].fees_paid"
                 )
             if "number_of_trades" in row:
-                result["number_of_trades"] = _strict_integer(
+                result["number_of_trades"] = _nonnegative_integer(
                     row.get("number_of_trades"),
                     field=f"{field}[{index}].number_of_trades",
                 )
@@ -3722,27 +4299,66 @@ class ArtifactRepository:
         )
 
     def _validate_unified_comparison(
-        self, comparison_id: str
+        self,
+        comparison_id: str,
+        *,
+        root_descriptor: int | None = None,
     ) -> ValidatedUnifiedComparison:
         safe_id = _validate_identifier(comparison_id, field="comparison_id")
-        directory = self._comparison_directory(safe_id)
+        owned_root: int | None = None
+        if root_descriptor is None:
+            owned_root = self._open_comparison_root_descriptor()
+            root_descriptor = owned_root
+        try:
+            directory_descriptor = self._open_comparison_descriptor(
+                root_descriptor, safe_id
+            )
+        except BaseException:
+            if owned_root is not None:
+                os.close(owned_root)
+            raise
+        try:
+            return self._validate_unified_comparison_descriptor(
+                safe_id, directory_descriptor
+            )
+        finally:
+            os.close(directory_descriptor)
+            if owned_root is not None:
+                os.close(owned_root)
+
+    def _validate_unified_comparison_descriptor(
+        self, safe_id: str, directory_descriptor: int
+    ) -> ValidatedUnifiedComparison:
         with self._lock:
-            cached = self._cached_comparison(safe_id, directory)
+            cached = self._cached_comparison(safe_id, directory_descriptor)
             if cached is not None:
                 return cached
+            captured: _PinnedArtifactTree | None = None
             try:
-                signature_before = _tree_signature(directory)
-                manifest_path = directory / "manifest.json"
-                if not manifest_path.is_file():
+                captured = _capture_pinned_artifact_tree(directory_descriptor)
+                signature_before = captured.signature
+                if "manifest.json" not in captured.descriptors:
                     raise RunNotCompletedError(
                         f"Unified comparison run '{safe_id}' has no completed manifest"
                     )
-                manifest_payload = _open_regular_bytes_beneath(
-                    directory,
+                manifest_payload = captured.read(
                     "manifest.json",
                     label="unified comparison manifest",
                     max_bytes=_UNIFIED_MAX_PAYLOAD_BYTES,
                 )
+                expected_manifest_digest = (
+                    self._comparison_manifest_authority.get(safe_id)
+                )
+                observed_manifest_digest = hashlib.sha256(
+                    manifest_payload
+                ).hexdigest()
+                if (
+                    expected_manifest_digest is None
+                    or observed_manifest_digest != expected_manifest_digest
+                ):
+                    raise ValueError(
+                        "Unified comparison manifest is not authorized"
+                    )
                 manifest = _decode_json(
                     manifest_payload, label="unified comparison manifest"
                 )
@@ -3773,20 +4389,21 @@ class ArtifactRepository:
 
                 parsed_inventory = _parse_unified_inventory(manifest)
                 inventory = dict(parsed_inventory)
-                actual = _regular_payload_files(directory)
-                if set(actual) != set(inventory):
+                actual = set(captured.descriptors) - {"manifest.json"}
+                if actual != set(inventory):
                     raise ValueError("Unified comparison artifact set does not match its manifest")
                 payload_bytes = len(manifest_payload)
+                payloads: dict[str, bytes] = {}
                 for relative, expected_digest in parsed_inventory:
                     remaining_bytes = _UNIFIED_MAX_PAYLOAD_BYTES - payload_bytes
                     if remaining_bytes < 0:
                         raise ValueError("Unified comparison pack exceeds the size limit")
-                    payload = _open_regular_bytes_beneath(
-                        directory,
+                    payload = captured.read(
                         relative,
                         label=f"comparison artifact {relative}",
                         max_bytes=remaining_bytes,
                     )
+                    payloads[relative] = payload
                     payload_bytes += len(payload)
                     if payload_bytes > _UNIFIED_MAX_PAYLOAD_BYTES:
                         raise ValueError("Unified comparison pack exceeds the size limit")
@@ -3799,12 +4416,12 @@ class ArtifactRepository:
                             f"Unified comparison artifact is not UTF-8 text: {relative}"
                         ) from exc
 
-                summary = self._comparison_json(directory, inventory, "final_summary.json")
-                contract = self._comparison_json(directory, inventory, "comparison_contract.json")
-                sources = self._comparison_json(directory, inventory, "source_roots.json")
-                date_alignment = self._comparison_json(directory, inventory, "date_alignment.json")
-                metrics = self._comparison_json(directory, inventory, "metrics.json")
-                rankings = self._comparison_json(directory, inventory, "rankings.json")
+                summary = self._comparison_json(payloads, inventory, "final_summary.json")
+                contract = self._comparison_json(payloads, inventory, "comparison_contract.json")
+                sources = self._comparison_json(payloads, inventory, "source_roots.json")
+                date_alignment = self._comparison_json(payloads, inventory, "date_alignment.json")
+                metrics = self._comparison_json(payloads, inventory, "metrics.json")
+                rankings = self._comparison_json(payloads, inventory, "rankings.json")
 
                 for name, payload in (
                     ("final_summary.json", summary),
@@ -4072,9 +4689,12 @@ class ArtifactRepository:
                     ),
                     "lstm": "evidence/source_manifests/lstm_run_manifest.json",
                 }
+                source_authority = self._unified_source_authority()
                 observed_roles: list[str] = []
                 sources_by_role: dict[str, dict[str, Any]] = {}
                 copied_manifests: dict[str, dict[str, Any]] = {}
+                source_inventory_maps: dict[str, dict[str, str]] = {}
+                source_payload_inventories: dict[str, dict[str, str]] = {}
                 for index, raw_source in enumerate(source_rows):
                     source = _require_mapping(raw_source, field=f"sources[{index}]")
                     if set(source) != {
@@ -4098,7 +4718,7 @@ class ArtifactRepository:
                     )
                     if artifact_type != expected_source_types.get(role):
                         raise ValueError("Source role and artifact type disagree")
-                    _validate_identifier(
+                    source_run_id = _validate_identifier(
                         _require_string(source.get("run_id"), field=f"sources[{index}].run_id"),
                         field=f"sources[{index}].run_id",
                     )
@@ -4124,6 +4744,20 @@ class ArtifactRepository:
                     )
                     if inventory.get(packed_path) != packed_digest:
                         raise ValueError("Source integrity root is not checksum-bound by the pack")
+                    expected_identity = source_authority.get(role)
+                    if (
+                        expected_identity is None
+                        or source_run_id != expected_identity["run_id"]
+                        or root_digest != expected_identity["manifest_sha256"]
+                        or (
+                            role == "baseline_vertical_slice"
+                            and packed_digest
+                            != expected_identity["portable_certificate_sha256"]
+                        )
+                    ):
+                        raise ValueError(
+                            f"Authoritative source binding mismatch for {role}"
+                        )
                     payload_file_count = _strict_integer(
                         source.get("payload_file_count"),
                         field=f"sources[{index}].payload_file_count",
@@ -4143,7 +4777,7 @@ class ArtifactRepository:
                     integrity_evidence: dict[str, Any]
                     if derivation == "byte_copy":
                         copied_manifest = self._comparison_json(
-                            directory, inventory, packed_path
+                            payloads, inventory, packed_path
                         )
                         if (
                             copied_manifest.get("schema_version") != SCHEMA_VERSION
@@ -4193,7 +4827,7 @@ class ArtifactRepository:
                                 )
                     if derivation == "deterministic_redacted_projection":
                         certificate = self._comparison_json(
-                            directory, inventory, packed_path
+                            payloads, inventory, packed_path
                         )
                         certificate_source = _require_mapping(
                             certificate.get("source_manifest"),
@@ -4214,24 +4848,97 @@ class ArtifactRepository:
                             raise ValueError(
                                 "Redacted source integrity certificate is invalid"
                             )
+                        if (
+                            set(certificate)
+                            != {
+                                "schema_version",
+                                "artifact_type",
+                                "source_role",
+                                "run_id",
+                                "source_manifest",
+                                "projection_policy",
+                                "raw_manifest_included",
+                                "source_assertions",
+                                "artifact_inventory",
+                                "disclaimer",
+                            }
+                            or certificate.get("schema_version") != SCHEMA_VERSION
+                            or certificate.get("projection_policy")
+                            != "allowlisted_fields_v1"
+                            or certificate.get("disclaimer") != ACADEMIC_DISCLAIMER
+                            or certificate.get("source_assertions")
+                            != {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "PASS",
+                                "symbol": "OGDC",
+                                "model_training_run_id": source_authority[
+                                    "baseline_training"
+                                ]["run_id"],
+                                "registered_model_ids": {
+                                    variant: model_ids[variant]
+                                    for variant in _UNIFIED_MODEL_VARIANTS[:4]
+                                },
+                                "disclaimer": ACADEMIC_DISCLAIMER,
+                            }
+                        ):
+                            raise ValueError(
+                                "Redacted source integrity certificate assertions are invalid"
+                            )
                         integrity_evidence = certificate
-                    source_inventory = _require_mapping(
+                    source_inventory = self._unified_source_inventory(
                         integrity_evidence.get("artifact_inventory"),
                         field=f"sources[{index}] integrity artifact_inventory",
+                        expected_excludes=(
+                            ("manifest.json",)
+                            if role == "baseline_vertical_slice"
+                            else ("run_manifest.json",)
+                        ),
                     )
-                    source_inventory_files = source_inventory.get("files")
-                    if (
-                        not isinstance(source_inventory_files, list)
-                        or len(source_inventory_files) != payload_file_count
-                    ):
+                    if len(source_inventory) != payload_file_count:
                         raise ValueError(
                             "Source payload_file_count disagrees with integrity evidence"
                         )
-                if set(observed_roles) != expected_roles or len(set(observed_roles)) != 3:
+                    source_payload_inventories[role] = source_inventory
+                    source_inventory_maps[role] = {
+                        integrity_root_name: root_digest,
+                        **source_inventory,
+                    }
+                if observed_roles != [
+                    "baseline_training",
+                    "baseline_vertical_slice",
+                    "lstm",
+                ]:
                     raise ValueError("Source roles are incomplete or duplicated")
                 lstm_manifest = copied_manifests.get("lstm")
                 if lstm_manifest is None:
                     raise ValueError("LSTM source manifest evidence is missing")
+                lstm_artifact_manifest_path = (
+                    "evidence/source_manifests/lstm_artifact_manifest.json"
+                )
+                lstm_artifact_manifest = self._comparison_json(
+                    payloads, inventory, lstm_artifact_manifest_path
+                )
+                lstm_nested_inventory = self._unified_source_inventory(
+                    lstm_artifact_manifest,
+                    field="Copied LSTM artifact inventory",
+                    expected_excludes=("artifact_manifest.json", "run_manifest.json"),
+                )
+                lstm_root_inventory = source_payload_inventories.get("lstm")
+                if lstm_root_inventory is None:
+                    raise ValueError("LSTM source inventory evidence is missing")
+                if (
+                    lstm_root_inventory.get("artifact_manifest.json")
+                    != inventory.get(lstm_artifact_manifest_path)
+                    or lstm_nested_inventory
+                    != {
+                        relative: digest
+                        for relative, digest in lstm_root_inventory.items()
+                        if relative != "artifact_manifest.json"
+                    }
+                ):
+                    raise ValueError(
+                        "Copied LSTM nested and root inventories disagree"
+                    )
                 for reference_key, expected_role in (
                     ("baseline_training_run", "baseline_training"),
                     ("baseline_vertical_slice", "baseline_vertical_slice"),
@@ -4263,10 +4970,13 @@ class ArtifactRepository:
                 evidence_rows = sources.get("evidence_files")
                 if not isinstance(evidence_rows, list):
                     raise ValueError("Source evidence_files must be an array")
-                expected_bindings = _UNIFIED_EVIDENCE_FILES - {
-                    "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
-                }
-                observed_bindings: list[str] = []
+                expected_bindings = expected_evidence_bindings(
+                    model_ids,
+                    portfolio_files=_UNIFIED_PORTFOLIO_FILES,
+                    source_authority=source_authority,
+                )
+                observed_bindings: dict[str, tuple[str, str, str]] = {}
+                previous_pack_path = ""
                 for index, raw_evidence in enumerate(evidence_rows):
                     evidence = _require_mapping(raw_evidence, field=f"evidence_files[{index}]")
                     if set(evidence) != {
@@ -4283,7 +4993,14 @@ class ArtifactRepository:
                     pack_path = _safe_relative_path(
                         evidence.get("pack_path"), field=f"evidence_files[{index}].pack_path"
                     )
-                    observed_bindings.append(pack_path)
+                    if (
+                        not pack_path.startswith("evidence/")
+                        or pack_path <= previous_pack_path
+                    ):
+                        raise ValueError(
+                            "Evidence pack paths must be sorted, unique, and under evidence/"
+                        )
+                    previous_pack_path = pack_path
                     source_path = _safe_relative_path(
                         evidence.get("source_path"), field=f"evidence_files[{index}].source_path"
                     )
@@ -4292,18 +5009,44 @@ class ArtifactRepository:
                     digest = _sha256_string(
                         evidence.get("sha256"), field=f"evidence_files[{index}].sha256"
                     )
-                    if inventory.get(pack_path) != digest:
-                        raise ValueError("Source evidence checksum disagrees with pack inventory")
-                    if evidence.get("derivation") != "byte_copy":
-                        raise ValueError("Source evidence derivation must be byte_copy")
-                    if evidence.get("source_role") not in expected_roles:
+                    source_role = evidence.get("source_role")
+                    if source_role not in expected_roles:
                         raise ValueError("Source evidence role is invalid")
-                    _require_string(
+                    purpose = _require_string(
                         evidence.get("purpose"),
                         field=f"evidence_files[{index}].purpose",
                     )
-                if set(observed_bindings) != expected_bindings or len(observed_bindings) != len(expected_bindings):
-                    raise ValueError("Source evidence bindings are incomplete or duplicated")
+                    if (
+                        evidence.get("derivation") != "byte_copy"
+                        or inventory.get(pack_path) != digest
+                        or source_inventory_maps[source_role].get(source_path)
+                        != digest
+                    ):
+                        raise ValueError(
+                            f"Source evidence checksum or derivation mismatch: {pack_path}"
+                        )
+                    observed_bindings[pack_path] = (
+                        source_role,
+                        source_path,
+                        purpose,
+                    )
+                if observed_bindings != expected_bindings:
+                    raise ValueError(
+                        "Source evidence bindings are incomplete or inconsistent"
+                    )
+                actual_evidence = {
+                    relative
+                    for relative in inventory
+                    if relative.startswith("evidence/")
+                }
+                if actual_evidence != {
+                    *expected_bindings,
+                    "evidence/source_manifests/"
+                    "baseline_vertical_manifest_certificate.json",
+                }:
+                    raise ValueError(
+                        "Pack evidence files do not match source evidence bindings"
+                    )
 
                 expected_ranking_keys = {
                     "schema_version",
@@ -4750,25 +5493,30 @@ class ArtifactRepository:
                 ):
                     raise ValueError("Buy-and-hold comparison metric is invalid")
 
+                public_artifacts = {
+                    "summary": summary,
+                    "contract": contract,
+                    "sources": sources,
+                    "metrics": metrics,
+                    "rankings": rankings,
+                }
+                _validate_public_text_tree(
+                    public_artifacts, field="unified comparison public text"
+                )
                 prohibited_text = json.dumps(
-                    {
-                        "summary": summary,
-                        "contract": contract,
-                        "sources": sources,
-                        "metrics": metrics,
-                        "rankings": rankings,
-                    },
+                    public_artifacts,
                     sort_keys=True,
                 ).lower()
                 if "universal winner" in prohibited_text or "universal_winner" in prohibited_text:
                     raise ValueError("Unified comparison must not claim a universal winner")
 
-                signature_after = _tree_signature(directory)
+                signature_after = _descriptor_tree_signature(
+                    directory_descriptor
+                )
                 if signature_before != signature_after:
                     raise ValueError("Unified comparison run changed during validation")
                 validated = ValidatedUnifiedComparison(
                     comparison_id=safe_id,
-                    directory=directory,
                     manifest=manifest,
                     summary=summary,
                     contract=contract,
@@ -4793,6 +5541,9 @@ class ArtifactRepository:
                 raise ArtifactIntegrityError(
                     f"Unified comparison run '{safe_id}' failed integrity validation"
                 ) from exc
+            finally:
+                if captured is not None:
+                    captured.close()
 
     def _unified_context(
         self, comparison: ValidatedUnifiedComparison
@@ -4819,43 +5570,57 @@ class ArtifactRepository:
         return _validate_identifier(value, field="default comparison run ID")
 
     def list_completed_unified_comparisons(self) -> list[dict[str, Any]]:
-        root = self.unified_comparison_root
-        if not os.path.lexists(root):
+        try:
+            root_descriptor = self._open_comparison_root_descriptor()
+        except RunNotFoundError:
             return []
-        _reject_symlink_path_components(root, label="Unified comparison root")
-        if not root.is_dir():
-            raise ArtifactIntegrityError(
-                "Configured unified comparison root is not a directory"
-            )
-        default_id = self.configured_default_unified_comparison_id()
-        rows: list[dict[str, Any]] = []
-        for candidate in sorted(root.iterdir(), key=lambda item: item.name):
-            if candidate.is_symlink() or not candidate.is_dir():
-                continue
+        try:
             try:
-                comparison = self._validate_unified_comparison(candidate.name)
-                context = self._unified_context(comparison)
-                alignment = self.load_unified_common_date_contract(
-                    comparison.comparison_id
+                with os.scandir(root_descriptor) as entries:
+                    names = sorted(entry.name for entry in entries)
+            except OSError as exc:
+                raise ArtifactIntegrityError(
+                    "Configured unified comparison root cannot be enumerated securely"
+                ) from exc
+            default_id = self.configured_default_unified_comparison_id()
+            rows: list[dict[str, Any]] = []
+            for name in names:
+                try:
+                    _validate_identifier(name, field="comparison_id")
+                    metadata = os.stat(
+                        name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        continue
+                    comparison = self._validate_unified_comparison(
+                        name, root_descriptor=root_descriptor
+                    )
+                    context = self._unified_context(comparison)
+                    alignment = self._unified_common_date_contract_from(
+                        comparison
+                    )
+                except (ArtifactRepositoryError, OSError, TypeError, ValueError):
+                    continue
+                rows.append(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "comparison_id": comparison.comparison_id,
+                        "status": "PASS",
+                        "symbol": context["symbol"],
+                        "model_count": len(_UNIFIED_MODEL_VARIANTS),
+                        "validation_count": alignment["validation"]["common_count"],
+                        "shared_holdout_count": alignment["shared_project_holdout"]["common_count"],
+                        "shared_holdout_target_start": alignment["shared_project_holdout"]["target_start"],
+                        "shared_holdout_target_end": alignment["shared_project_holdout"]["target_end"],
+                        "holdout_term": _UNIFIED_HOLDOUT_TERM,
+                        "is_default": comparison.comparison_id == default_id,
+                    }
                 )
-            except (ArtifactRepositoryError, TypeError, ValueError):
-                continue
-            rows.append(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "comparison_id": comparison.comparison_id,
-                    "status": "PASS",
-                    "symbol": context["symbol"],
-                    "model_count": len(_UNIFIED_MODEL_VARIANTS),
-                    "validation_count": alignment["validation"]["common_count"],
-                    "shared_holdout_count": alignment["shared_project_holdout"]["common_count"],
-                    "shared_holdout_target_start": alignment["shared_project_holdout"]["target_start"],
-                    "shared_holdout_target_end": alignment["shared_project_holdout"]["target_end"],
-                    "holdout_term": _UNIFIED_HOLDOUT_TERM,
-                    "is_default": comparison.comparison_id == default_id,
-                }
-            )
-        return rows
+            return rows
+        finally:
+            os.close(root_descriptor)
 
     def load_unified_comparison_detail(self, comparison_id: str) -> dict[str, Any]:
         comparison = self._validate_unified_comparison(comparison_id)
@@ -4869,7 +5634,7 @@ class ArtifactRepository:
             _model_ids,
         ) = self._unified_metric_collections(comparison.metrics)
         models_by_id = {row["competitor_id"]: row for row in validation_models}
-        date_contract = self.load_unified_common_date_contract(comparison_id)
+        date_contract = self._unified_common_date_contract_from(comparison)
         selection = _require_mapping(
             comparison.contract.get("selection_policy"), field="selection_policy"
         )
@@ -4936,13 +5701,25 @@ class ArtifactRepository:
                 ),
                 "criterion": _require_string(raw.get("criterion"), field=f"{name}.criterion"),
                 "scope": _require_string(raw.get("scope"), field=f"{name}.scope"),
-                "accuracy": _strict_float(raw.get("accuracy"), field=f"{name}.accuracy"),
-                "balanced_accuracy": _strict_float(
+                "accuracy": _bounded_float(
+                    raw.get("accuracy"),
+                    field=f"{name}.accuracy",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+                "balanced_accuracy": _bounded_float(
                     raw.get("balanced_accuracy"),
                     field=f"{name}.balanced_accuracy",
+                    minimum=0.0,
+                    maximum=1.0,
                     nullable=True,
                 ),
-                "f1": _strict_float(raw.get("f1"), field=f"{name}.f1"),
+                "f1": _bounded_float(
+                    raw.get("f1"),
+                    field=f"{name}.f1",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
             }
 
         def portfolio(name: str) -> dict[str, Any]:
@@ -4956,10 +5733,15 @@ class ArtifactRepository:
                 "criterion": _require_string(raw.get("criterion"), field=f"{name}.criterion"),
                 "ending_equity": _money(raw.get("ending_equity"), field=f"{name}.ending_equity"),
                 "total_return": _strict_float(raw.get("total_return"), field=f"{name}.total_return"),
-                "maximum_drawdown": _strict_float(
-                    raw.get("maximum_drawdown"), field=f"{name}.maximum_drawdown"
+                "maximum_drawdown": _bounded_float(
+                    raw.get("maximum_drawdown"),
+                    field=f"{name}.maximum_drawdown",
+                    minimum=0.0,
+                    maximum=1.0,
                 ),
-                "fees_paid": _money(raw.get("fees_paid"), field=f"{name}.fees_paid"),
+                "fees_paid": _nonnegative_money(
+                    raw.get("fees_paid"), field=f"{name}.fees_paid"
+                ),
             }
 
         def benchmark(name: str) -> dict[str, Any]:
@@ -4968,19 +5750,27 @@ class ArtifactRepository:
                 "initial_equity": _money(raw.get("initial_equity"), field=f"{name}.initial_equity"),
                 "ending_equity": _money(raw.get("ending_equity"), field=f"{name}.ending_equity"),
                 "total_return": _strict_float(raw.get("total_return"), field=f"{name}.total_return"),
-                "maximum_drawdown": _strict_float(
-                    raw.get("maximum_drawdown"), field=f"{name}.maximum_drawdown"
+                "maximum_drawdown": _bounded_float(
+                    raw.get("maximum_drawdown"),
+                    field=f"{name}.maximum_drawdown",
+                    minimum=0.0,
+                    maximum=1.0,
                 ),
-                "volatility": _strict_float(
-                    raw.get("volatility"), field=f"{name}.volatility", nullable=True
+                "volatility": _bounded_float(
+                    raw.get("volatility"),
+                    field=f"{name}.volatility",
+                    minimum=0.0,
+                    nullable=True,
                 ),
                 "sharpe_ratio": _strict_float(
                     raw.get("sharpe_ratio"), field=f"{name}.sharpe_ratio", nullable=True
                 ),
-                "number_of_trades": _strict_integer(
+                "number_of_trades": _nonnegative_integer(
                     raw.get("number_of_trades"), field=f"{name}.number_of_trades"
                 ),
-                "fees_paid": _money(raw.get("fees_paid"), field=f"{name}.fees_paid"),
+                "fees_paid": _nonnegative_money(
+                    raw.get("fees_paid"), field=f"{name}.fees_paid"
+                ),
             }
 
         beat_raw = _require_mapping(
@@ -5194,6 +5984,11 @@ class ArtifactRepository:
 
     def load_unified_common_date_contract(self, comparison_id: str) -> dict[str, Any]:
         comparison = self._validate_unified_comparison(comparison_id)
+        return self._unified_common_date_contract_from(comparison)
+
+    def _unified_common_date_contract_from(
+        self, comparison: ValidatedUnifiedComparison
+    ) -> dict[str, Any]:
         validation = self._unified_date_scope(
             comparison.date_alignment.get("validation"),
             field="date_alignment.validation",

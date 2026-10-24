@@ -394,7 +394,7 @@ describe("PAISA dashboard shell", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
-      "The PAISA API response contained prohibited local-path data.",
+      "The PAISA API response contained prohibited path or model-binary data.",
     );
     expect(container).not.toHaveTextContent(unsafePath);
     expect(screen.queryByText(RUN_ID)).not.toBeInTheDocument();

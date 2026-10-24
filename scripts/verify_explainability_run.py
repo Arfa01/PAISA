@@ -51,8 +51,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checksum",
         help=(
-            "ZIP SHA-256 sidecar; required for ZIP input and auto-detected at "
-            "<pack>.sha256 when omitted."
+            "ZIP SHA-256 transport sidecar; required for ZIP input and "
+            "auto-detected at <pack>.sha256 when omitted. A sidecar detects "
+            "corruption but does not authenticate provenance."
+        ),
+    )
+    parser.add_argument(
+        "--expected-manifest-sha256",
+        help=(
+            "Independently obtained SHA-256 of artifact_manifest.json. Official "
+            "allowlisted runs use their committed digest automatically."
+        ),
+    )
+    parser.add_argument(
+        "--require-authenticated",
+        action="store_true",
+        help=(
+            "Fail unless the pack matches a committed official digest or the "
+            "independent digest supplied with --expected-manifest-sha256."
         ),
     )
     parser.add_argument(
@@ -79,7 +95,12 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(command_line)
         from paisa.explainability.tree_shap import verify_explainability_pack
 
-        result = verify_explainability_pack(args.pack, checksum=args.checksum)
+        result = verify_explainability_pack(
+            args.pack,
+            checksum=args.checksum,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+            require_authenticated=args.require_authenticated,
+        )
     except ArgumentParsingError as exc:
         if debug:
             raise

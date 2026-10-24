@@ -635,6 +635,67 @@ def _build_pack(
     return pack
 
 
+def _coherently_reseal_m001_attributions(pack: Path) -> None:
+    frames = {
+        model_id: pd.read_csv(pack / "local_explanations" / f"{model_id}.csv")
+        for model_id in tree_shap.MODEL_ORDER
+    }
+    frame = frames["M-001"]
+    for _, group in frame.groupby("target_date", sort=False):
+        first = group.index[0]
+        last = group.index[-1]
+        for column in (
+            "shap_value",
+            "absolute_contribution_rank",
+            "contribution_direction",
+        ):
+            first_value = frame.at[first, column]
+            frame.at[first, column] = frame.at[last, column]
+            frame.at[last, column] = first_value
+
+    local = pd.concat(
+        [frames[model_id] for model_id in tree_shap.MODEL_ORDER],
+        ignore_index=True,
+    )
+    global_frame = tree_shap.compute_global_importance(local)
+    cross = tree_shap.compute_cross_model_rankings(global_frame)
+    audit = tree_shap._select_audit_rows(local)
+    additivity = tree_shap._additivity_report(local, _explainer_contracts())
+    agreements = tree_shap._rank_agreements(global_frame)
+
+    for model_id in tree_shap.MODEL_ORDER:
+        tree_shap._write_csv(
+            frames[model_id],
+            pack / "local_explanations" / f"{model_id}.csv",
+        )
+        write_json(
+            tree_shap._model_summary(
+                model_id,
+                local=local,
+                global_frame=global_frame,
+                audit=audit,
+                agreements=agreements,
+            ),
+            pack / "summaries" / f"{model_id}.json",
+        )
+    tree_shap._write_csv(global_frame, pack / "global_feature_importance.csv")
+    tree_shap._write_csv(cross, pack / "cross_model_feature_rankings.csv")
+    tree_shap._write_csv(audit, pack / "audit_sample.csv")
+    write_json(additivity, pack / "additivity_report.json")
+    write_json(
+        tree_shap._final_summary(
+            run_id=FIXTURE_RUN_ID,
+            versions=_run_manifest()["package_versions"],
+            global_frame=global_frame,
+            additivity=additivity,
+            audit=audit,
+            agreements=agreements,
+        ),
+        pack / "final_summary.json",
+    )
+    _reseal(pack)
+
+
 def _write_sidecar(zip_path: Path) -> Path:
     digest = sha256_file(zip_path)
     sidecar = zip_path.with_name(f"{zip_path.name}.sha256")
@@ -650,6 +711,24 @@ def _canonical_zip_info(name: str, *, mode: int = 0o600) -> zipfile.ZipInfo:
     return info
 
 
+def _alternate_valid_png() -> bytes:
+    def chunk(name: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + name
+            + data
+            + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
 def test_explainability_dependency_declares_exact_shap_pin():
     requirements = REPOSITORY_ROOT / "requirements-explainability.txt"
     assert requirements.is_file()
@@ -660,6 +739,19 @@ def test_explainability_dependency_declares_exact_shap_pin():
     }
     assert f"shap=={tree_shap.SHAP_PIN}" in declared
     assert tree_shap.SHAP_PIN == "0.54.1"
+
+
+def test_retained_official_pack_has_committed_independent_trust_roots():
+    assert tree_shap.OFFICIAL_EXPLAINABILITY_PACKS[
+        "XAI-20261024-140320-OGDC-tree-v1"
+    ] == {
+        "artifact_manifest_sha256": (
+            "cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda"
+        ),
+        "zip_sha256": (
+            "7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1"
+        ),
+    }
 
 
 def test_runtime_version_gate_fails_closed_on_wrong_shap(monkeypatch):
@@ -807,9 +899,11 @@ def test_positive_class_shap_normalizes_rf_list_and_xgb_2d_outputs():
     ],
     ids=["random-forest", "xgboost"],
 )
-def test_tiny_fitted_tree_models_exercise_probability_and_shape_contract(
+def test_synthetic_normalizer_arrays_reconstruct_fitted_model_probabilities(
     estimator, shape_convention
 ):
+    # This intentionally isolates synthetic normalizer behavior. Real SHAP
+    # estimator integration lives in tests/test_tree_shap_runtime_integration.py.
     features = np.array(
         [
             [0.0, 0.0, 0.0, 0.0],
@@ -1247,6 +1341,7 @@ def test_feature_contract_rejects_declared_and_content_holdout_fingerprint_chang
 
 def test_fixture_only_directory_pack_replays_to_pass(tmp_path):
     pack = _build_pack(tmp_path)
+    manifest_sha256 = sha256_file(pack / "artifact_manifest.json")
     result = _verify_fixture_pack(pack)
     assert result == {
         "status": "PASS",
@@ -1255,13 +1350,148 @@ def test_fixture_only_directory_pack_replays_to_pass(tmp_path):
         "models": list(tree_shap.MODEL_ORDER),
         "row_count_per_model": tree_shap.ROW_COUNT,
         "shap_version": tree_shap.SHAP_PIN,
+        "artifact_manifest_sha256": manifest_sha256,
         "disclaimer": tree_shap.ACADEMIC_DISCLAIMER,
         "pack": FIXTURE_RUN_ID,
         "path_base": "input_parent",
         "checksum_verified": False,
+        "sidecar_checksum_verified": False,
         "zip_sha256": None,
         "verification_scope": "portable_evidence",
+        "integrity_status": "PASS",
+        "authentication_status": "NOT_AUTHENTICATED",
+        "authentication_source": None,
+        "official_artifact": False,
+        "expected_artifact_manifest_sha256": None,
     }
+
+
+def test_independent_manifest_digest_authenticates_directory_and_zip(tmp_path):
+    pack = _build_pack(tmp_path)
+    manifest_sha256 = sha256_file(pack / "artifact_manifest.json")
+
+    directory_result = _verify_fixture_pack(
+        pack,
+        expected_manifest_sha256=manifest_sha256,
+    )
+
+    archive = tmp_path / f"{FIXTURE_RUN_ID}.zip"
+    tree_shap._create_deterministic_zip(pack, archive, run_id=FIXTURE_RUN_ID)
+    _write_sidecar(archive)
+    zip_result = _verify_fixture_pack(
+        archive,
+        expected_manifest_sha256=manifest_sha256,
+        require_authenticated=True,
+    )
+
+    for result in (directory_result, zip_result):
+        assert result["integrity_status"] == "PASS"
+        assert result["authentication_status"] == "AUTHENTICATED"
+        assert (
+            result["authentication_source"]
+            == "caller_supplied_expected_manifest_sha256"
+        )
+        assert result["official_artifact"] is False
+        assert result["artifact_manifest_sha256"] == manifest_sha256
+        assert result["expected_artifact_manifest_sha256"] == manifest_sha256
+    assert directory_result["sidecar_checksum_verified"] is False
+    assert zip_result["sidecar_checksum_verified"] is True
+
+
+def test_authenticated_verification_requires_a_trust_anchor_and_valid_digest(
+    tmp_path,
+):
+    pack = _build_pack(tmp_path)
+
+    with pytest.raises(ValueError, match="independently trusted"):
+        _verify_fixture_pack(pack, require_authenticated=True)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        _verify_fixture_pack(pack, expected_manifest_sha256="A" * 64)
+    with pytest.raises(ValueError, match="trusted digest"):
+        _verify_fixture_pack(pack, expected_manifest_sha256="0" * 64)
+    with pytest.raises(TypeError, match="must be a bool"):
+        _verify_fixture_pack(pack, require_authenticated="false")
+
+
+def test_committed_official_allowlist_authenticates_directory_and_exact_zip(
+    tmp_path, monkeypatch
+):
+    pack = _build_pack(tmp_path)
+    archive = tmp_path / f"{FIXTURE_RUN_ID}.zip"
+    zip_sha256 = tree_shap._create_deterministic_zip(
+        pack, archive, run_id=FIXTURE_RUN_ID
+    )
+    _write_sidecar(archive)
+    manifest_sha256 = sha256_file(pack / "artifact_manifest.json")
+    official = {
+        FIXTURE_RUN_ID: {
+            "artifact_manifest_sha256": manifest_sha256,
+            "zip_sha256": zip_sha256,
+        }
+    }
+    monkeypatch.setattr(tree_shap, "OFFICIAL_EXPLAINABILITY_PACKS", official)
+
+    directory_result = _verify_fixture_pack(pack)
+    zip_result = _verify_fixture_pack(archive, require_authenticated=True)
+    for result in (directory_result, zip_result):
+        assert result["authentication_status"] == "AUTHENTICATED"
+        assert result["authentication_source"] == "committed_official_allowlist"
+        assert result["official_artifact"] is True
+
+    monkeypatch.setattr(
+        tree_shap,
+        "OFFICIAL_EXPLAINABILITY_PACKS",
+        {
+            FIXTURE_RUN_ID: {
+                "artifact_manifest_sha256": manifest_sha256,
+                "zip_sha256": "0" * 64,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="committed official digest"):
+        _verify_fixture_pack(archive)
+
+
+def test_coherent_reseal_remains_internal_only_and_cannot_override_official_digest(
+    tmp_path, monkeypatch
+):
+    pack = _build_pack(tmp_path)
+    original_manifest_sha256 = sha256_file(pack / "artifact_manifest.json")
+    _coherently_reseal_m001_attributions(pack)
+    (pack / "plots" / "M-001-global-importance.png").write_bytes(
+        _alternate_valid_png()
+    )
+    _reseal(pack)
+    resealed_manifest_sha256 = sha256_file(pack / "artifact_manifest.json")
+    assert resealed_manifest_sha256 != original_manifest_sha256
+
+    internal_result = _verify_fixture_pack(pack)
+    assert internal_result["status"] == "PASS"
+    assert internal_result["authentication_status"] == "NOT_AUTHENTICATED"
+
+    with pytest.raises(ValueError, match="trusted digest"):
+        _verify_fixture_pack(
+            pack,
+            expected_manifest_sha256=original_manifest_sha256,
+        )
+
+    monkeypatch.setattr(
+        tree_shap,
+        "OFFICIAL_EXPLAINABILITY_PACKS",
+        {
+            FIXTURE_RUN_ID: {
+                "artifact_manifest_sha256": original_manifest_sha256,
+                "zip_sha256": "0" * 64,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="trusted digest"):
+        _verify_fixture_pack(pack)
+    with pytest.raises(ValueError, match="conflicts with the committed official"):
+        _verify_fixture_pack(
+            pack,
+            expected_manifest_sha256=resealed_manifest_sha256,
+        )
 
 
 def test_verifier_rejects_checksum_tamper_and_resealed_semantic_tamper(tmp_path):
@@ -1544,7 +1774,7 @@ def test_deterministic_zip_bytes_are_reproducible(tmp_path):
 
 
 @pytest.mark.parametrize("placement", ["prepended", "trailing"])
-def test_authenticated_zip_rejects_bytes_outside_the_canonical_archive(
+def test_sidecar_checked_zip_rejects_bytes_outside_the_canonical_archive(
     tmp_path, placement
 ):
     pack = _build_pack(tmp_path)
@@ -1651,7 +1881,7 @@ def test_zip_member_validation_rejects_noncanonical_dos_attributes(tmp_path):
             tree_shap._validated_zip_members(archive)
 
 
-def test_authenticated_zip_rejects_an_unexpected_member(tmp_path):
+def test_sidecar_checked_zip_rejects_an_unexpected_member(tmp_path):
     pack = _build_pack(tmp_path)
     archive_path = tmp_path / f"{FIXTURE_RUN_ID}.zip"
     tree_shap._create_deterministic_zip(

@@ -78,34 +78,50 @@ Use only these restored, checksum-valid source roots:
 - artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02
 - artifacts/vertical_slice/VSL-20261020-OGDC-main-02
 
-Create a separate Python 3.12+ / NumPy 2+ environment and install the exact
-requirements-explainability.txt pin. Confirm `shap==0.54.1` and run `pip check`.
+Create a separate Python 3.12+ / NumPy 2+ environment. Install
+requirements.txt and requirements-explainability.txt together under
+constraints-explainability.txt; the constraints file pins the certified direct
+versions but is not a standalone requirements file or a full hashed lock.
+Confirm `shap==0.54.1`, run `pip check`, and run the real-estimator integration
+test in tests/test_tree_shap_runtime_integration.py.
 Explain only M-001 through M-004 over the exact 184-date shared project
 holdout. Do not explain M-005/M-006, refit preprocessing, weaken additivity,
 load an unverified model path, or modify a source artifact.
 
 Run scripts/run_tree_shap_explainability.py with the three fixed inputs and
 artifacts/explainability as output. Use a fresh immutable XAI ID. Verify both
-the published directory and its ZIP/sidecar with
-scripts/verify_explainability_run.py. Do not commit the generated pack.
+the published directory and its ZIP with
+scripts/verify_explainability_run.py. Preserve the raw artifact_manifest.json
+SHA-256 in a separate trusted record, then supply it as
+--expected-manifest-sha256 together with --require-authenticated. Treat the ZIP
+sidecar only as a transport-corruption check, not a provenance credential. Do
+not commit the generated pack.
 
 The current accepted reference pack is
 XAI-20261024-140320-OGDC-tree-v1, produced from clean commit
 2cd4145e5e01459d13d186a6f3b697e979821a9d. Its exact inventory is 24 files,
-quality is PASS, and ZIP SHA-256 is
+quality is PASS, its independently committed artifact_manifest.json SHA-256 is
+cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda, and its
+ZIP SHA-256 is
 7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1.
-Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
-passed. Verify that pack directly when the task is review or reproduction; a
-new execution must still use a new collision-free ID and must not alter this
+Strict authenticated directory, ZIP, and extracted-directory verification
+passed; the separate ZIP-sidecar transport check also passed. PNG validation
+is structural rather than a rerender from CSV evidence, although the manifest
+trust root binds the accepted plot bytes. A bare internal PASS is not an
+official provenance claim. Verify the accepted pack with
+--require-authenticated when the task is review or reproduction; a new
+execution must still use a new collision-free ID and must not alter this
 reference.
 
 Report the observed run ID, package versions, registered model IDs, output
 space, row/feature counts, maximum and mean additivity errors, top features,
 rank agreements/disagreements, audit categories, quality status, relative
-artifact name, and ZIP SHA-256 directly from the verified pack. If execution
-fails, preserve the source artifacts, report the exact failing gate, and do not
-publish or describe a false PASS. Use model-behavior language only; do not make
-causal, profitability, future-performance, or financial-advice claims.
+artifact name, internal integrity status, authentication status/source,
+manifest SHA-256, sidecar transport status, and ZIP SHA-256 directly from the
+verified pack. If execution fails, preserve the source artifacts, report the
+exact failing gate, and do not publish or describe a false PASS. Use
+model-behavior language only; do not make causal, profitability,
+future-performance, or financial-advice claims.
 For the accepted reference, the expected scope is all M-001--M-004, 184 shared
 holdout rows, 19 transformed features, positive-class probability output, and
 all seven audit categories available for every model. Treat any divergence as

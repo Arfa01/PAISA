@@ -268,18 +268,33 @@ probability output, and 100 evenly spaced rows from the chronological training
 split as background. Every prediction must reconstruct within `5e-5` for
 Random Forest or `1e-6` for XGBoost. Local long-form rows, per-model global
 importance, cross-model ranks, deterministic
-audit examples, manifests, plots, and a portable ZIP are checksum-bound. The
-offline verifier recomputes derived tables without loading a model.
+audit examples, manifests, plots, and a portable ZIP are manifest-inventoried.
+That establishes internal consistency; official provenance additionally
+depends on an independent manifest trust root. The offline verifier recomputes
+derived tables without loading a model.
 
 The accepted local run is `XAI-20261024-140320-OGDC-tree-v1`, produced from
 clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its 24-file quality
 report is `PASS`; the ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
-all passed. The recorded runtime is Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
+Its independently committed `artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`.
+Strict authenticated directory, ZIP, and extracted-directory verification all
+passed; the adjacent ZIP sidecar separately passed as a transport-corruption
+check and is not a provenance credential. An internal `PASS` without
+`authentication_status: AUTHENTICATED` is not an official provenance claim.
+PNG validation is structural rather than a rerender from CSV evidence; the
+authenticated manifest binds the accepted plot bytes.
+
+The recorded runtime is Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
 scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP
-0.54.1. The separate environment preserves the default Python 3.10+ support
-claim.
+0.54.1. `constraints-explainability.txt` pins those certified direct versions
+for installation alongside both requirements files; it is not a standalone or
+fully hashed lock. A dedicated Python 3.13.7 CI job runs real Tree SHAP against
+small Random Forest and XGBoost estimators. The separate environment preserves
+the default Python 3.10+ support claim. Official verification requires
+`--require-authenticated`; a non-allowlisted run also requires an independently
+retained `--expected-manifest-sha256` value.
 
 Every one of 184 rows passed: M-001 max/mean absolute error
 `5.78484978308591e-06` / `5.781760213738571e-06`, M-002

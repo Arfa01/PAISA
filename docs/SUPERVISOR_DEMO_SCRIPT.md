@@ -268,17 +268,24 @@ Say:
 > close-to-close, while portfolio returns begin at the next open, so prediction
 > accuracy and simulated profitability answer different questions.
 
-Also state what is not implemented: fresh reliable live ingestion for this run,
-sentiment, a knowledge graph, a production database, and broker integration.
+Also state what is not integrated into this retained vertical-slice dashboard:
+fresh reliable live ingestion for this run, sentiment features, the separate
+tree-SHAP evidence view, a knowledge graph, a production database, and broker
+integration. A certified LSTM comparison and authenticated tree-SHAP pack now
+exist as separate retained evidence; neither changes this price-only dashboard
+or its previously exposed shared holdout.
 
 Close with:
 
-> Next semester we will first add financial-news ingestion, company/entity
-> linking, FinBERT sentiment, and daily sentiment aggregation. We will compare
-> price-only with price-plus-sentiment under the same chronological split, add an
-> LSTM under that contract, use SHAP for explanations, then broaden to more
-> stocks and sector/event relationships. Reinforcement learning is explicitly
-> deferred until those data, evaluation, and explanation components are stable.
+> Next work will expose the authenticated tree-SHAP evidence through a
+> read-only API and dashboard without recomputing it in React. The current
+> verifier separates internal PASS from manifest authentication; its ZIP
+> sidecar checks transport only, and its PNG checks are structural. In parallel,
+> we will pursue permitted overlapping historical news, leakage-safe daily
+> sentiment, and a controlled price-only versus price-plus-sentiment comparison,
+> then broaden to more stocks and sector/event relationships. Reinforcement
+> learning remains deferred until those data, evaluation, and explanation
+> components are stable.
 
 ## Expected result checkpoints
 

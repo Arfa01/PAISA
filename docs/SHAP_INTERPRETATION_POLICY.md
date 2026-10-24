@@ -201,9 +201,18 @@ The accepted local schema-1.0 pack is
 `2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its exact 24-file inventory and
 quality report are `PASS`; the ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
-all passed. Cite results from that verified pack, not from the dependency smoke
-test or impurity-based importance.
+Its independently committed `artifact_manifest.json` SHA-256 trust root is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`.
+Strict authenticated directory, ZIP, and extracted-directory verification all
+passed. The ZIP sidecar separately checks transport integrity and is not a
+provenance credential; PNG checks are structural rather than a rerender from
+CSV evidence, while the authenticated manifest binds the accepted plot bytes.
+An internal `PASS` without `authentication_status: AUTHENTICATED` is not an
+official provenance claim. Cite results from that authenticated pack, not from
+impurity-based importance or a synthetic/unit fixture. The certified direct
+runtime versions are pinned with `constraints-explainability.txt`, and a
+dedicated Python 3.13.7 CI job exercises the real SHAP library against small
+Random Forest and XGBoost estimators without retained artifacts.
 
 For M-001 through M-004 respectively, the maximum/mean absolute additivity
 errors were `5.78484978308591e-06` / `5.781760213738571e-06`,
@@ -234,12 +243,17 @@ future results. Academic simulation; not financial advice.
 
 Before publishing an explanation claim, verify that:
 
-1. the directory or ZIP and sidecar pass the offline verifier;
-2. the cited model and run IDs match the verified artifact;
-3. the class and probability output space are stated;
-4. the sign is described relative to class 1 and the expected value;
-5. the claim uses the correct local or global population;
-6. cross-model magnitudes have not been pooled;
-7. prediction, attribution, policy, and portfolio conclusions remain separate;
-8. shared-holdout reuse and limitations are visible; and
-9. causal, guaranteed-performance, profitability, and advice wording is absent.
+1. the directory or ZIP passes with `--require-authenticated` and reports
+   `authentication_status: AUTHENTICATED`;
+2. for a non-allowlisted run, an independently retained
+   `--expected-manifest-sha256` was supplied;
+3. any ZIP sidecar is described only as transport-integrity evidence, and plot
+   checks are described as structural rather than semantic rerendering;
+4. the cited model and run IDs match the authenticated artifact;
+5. the class and probability output space are stated;
+6. the sign is described relative to class 1 and the expected value;
+7. the claim uses the correct local or global population;
+8. cross-model magnitudes have not been pooled;
+9. prediction, attribution, policy, and portfolio conclusions remain separate;
+10. shared-holdout reuse and limitations are visible; and
+11. causal, guaranteed-performance, profitability, and advice wording is absent.

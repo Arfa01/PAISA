@@ -25,6 +25,7 @@ import shutil
 import stat
 import struct
 import tempfile
+from types import MappingProxyType
 from typing import Any
 import uuid
 import zipfile
@@ -67,6 +68,20 @@ HOLDOUT_TERM = "shared project holdout"
 TICKER = "OGDC"
 ROW_COUNT = 184
 SHAP_PIN = "0.54.1"
+OFFICIAL_EXPLAINABILITY_PACKS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "XAI-20261024-140320-OGDC-tree-v1": MappingProxyType(
+            {
+                "artifact_manifest_sha256": (
+                    "cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda"
+                ),
+                "zip_sha256": (
+                    "7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1"
+                ),
+            }
+        ),
+    }
+)
 PACKAGE_VERSION_KEYS = (
     "python",
     "numpy",
@@ -2373,9 +2388,11 @@ def build_tree_shap_explainability(
                     "Staged explainability directory and ZIP did not verify PASS"
                 )
 
-        # Bind the final private directory bytes to the authenticated ZIP before
-        # the last source-integrity gate.  That source revalidation is kept as
-        # the final expensive operation before exclusive publication.
+        # Bind the final private directory bytes to the sidecar-checked
+        # canonical ZIP before the last source-integrity gate. This producer
+        # self-check establishes integrity, not independent authentication.
+        # Source revalidation remains the final expensive operation before
+        # exclusive publication.
         if create_zip:
             verify_explainability_pack(stage_dir, checksum=staged_sidecar)
         else:
@@ -2388,7 +2405,7 @@ def build_tree_shap_explainability(
         try:
             if create_zip:
                 # An orphan sidecar is inert; a published ZIP always follows its
-                # authenticator. Exact-inode rollback covers a later collision.
+                # transport checksum. Exact-inode rollback covers a later collision.
                 sidecar_sha256 = sha256_file(staged_sidecar)
                 published_files.append(
                     (
@@ -2982,8 +2999,14 @@ def _verify_pack_directory(pack_root: Path) -> dict[str, Any]:
         total_size += size
         if total_size > _MAX_ZIP_BYTES:
             raise ValueError("Explainability directory exceeds its total size limit")
-    manifest = _read_json(
-        pack_root / "artifact_manifest.json", field="Explainability artifact manifest"
+    manifest_payload, _ = _read_regular_bytes(
+        pack_root / "artifact_manifest.json",
+        field="Explainability artifact manifest",
+        max_bytes=_MAX_JSON_BYTES,
+    )
+    artifact_manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    manifest = _decode_json_object(
+        manifest_payload, field="Explainability artifact manifest"
     )
     if set(manifest) != {
         "schema_version",
@@ -3223,6 +3246,7 @@ def _verify_pack_directory(pack_root: Path) -> dict[str, Any]:
         "models": list(MODEL_ORDER),
         "row_count_per_model": ROW_COUNT,
         "shap_version": SHAP_PIN,
+        "artifact_manifest_sha256": artifact_manifest_sha256,
         "disclaimer": ACADEMIC_DISCLAIMER,
     }
 
@@ -3597,8 +3621,26 @@ def verify_explainability_pack(
     pack: str | Path,
     *,
     checksum: str | Path | None = None,
+    expected_manifest_sha256: str | None = None,
+    require_authenticated: bool = False,
 ) -> dict[str, Any]:
-    """Verify an explainability directory or deterministic ZIP entirely offline."""
+    """Verify integrity and, when anchored, authenticity entirely offline.
+
+    An adjacent ZIP checksum sidecar detects transfer corruption but is not an
+    independent trust anchor.  Official packs are authenticated through the
+    committed run-ID allowlist.  Other packs can be authenticated to a digest
+    obtained through an independent channel with ``expected_manifest_sha256``.
+    """
+
+    caller_expected_sha256: str | None = None
+    if not isinstance(require_authenticated, bool):
+        raise TypeError("require_authenticated must be a bool")
+    if expected_manifest_sha256 is not None:
+        caller_expected_sha256 = str(expected_manifest_sha256)
+        if not _SHA256.fullmatch(caller_expected_sha256):
+            raise ValueError(
+                "expected_manifest_sha256 must be a lowercase SHA-256 digest"
+            )
 
     candidate = reject_symlink_components(
         Path(pack).expanduser(), label="Explainability pack"
@@ -3660,13 +3702,73 @@ def verify_explainability_pack(
     else:
         raise ValueError("Pack must be an explainability directory or .zip file")
 
+    run_id = str(result["run_id"])
+    observed_manifest_sha256 = str(result["artifact_manifest_sha256"])
+    official_record = OFFICIAL_EXPLAINABILITY_PACKS.get(run_id)
+    official_manifest_sha256: str | None = None
+    if official_record is not None:
+        if set(official_record) != {"artifact_manifest_sha256", "zip_sha256"}:
+            raise RuntimeError("Official explainability digest record is invalid")
+        official_manifest_sha256 = str(
+            official_record["artifact_manifest_sha256"]
+        )
+        official_zip_sha256 = str(official_record["zip_sha256"])
+        if not _SHA256.fullmatch(official_manifest_sha256) or not _SHA256.fullmatch(
+            official_zip_sha256
+        ):
+            raise RuntimeError("Official explainability digest record is invalid")
+        if (
+            caller_expected_sha256 is not None
+            and caller_expected_sha256 != official_manifest_sha256
+        ):
+            raise ValueError(
+                "Caller-supplied manifest digest conflicts with the committed "
+                "official digest"
+            )
+        if zip_sha256 is not None and zip_sha256 != official_zip_sha256:
+            raise ValueError(
+                "Explainability ZIP does not match the committed official digest"
+            )
+
+    trusted_manifest_sha256 = (
+        official_manifest_sha256 or caller_expected_sha256
+    )
+    if (
+        trusted_manifest_sha256 is not None
+        and observed_manifest_sha256 != trusted_manifest_sha256
+    ):
+        raise ValueError(
+            "Explainability artifact manifest does not match the trusted digest"
+        )
+    if require_authenticated and trusted_manifest_sha256 is None:
+        raise ValueError(
+            "Authenticated verification requires an independently trusted "
+            "artifact-manifest digest"
+        )
+
+    if official_manifest_sha256 is not None:
+        authentication_source: str | None = "committed_official_allowlist"
+    elif caller_expected_sha256 is not None:
+        authentication_source = "caller_supplied_expected_manifest_sha256"
+    else:
+        authentication_source = None
+    authenticated = trusted_manifest_sha256 is not None
+
     return {
         **result,
         "pack": resolved.name,
         "path_base": "input_parent",
         "checksum_verified": checksum_path is not None,
+        "sidecar_checksum_verified": checksum_path is not None,
         "zip_sha256": zip_sha256,
         "verification_scope": "portable_evidence",
+        "integrity_status": "PASS",
+        "authentication_status": (
+            "AUTHENTICATED" if authenticated else "NOT_AUTHENTICATED"
+        ),
+        "authentication_source": authentication_source,
+        "official_artifact": official_manifest_sha256 is not None,
+        "expected_artifact_manifest_sha256": trusted_manifest_sha256,
     }
 
 
@@ -3677,6 +3779,7 @@ __all__ = [
     "EXPECTED_MODELS",
     "HOLDOUT_TERM",
     "MODEL_ORDER",
+    "OFFICIAL_EXPLAINABILITY_PACKS",
     "ROW_COUNT",
     "SHAP_PIN",
     "build_tree_shap_explainability",

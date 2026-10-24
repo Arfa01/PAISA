@@ -70,7 +70,7 @@ the gate pass.
 | `PAISA-RM-011` | MUST | Daily sentiment aggregation and immutable artifact writer | `PAISA-RM-010` | `G3-NEWS-OVERLAP` | Aggregator reproduces the oracle, refuses collisions, and passes leakage and checksum verification. |
 | `PAISA-RM-012` | MUST | Fixture-backed paired price/sentiment experiment runner | `PAISA-RM-011` | `G4-DAILY-SENTIMENT` | Tests prove matched rows and assumptions, train-only transforms, validation-only selection, and separate ledgers. |
 | `PAISA-RM-013` | MUST | Official OGDC paired comparison run and result report | `PAISA-RM-012` | `G4-DAILY-SENTIMENT` | Fresh immutable runs satisfy `G5-PAIRED-COMPARISON`; negative or inconclusive results are retained. |
-| `PAISA-RM-014` | SHOULD | Versioned tree-SHAP artifact generator, portable verifier, and verified official real pack complete on `feature/tree-model-shap-explainability` | `PAISA-RM-003` | `G0-INTEGRITY` | `XAI-20261024-140320-OGDC-tree-v1` binds model, features, background data, output/class, versions, and checksums; its directory and ZIP pass offline verification. |
+| `PAISA-RM-014` | SHOULD | Versioned tree-SHAP artifact generator, portable verifier, and authenticated official real pack complete on `feature/tree-model-shap-explainability` | `PAISA-RM-003` | `G0-INTEGRITY` | `XAI-20261024-140320-OGDC-tree-v1` binds model, features, background data, output/class, versions, and checksums; strict directory and ZIP verification report `AUTHENTICATED` against the independently committed manifest trust root. |
 | `PAISA-RM-015` | SHOULD | Read-only SHAP API and dashboard explanation view | `PAISA-RM-014` | `G0-INTEGRITY` | Additive API/UI present behavior, never causality or advice, with offline contract tests. |
 | `PAISA-RM-016` | SHOULD | One-stock-at-a-time PSX data-quality onboarding pilot | `PAISA-RM-013` | `G5-PAIRED-COMPARISON` | At least one additional approved symbol has provenance, coverage, missing-field, and split-readiness evidence. |
 | `PAISA-RM-017` | STRETCH | Multi-stock experiment orchestration | `PAISA-RM-016` | `G0-INTEGRITY` | Per-stock or explicitly pooled identities, transforms, portfolios, and conclusions remain isolated. |
@@ -102,11 +102,22 @@ holdout, a deterministic 100-row training background, and strict additivity
 gates of `5e-5` for Random Forest and `1e-6` for XGBoost. The dependency pin
 was executed under Python 3.13.7, NumPy 2.3.5, pandas 2.3.3, scikit-learn
 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP 0.54.1.
+Those certified direct versions are pinned by
+`constraints-explainability.txt`, which is applied alongside both requirements
+files and is not a standalone or fully hashed lock. Dedicated Python 3.13.7 CI
+runs the real SHAP library against small Random Forest and XGBoost estimators
+without retained artifacts.
 The official 24-file pack is `XAI-20261024-140320-OGDC-tree-v1`, produced from
 clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`; its ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-Quality, directory-plus-checksum, ZIP-plus-sidecar, and extracted offline
-verification all passed. RM-015 remains a separate API/UI task.
+Its independently committed `artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`.
+Strict authenticated directory, ZIP, and extracted-directory verification all
+passed. The ZIP sidecar separately establishes transport integrity, not
+provenance; PNG checks are structural rather than a semantic rerender. Internal
+`PASS` without `AUTHENTICATED` is not sufficient for an official claim, so use
+`--require-authenticated` and, for a non-allowlisted run, an independently
+retained `--expected-manifest-sha256`. RM-015 remains a separate API/UI task.
 
 ## Recommended execution sequence
 

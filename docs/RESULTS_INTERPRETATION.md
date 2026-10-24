@@ -209,8 +209,14 @@ financial advice, and are not evidence of future performance.
 ## Tree-model SHAP interpretation status
 
 Official retained pack `XAI-20261024-140320-OGDC-tree-v1` was produced from
-clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`, passed directory and
-ZIP verification, and records quality status `PASS`. Its ZIP SHA-256 is
+clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d` and records quality
+status `PASS`. Its independently committed `artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`; strict
+authenticated directory, ZIP, and extracted-directory verification passed.
+The ZIP sidecar is only a separate transport-integrity check, and PNG checks
+are structural rather than a semantic rerender from CSV inputs. An internal
+`PASS` without `authentication_status: AUTHENTICATED` is therefore not an
+official provenance claim. The pack's ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
 It explains each fitted model's class-1 probability over the exact `184 × 19`
 shared project holdout matrix relative to 100
@@ -241,8 +247,14 @@ shares four of the top five features.
 
 The recorded environment is Python `3.13.7`, SHAP `0.54.1`, NumPy `2.3.5`,
 pandas `2.3.3`, scikit-learn `1.9.1`, XGBoost `3.4.1`, joblib `1.6.0`, and
-Matplotlib `3.11.2`. Final validation completed with
-`1339 passed, 2 skipped, 6 warnings` in the backend and `132 passed` across 10
+Matplotlib `3.11.2`. `constraints-explainability.txt` pins those certified
+direct versions and is applied alongside both requirements files; it is not a
+standalone or fully hashed lock. A dedicated Python 3.13.7 CI job exercises
+real Tree SHAP against small Random Forest and XGBoost estimators without the
+retained pack. Official claims require `--require-authenticated`; a
+non-allowlisted run also needs an independently retained
+`--expected-manifest-sha256`. Final validation completed with
+`1350 passed, 2 skipped, 6 warnings` in the backend and `132 passed` across 10
 frontend test files, plus passing frontend lint and build.
 
 That numerical reconstruction does not establish model accuracy, calibration,

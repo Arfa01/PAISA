@@ -42,9 +42,16 @@ UNIFIED_COMPARISON_ZIP_SHA256 = (
     "8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe"
 )
 UNIFIED_COMPARISON_FILE_COUNT = 65
+OFFICIAL_XAI_RUN_ID = "XAI-20261024-140320-OGDC-tree-v1"
+OFFICIAL_XAI_MANIFEST_SHA256 = (
+    "cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda"
+)
+OFFICIAL_XAI_ZIP_SHA256 = (
+    "7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1"
+)
 ALLOWED_ACTIONS = {
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": 3,
-    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": 2,
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": 4,
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97": 3,
     "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1": 1,
 }
 
@@ -1208,6 +1215,55 @@ def test_reproduction_runbook_covers_required_commands_and_parses_as_shell() -> 
         assert parsed.returncode == 0, parsed.stderr
 
 
+def test_tree_shap_authentication_and_certified_runtime_are_documented() -> None:
+    operator_documents = (
+        "README.md",
+        "RUN_FROM_GITHUB.md",
+        "docs/TREE_MODEL_SHAP_EXPLAINABILITY.md",
+        "docs/EXPLAINABILITY_DATA_CONTRACT.md",
+        "docs/REPRODUCTION_COMMANDS.md",
+        "docs/TEAM_HANDOFF.md",
+    )
+    combined = "\n".join(_normalized(_read(path)) for path in operator_documents)
+    assert OFFICIAL_XAI_RUN_ID.lower() in combined
+    assert OFFICIAL_XAI_MANIFEST_SHA256 in combined
+    assert OFFICIAL_XAI_ZIP_SHA256 in combined
+    for phrase in (
+        "internal `pass`",
+        "authentication_status: authenticated",
+        "--require-authenticated",
+        "--expected-manifest-sha256",
+        "transport",
+        "sidecar",
+        "structural",
+        "rerender",
+        "constraints-explainability.txt",
+    ):
+        assert phrase in combined
+
+    runbook = _read("RUN_FROM_GITHUB.md")
+    assert runbook.count("--require-authenticated") >= 3
+    assert '--expected-manifest-sha256 "$PAISA_XAI_MANIFEST_SHA256"' in runbook
+    assert "hashlib.sha256" in runbook
+    assert "independently retained record" in runbook
+
+    constraints = {
+        line.strip()
+        for line in _read("constraints-explainability.txt").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert constraints == {
+        "numpy==2.3.5",
+        "pandas==2.3.3",
+        "scikit-learn==1.9.1",
+        "xgboost==3.4.1",
+        "joblib==1.6.0",
+        "matplotlib==3.11.2",
+        "shap==0.54.1",
+    }
+    assert ".venv-explainability/" in _read(".gitignore").splitlines()
+
+
 def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
     workflow_text = _read(".github/workflows/ci.yml")
     workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
@@ -1224,7 +1280,12 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
-    assert set(jobs) == {"python", "documentation-contracts", "frontend"}
+    assert set(jobs) == {
+        "python",
+        "explainability-runtime",
+        "documentation-contracts",
+        "frontend",
+    }
     assert all("permissions" not in job for job in jobs.values())
 
     action_references = Counter(
@@ -1248,17 +1309,26 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
         assert checkout_steps[0].get("with") == {"persist-credentials": "false"}
 
     python_job = jobs["python"]
+    explainability_job = jobs["explainability-runtime"]
     docs_job = jobs["documentation-contracts"]
     frontend_job = jobs["frontend"]
     assert python_job["env"]["HF_HUB_OFFLINE"] == "1"
     assert python_job["env"]["TRANSFORMERS_OFFLINE"] == "1"
     assert python_job["env"]["MPLCONFIGDIR"] == "/tmp/paisa-matplotlib"
+    assert explainability_job["env"]["HF_HUB_OFFLINE"] == "1"
+    assert explainability_job["env"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert explainability_job["env"]["MPLCONFIGDIR"] == "/tmp/paisa-matplotlib"
     assert docs_job["env"]["HF_HUB_OFFLINE"] == "1"
     assert docs_job["env"]["TRANSFORMERS_OFFLINE"] == "1"
 
     python_setup = next(
         step
         for step in python_job["steps"]
+        if step.get("uses", "").startswith("actions/setup-python@")
+    )
+    explainability_setup = next(
+        step
+        for step in explainability_job["steps"]
         if step.get("uses", "").startswith("actions/setup-python@")
     )
     docs_setup = next(
@@ -1272,6 +1342,11 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
         if step.get("uses", "").startswith("actions/setup-node@")
     )
     assert python_setup["with"]["cache"] == "pip"
+    assert explainability_setup["with"]["python-version"] == "3.13.7"
+    assert explainability_setup["with"]["cache"] == "pip"
+    explainability_cache_paths = explainability_setup["with"]["cache-dependency-path"]
+    assert "requirements-explainability.txt" in explainability_cache_paths
+    assert "constraints-explainability.txt" in explainability_cache_paths
     assert docs_setup["with"]["cache"] == "pip"
     assert node_setup["with"]["cache"] == "npm"
 
@@ -1289,6 +1364,22 @@ def test_ci_is_pinned_cached_offline_and_fixture_only() -> None:
         "documentation-contracts": {
             "python -m pip install -r requirements-dev.txt",
             "python -m pytest tests/test_documentation_contracts.py",
+            "git diff --check",
+            "git diff --exit-code",
+        },
+        "explainability-runtime": {
+            "python -m pip install --upgrade pip",
+            "python -m pip install \\",
+            "-c constraints-explainability.txt \\",
+            "-r requirements.txt \\",
+            "-r requirements-explainability.txt",
+            "python -m pip install --no-deps -e .",
+            "python -m pip check",
+            (
+                'python -c "import importlib.metadata as m; import shap; '
+                "assert m.version('shap') == '0.54.1', m.version('shap')\""
+            ),
+            "python -m pytest tests/test_tree_shap_runtime_integration.py",
             "git diff --check",
             "git diff --exit-code",
         },

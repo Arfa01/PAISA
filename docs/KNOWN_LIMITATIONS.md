@@ -131,10 +131,35 @@ evidence.
 
 ### Explainability is limited
 
-The artifacts retain model configuration, feature order, metrics, and
-provenance, but the completed comparison does not include SHAP explanations.
-Current evidence should not be presented as a causal explanation of OGDC price
-movement.
+The separate authenticated tree-SHAP pack explains only M-001 through M-004 on
+the reused 184-date OGDC shared project holdout, one technical-feature family,
+and one historical period. It does not explain M-005/M-006, supply a fresh
+independent evaluation, establish causality, or predict future performance.
+Correlated lags, averages, returns, volatility, RSI, and MACD terms may share
+attribution, so model-specific ranks must not be recast as economic importance.
+
+The portable verifier distinguishes internal `PASS`, ZIP-sidecar transport
+integrity, and manifest authentication. Official claims require strict
+`--require-authenticated` verification; a non-allowlisted run additionally
+needs an independently retained `--expected-manifest-sha256`. The sidecar is
+not a provenance credential. PNG validation is structural and does not
+rerender plots from the CSV evidence, although an authenticated manifest binds
+the exact accepted bytes. The certified direct runtime is constrained and real
+Tree SHAP is exercised in a dedicated Python 3.13.7 CI job, but the verifier
+still cannot prove that inference originally ran correctly on an untrusted
+producer host.
+
+Four local hardening items remain outside the merge-blocking correction. The
+output-root validation/publication path is still pathname-based, so a local
+actor with write access to the parent directory can race an ancestor swap. A
+correctly named FIFO can block before the verifier rejects it, and directory
+enumeration is not bounded until after recursive discovery. The explanation
+directory, ZIP, and sidecar are published as three entries rather than one
+atomic enclosing bundle, so abrupt process termination can leave collision-
+blocking orphans. Finally, the generic model writer does not yet enforce the
+loader's 256 MiB model and 1 MiB manifest limits. None of the retained PAISA
+artifacts approaches those limits, and these paths are not remotely exposed,
+but they remain defense-in-depth work rather than resolved guarantees.
 
 ## Operational limitations
 

@@ -64,6 +64,62 @@ jobs:
           git diff --check
           git diff --exit-code
 
+  explainability-runtime:
+    name: Certified Tree SHAP runtime integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      MPLCONFIGDIR: /tmp/paisa-matplotlib
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up certified Python 3.13.7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.7"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
+            requirements-core.txt
+            requirements-ml.txt
+            requirements-backtesting.txt
+            requirements-dev.txt
+            requirements-explainability.txt
+            constraints-explainability.txt
+
+      - name: Install certified explainability dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -c constraints-explainability.txt \
+            -r requirements.txt \
+            -r requirements-explainability.txt
+          python -m pip install --no-deps -e .
+
+      - name: Check installed dependency consistency
+        run: python -m pip check
+
+      - name: Require the pinned SHAP runtime
+        run: >-
+          python -c "import importlib.metadata as m; import shap;
+          assert m.version('shap') == '0.54.1', m.version('shap')"
+
+      - name: Run real Tree SHAP integration tests
+        run: python -m pytest tests/test_tree_shap_runtime_integration.py
+
+      - name: Confirm checks did not modify tracked files
+        run: |
+          git diff --check
+          git diff --exit-code
+
   documentation-contracts:
     name: Documentation contract tests
     runs-on: ubuntu-latest

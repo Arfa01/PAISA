@@ -77,12 +77,21 @@ environment continues to support Python 3.10+.
 python3.13 -m venv .venv-explainability
 source .venv-explainability/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 python -m pip install --no-deps -e .
 python -m pip check
 deactivate
 ```
+
+`constraints-explainability.txt` pins the certified direct NumPy, pandas,
+scikit-learn, XGBoost, joblib, Matplotlib, and SHAP versions; it is applied
+alongside both requirements files and is not a standalone or fully hashed
+lock. The dedicated Python 3.13.7 explainability-runtime CI job exercises real
+`shap.TreeExplainer` calls for small Random Forest and XGBoost estimators
+without needing the retained explanation pack.
 
 ## Current component entry points
 
@@ -145,7 +154,10 @@ evidence. Contemporaneous source packs use
 `artifacts/evidence_coverage/<run_id>/`. Tree-model explanations use
 `artifacts/explainability/<run_id>/`, `<run_id>.zip`, and
 `<run_id>.zip.sha256`. The accepted local pack is
-`XAI-20261024-140320-OGDC-tree-v1`; its ZIP SHA-256 is
+`XAI-20261024-140320-OGDC-tree-v1`; its independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and its
+ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
 Never overwrite an existing model, experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
@@ -153,8 +165,13 @@ artifacts, `frontend/dist/`, local environments, or secrets.
 
 The accepted explanation pack was produced from clean implementation commit
 `2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its 24-file inventory and quality
-report are `PASS`; directory-plus-checksum, ZIP-plus-sidecar, and extracted
-offline verification passed. The manifest records Python 3.13.7, NumPy 2.3.5,
+report are `PASS`; authenticated directory, ZIP, and extracted-directory
+verification passed, as did the separate ZIP-sidecar transport-integrity
+check. The adjacent sidecar is not a provenance credential. The manifest
+anchor is what authenticates the accepted file bytes; PNG checks are structural
+and do not rerender plots from their CSV inputs. A bare internal `PASS` without
+`authentication_status: AUTHENTICATED` is not an official provenance claim.
+The manifest records Python 3.13.7, NumPy 2.3.5,
 pandas 2.3.3, scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib
 3.11.2, and SHAP 0.54.1. All M-001--M-004 results cover the exact 184-row
 shared project holdout and 19 transformed features in positive-class
@@ -166,8 +183,8 @@ The model-wise maximum/mean absolute additivity errors were
 `4.302598055616613e-09` / `7.864803434113863e-10` for M-002,
 `2.7466758000471714e-05` / `2.7464541568790406e-05` for M-003, and
 `1.5920226559273942e-07` / `3.5509845686483396e-08` for M-004. The code-stage
-validation recorded 1,339 backend tests passed with two skipped and six
-warnings, 111 focused tests passed, 132 frontend tests passed, and passing
+validation recorded 1,350 backend tests passed with two skipped and six
+warnings, 138 focused tests passed, 132 frontend tests passed, and passing
 doctor, dependency, bytecode-compilation, frontend lint, frontend build, and
 diff checks.
 
@@ -1041,10 +1058,11 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    post-freeze test balanced accuracy. After the sentiment coverage gate passes,
    train paired price-only and price-plus-sentiment experiments without using
    test results for selection.
-4. Use verified pack `XAI-20261024-140320-OGDC-tree-v1` when adding SHAP result
-   views after Waqas exposes the validated read-only API schema. Consume
-   persisted evidence without recalculating SHAP in React; explain model
-   behavior, not causality.
+4. Use authenticated pack `XAI-20261024-140320-OGDC-tree-v1` when adding SHAP
+   result views after Waqas exposes the validated read-only API schema. Require
+   `authentication_status: AUTHENTICATED`, consume persisted evidence without
+   recalculating SHAP in React, and explain model behavior rather than
+   causality.
 5. Extend dashboard components and client schemas without recalculating backend
    metrics in React.
 6. Lead additional-stock data quality, evaluation, screenshots, and supervisor
@@ -1197,15 +1215,17 @@ python scripts/run_tree_shap_explainability.py \
   artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --output-dir artifacts/explainability
 
-# Verify the accepted immutable local evidence pack. Replace only when
-# verifying the fresh run ID emitted by the producer above.
+# Verify the accepted immutable local evidence pack. For a fresh run, retain
+# its independent manifest digest and use both strict options described below.
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
 deactivate
 
 # Full OGDC vertical slice with a new immutable ID. The command still attempts
@@ -1241,6 +1261,14 @@ npm run build
 cd ..
 git diff --check origin/main...HEAD
 ```
+
+For a new `XAI-...` run, preserve the raw `artifact_manifest.json` SHA-256 in a
+separate trusted handoff record and verify with
+`--expected-manifest-sha256 <digest> --require-authenticated`. A verifier
+`status: PASS` without `authentication_status: AUTHENTICATED` establishes only
+internal consistency. `checksum_verified` and `sidecar_checksum_verified` are
+transport-corruption checks. Plot validation is structural; the manifest trust
+root binds the accepted plot bytes but does not rerender them from CSV data.
 
 Independent validation of reviewed PR head `4d7084b` produced two historical
 pre-fix matrices:

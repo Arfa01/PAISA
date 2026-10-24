@@ -259,6 +259,12 @@ record.
 stable and registered model order, installed package versions, background
 policy, code provenance, contract filenames, and disclaimer. SHAP must be
 exactly `0.54.1`. Other installed versions are recorded rather than hidden.
+The certified direct runtime versions are pinned in
+`constraints-explainability.txt`, applied alongside both requirements files;
+that constraints file is not a standalone requirements file or a full hashed
+lock. A dedicated Python 3.13.7 CI job runs the real `shap.TreeExplainer`
+library against small Random Forest and XGBoost estimators and checks
+probability-space reconstruction without depending on retained artifacts.
 
 `quality_report.json` is `PASS` only after source identity, trusted loading,
 checksums, model/class/feature contracts, exact dates, leakage exclusions,
@@ -284,23 +290,41 @@ runtime, retraining, or inference. For a directory or ZIP it:
 6. recomputes prediction-level additivity from local feature rows;
 7. recomputes global importance, cross-model rankings, audit selection,
    summaries, and final summary; and
-8. for ZIP input, validates the sidecar, canonical member metadata, one safe
-   top-level run directory, size limits, and extraction containment.
+8. for ZIP input, validates the adjacent transport sidecar, canonical member
+   metadata, one safe top-level run directory, size limits, and extraction
+   containment; and
+9. always applies a committed official run allowlist or independently supplied
+   expected digest when one is available, authenticating the raw
+   `artifact_manifest.json` SHA-256; strict mode additionally makes a missing
+   trust anchor fatal.
 
-Any mismatch fails verification. The verifier cannot attest that model
-inference originally ran correctly on an untrusted host; it attests that the
-portable pack is internally consistent with this sealed contract and its fixed
-source identities.
+Any internal mismatch fails verification. An adjacent sidecar is produced and
+transferred with the ZIP, so it detects corruption but is not an independent
+provenance credential. `status: PASS` and `integrity_status: PASS` attest only
+that the portable pack is internally consistent with the sealed contract and
+fixed source identities. `authentication_status: AUTHENTICATED` additionally
+attests that its manifest trust root matched an independent anchor. The
+verifier still cannot prove that inference originally ran correctly on an
+untrusted host. PNG validation is structural rather than a rerendered semantic
+comparison; authentication binds the accepted plot bytes through the manifest.
+Use `--require-authenticated` for every official evidence claim. A run absent
+from the committed allowlist additionally needs an independently retained
+`--expected-manifest-sha256 <digest>`; a non-strict internal `PASS` is not a
+provenance claim.
 
 ## Accepted schema-1.0 instance
 
 The accepted local pack is `XAI-20261024-140320-OGDC-tree-v1`, produced from
 clean code version/source fingerprint
 `2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its exact inventory contains 24
-files, its quality status is `PASS`, and its ZIP SHA-256 is
+files, its quality status is `PASS`, its committed `artifact_manifest.json`
+SHA-256 trust root is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and its
+ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
-all passed. The manifest records Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
+Authenticated directory, ZIP, and extracted-directory verification all passed;
+the separate ZIP-sidecar transport check also passed. The manifest records
+Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
 scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP
 0.54.1.
 

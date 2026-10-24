@@ -1,6 +1,8 @@
 # Optional runtime for immutable M-001 through M-004 Tree SHAP evidence packs.
-# Verified with Python 3.13.7, NumPy 2.3.5, scikit-learn 1.9.1, and XGBoost 3.4.1.
+# Certified with Python 3.13.7 and the exact direct versions in
+# constraints-explainability.txt.
 # SHAP 0.54.1 requires Python >=3.12 and NumPy >=2; core requirements stay unchanged.
-# After requirements.txt, install with:
-# python -m pip install -r requirements-explainability.txt
+# Install the default and optional requirements together under those constraints:
+# python -m pip install -c constraints-explainability.txt \
+#   -r requirements.txt -r requirements-explainability.txt
 shap==0.54.1

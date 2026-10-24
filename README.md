@@ -79,8 +79,10 @@ proposal and early-v0 context.
   leakage-safe availability filtering.
 - Immutable tree-SHAP explanation packs for M-001 through M-004, with trusted
   model loading, exact 184-date alignment, probability-space additivity,
-  deterministic audit samples, and model-free offline verification. Official
-  retained run `XAI-20261024-140320-OGDC-tree-v1` has quality status `PASS`.
+  deterministic audit samples, model-free offline verification, and an
+  independent committed manifest trust root. Official retained run
+  `XAI-20261024-140320-OGDC-tree-v1` has quality status `PASS` and authentication
+  status `AUTHENTICATED`.
 
 ## Recommended first run
 
@@ -658,8 +660,10 @@ Python 3.13 matches the authoritative serialization runtime most closely:
 python3.13 -m venv .venv-explainability
 source .venv-explainability/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 python -m pip install --no-deps -e .
 
 python scripts/run_tree_shap_explainability.py \
@@ -675,9 +679,20 @@ python scripts/run_tree_shap_explainability.py \
 The output is a collision-refusing directory plus deterministic ZIP and
 SHA-256 sidecar. Its portable verifier recomputes derived explanation tables
 from the long-form local rows and does not load joblib or XGBoost binaries.
-Generated packs remain ignored by Git. The official retained pack is
+The adjacent sidecar detects transfer corruption but is not a provenance
+credential; internal `PASS` is reported separately from `AUTHENTICATED` trust-
+root verification. PNG validation is structural, while manifest
+authentication binds the exact accepted plot bytes. Require
+`--require-authenticated` for an official claim; a non-allowlisted run also
+needs an independently retained `--expected-manifest-sha256`. Generated packs
+and the documented `.venv-explainability/` environment remain ignored by Git.
+`constraints-explainability.txt` pins the certified direct runtime versions,
+and a dedicated artifact-free Python 3.13 CI job reconstructs probabilities
+from real Random Forest and XGBoost SHAP outputs. The official retained pack is
 `XAI-20261024-140320-OGDC-tree-v1`, produced from clean commit
-`2cd4145e5e01459d13d186a6f3b697e979821a9d`; its ZIP SHA-256 is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`; its committed manifest SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, its ZIP
+SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1` and
 its quality status is `PASS`. All four models explain the same `184 × 19`
 matrix in positive-class probability space, and all seven deterministic audit
@@ -694,7 +709,7 @@ Every one of the 184 rows per model passes its declared tolerance. The
 strongest rank agreement is `M-001`/`M-002` at `0.8228070175438595`; the
 official summary also identifies the three comparisons involving `M-004` as
 the rank-disagreement group (`0.5964912280701754` to `0.7`). Validation at the
-official revision completed with `1339 passed, 2 skipped, 6 warnings` in the
+official revision completed with `1350 passed, 2 skipped, 6 warnings` in the
 backend and `132 passed` across 10 frontend test files, plus passing frontend
 lint and build.
 

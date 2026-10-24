@@ -7,11 +7,14 @@ Source installation, offline tests, and newly generated runs work from a fresh
 clone. Git intentionally excludes retained model, news, database, sentiment,
 and coverage artifacts. Commands below that name a `NEWS-...`, `COVERAGE-...`,
 `SENT-...`, `TRN-...`, `VSL-...`, `CMP-...`, or `XAI-...` identity are therefore marked
-**artifact-present**: obtain a checksum-verified custodian export as documented
-in [`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs.
-The repository does not publish a download URL for those local archives. When
-this guide records an accepted pack checksum, treat it as descriptive evidence;
-verify the sidecar transferred with the archive rather than trusting prose.
+**artifact-present**: obtain a custodian export as documented in
+[`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs. The
+repository does not publish a download URL for those local archives. An
+archive-adjacent checksum sidecar detects transfer corruption, but because it
+travels with the archive it does not authenticate provenance. For retained
+Tree-SHAP evidence, require the verifier's independently committed manifest
+trust anchor; for a new run, obtain the expected manifest SHA-256 through a
+separate trusted channel.
 
 ## 1. Clone the repo
 
@@ -65,12 +68,20 @@ model serialization environment most closely:
 python3.13 -m venv .venv-explainability
 source .venv-explainability/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 python -m pip install --no-deps -e .
 python -m pip check
 deactivate
 ```
+
+`constraints-explainability.txt` pins the certified direct runtime versions
+used to deserialize and explain the retained models; it is applied alongside,
+not instead of, both requirements files. Hosted CI repeats that installation
+under Python 3.13.7 and runs real `shap.TreeExplainer` integration against tiny
+Random Forest and XGBoost estimators without retained artifacts.
 
 ## 4. Generate PSX data, features, dataset, and baseline model
 
@@ -899,35 +910,74 @@ Record the newly printed `XAI-...` run ID. Existing directory, ZIP, or sidecar
 targets are never overwritten. Verify the published directory:
 
 ```bash
-# Accepted retained pack; replace when verifying a newly emitted run ID.
+# Accepted retained pack only; new runs need the independent digest command below.
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
 ```
 
 The ZIP/sidecar pair can be moved together and verified without source models:
 
 ```bash
-# Accepted retained pack; replace when verifying a newly emitted run ID.
+# Accepted retained pack only; new runs need the independent digest command below.
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
 ```
 
 The verifier checks the exact inventory and checksums, exact 184-date shared
 project holdout, model and feature identities, additivity, global metrics,
 cross-model ranks, deterministic audit sample, portable paths, and prohibited
 causal language. It does not deserialize joblib or load XGBoost binaries.
+`status: PASS` and `integrity_status: PASS` establish internal consistency;
+only `authentication_status: AUTHENTICATED` establishes a match to an
+independent trust anchor. `checksum_verified` and
+`sidecar_checksum_verified` mean only that the ZIP matched its adjacent
+transport sidecar. Plot checks validate PNG structure; authentication binds the
+accepted plot bytes, but the verifier does not rerender plots from the tables.
+
+The retained run is authenticated automatically from the committed run-ID,
+manifest, and ZIP digest allowlist. To authenticate a newly generated run,
+capture its `artifact_manifest.json` SHA-256 immediately after generation:
+
+```bash
+PAISA_XAI_RUN_ID="<new printed XAI-... run ID>"
+export PAISA_XAI_MANIFEST_SHA256="$(
+  python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+    "artifacts/explainability/$PAISA_XAI_RUN_ID/artifact_manifest.json"
+)"
+printf '%s\n' "$PAISA_XAI_MANIFEST_SHA256"
+```
+
+Before transferring the pack, preserve that printed digest in a trusted record
+outside the artifact directory, ZIP, and sidecar. When verifying a received
+copy, set `PAISA_XAI_MANIFEST_SHA256` from that independently retained record,
+not from the received pack, and use both strict options:
+
+```bash
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --expected-manifest-sha256 "$PAISA_XAI_MANIFEST_SHA256" \
+  --require-authenticated
+```
 
 The accepted local pack is
 `artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
 ZIP and sidecar. It was produced from clean implementation commit
-`2cd4145e5e01459d13d186a6f3b697e979821a9d`; the ZIP SHA-256 is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`; the independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and the
+ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-The 24-file pack reports `PASS`, and directory-plus-checksum, ZIP-plus-sidecar,
-and extracted offline verification all passed.
+The 24-file pack reports internal `PASS` and authenticated `AUTHENTICATED` for
+the directory, ZIP, and extracted directory. The sidecar check also passed as
+a separate transport-integrity check.
 
 All four models explain 184 rows and 19 transformed features in positive-class
 probability space. The observed maximum/mean absolute additivity errors were

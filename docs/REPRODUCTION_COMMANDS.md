@@ -20,7 +20,10 @@ There are two distinct profiles:
 The Python package supports Python 3.10 or newer. The certified LSTM run used
 Python 3.13.7, and TensorFlow 2.21 is supported here only on CPython 3.10 through
 3.13. The optional `shap==0.54.1` explainability runtime requires Python 3.12+
-and NumPy 2+; its compatibility smoke used Python 3.13.7 and NumPy 2.3.5. The frontend supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
+and NumPy 2+. Its certified direct versions are pinned in
+`constraints-explainability.txt`, and dedicated Python 3.13.7 CI exercises
+real Tree SHAP against small Random Forest and XGBoost estimators. The frontend
+supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
 22.20.0 is the version recorded in the current dashboard runbook.
 
 All generated run destinations are immutable. Every producer below requires a
@@ -62,7 +65,10 @@ python -m pip install -r requirements-sentiment.txt
 python -m pip install -r requirements-lstm.txt
 
 # Only in a separate CPython 3.12+ / NumPy 2+ explainability environment.
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 
 # Optional full-OHLCV provider; not required for the official psx-dps path.
 python -m pip install -r requirements-provider-pypsx.txt
@@ -78,8 +84,10 @@ is:
 python3.13 -m venv .venv-explainability
 source .venv-explainability/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 python -m pip install --no-deps -e .
 python -m pip check
 deactivate
@@ -556,11 +564,13 @@ modify a source, or create a portfolio. The exact 184 rows are the reused
 **shared project holdout**, not a fresh independent evaluation.
 
 Official runs require `shap==0.54.1` in the separate Python 3.12+ / NumPy 2+
-environment documented above. The pin passed a deterministic isolated smoke
-against Python 3.13.7, NumPy 2.3.5, scikit-learn 1.9.1, and XGBoost 3.4.1. The
-Random Forest smoke returned an explicit class dimension; XGBoost returned a
-two-dimensional class-1 matrix. Both reconstructed probability output within
-`1e-6`.
+environment documented above. `constraints-explainability.txt` pins the
+certified direct NumPy, pandas, scikit-learn, XGBoost, joblib, Matplotlib, and
+SHAP versions while both requirements files declare the environment; it is not
+a standalone or fully hashed lock. The dedicated artifact-free Python 3.13.7
+CI job runs real `shap.TreeExplainer` calls. Random Forest returns an explicit
+class dimension and reconstructs within `5e-5`; XGBoost returns a
+two-dimensional class-1 matrix and reconstructs within `1e-6`.
 
 Restore the three generated, Git-ignored source roots before running:
 
@@ -584,25 +594,27 @@ deterministic training-background rows. Every one of the 184 rows per model
 must satisfy its estimator-family additivity tolerance: `5e-5` for Random
 Forest and `1e-6` for XGBoost.
 
-The producer stages and verifies all files before collision-refusing atomic
-publication. Record the returned run ID, then verify the directory:
+The producer stages and verifies all files before collision-refusing,
+no-replace publication. Record the returned run ID, then verify the directory:
 
 ```bash
-# Accepted retained pack; replace when verifying a newly emitted run ID.
+# Accepted retained pack only; new runs also need the independent digest below.
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
 ```
 
 Verify a transferred deterministic ZIP with its sidecar:
 
 ```bash
-# Accepted retained pack; replace when verifying a newly emitted run ID.
+# Accepted retained pack only; new runs also need the independent digest below.
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
 ```
 
 The verifier is offline and model-free. It validates the exact inventory and
@@ -613,14 +625,29 @@ metadata, and prohibited causal/advice wording. It rejects missing and added
 files, tampering, absolute paths, symlinks, executable model payloads, unsafe
 ZIP members, and any false `PASS`.
 
+The result deliberately separates integrity from provenance. `status: PASS`
+and `integrity_status: PASS` mean that the pack is internally consistent.
+`checksum_verified`/`sidecar_checksum_verified` mean only that an archive
+matched its adjacent transport sidecar. Require
+`authentication_status: AUTHENTICATED` for official use. The retained run is
+anchored by a committed manifest and ZIP digest allowlist; a new run needs an
+independently obtained `artifact_manifest.json` digest supplied with
+`--expected-manifest-sha256` and enforced with `--require-authenticated`.
+PNG checks are structural; the authenticated manifest binds the accepted plot
+bytes without claiming that the verifier rerendered them.
+
 The accepted local real pack is
 `artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
 ZIP and sidecar. Its clean code version/source fingerprint is
-`2cd4145e5e01459d13d186a6f3b697e979821a9d`, its ZIP SHA-256 is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`, its committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, its ZIP
+SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`, and
-its exact 24-file inventory reports `PASS`. Directory-plus-checksum,
-ZIP-plus-sidecar, and extracted offline verification all passed. The recorded
-runtime is Python 3.13.7, NumPy 2.3.5, pandas 2.3.3, scikit-learn 1.9.1,
+its exact 24-file inventory reports `PASS`. Authenticated directory, ZIP, and
+extracted-directory verification all passed; the sidecar transport-integrity
+check also passed. The recorded runtime is Python 3.13.7, NumPy 2.3.5, pandas
+2.3.3, scikit-learn 1.9.1,
 XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP 0.54.1.
 
 All M-001--M-004 results contain 184 rows and 19 transformed features in

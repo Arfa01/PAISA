@@ -56,29 +56,36 @@ serialization environment.
 SHAP 0.54.1 itself requires Python 3.12 or newer and NumPy 2 or newer. That is
 compatible with the retained model runtime but narrower than PAISA's general
 Python 3.10+ and NumPy 1.26+ package floor. Keep explainability in a separate
-Python 3.12+ environment—Python 3.13 is the closest match—and do not treat
-`requirements-explainability.txt` as part of the default CI runtime.
+Python 3.12+ environment—Python 3.13 is the closest match. The default Python
+unit-test job does not install SHAP; a separate required explainability-runtime
+CI job installs and exercises the certified stack.
 
 ```bash
 python3.13 -m venv .venv-explainability
 source .venv-explainability/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-explainability.txt
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
 python -m pip install --no-deps -e .
 python -m pip check
 ```
 
-The pin was selected only after an isolated compatibility smoke test using the
-artifact-matching versions. With seed `314159`, the test fitted one tiny
-Random Forest and one tiny XGBoost binary classifier, explained eight rows with
-six features in probability space, and manually reconstructed every class-1
-probability:
+`constraints-explainability.txt` pins the certified direct versions of NumPy,
+pandas, scikit-learn, XGBoost, joblib, Matplotlib, and SHAP. It is a pip
+constraints file, not a standalone requirements file or a full hashed lock.
+The real-estimator integration runs in a dedicated artifact-free Python 3.13.7
+CI job: it installs that constrained runtime, imports and asserts SHAP
+`0.54.1`, fits tiny Random Forest and XGBoost classifiers, constructs the
+production-style `TreeExplainer`, normalizes the observed SHAP and expected-
+value shapes, and reconstructs every class-1 probability. With seed `314159`,
+eight rows, and six features, CI asserts this live-library contract:
 
-| Estimator | SHAP value shape | Base-value shape | Maximum absolute additivity error | Rows within `1e-6` |
-|---|---:|---:|---:|---:|
-| Random Forest | `(8, 6, 2)` | `(8, 2)` | `5.4065917298729005e-09` | `8/8` |
-| XGBoost | `(8, 6)` | `(8,)` | `4.783143642272947e-08` | `8/8` |
+| Estimator | `shap_values` shape | `explainer.expected_value` shape | Reconstruction gate |
+|---|---:|---:|---:|
+| Random Forest | `(8, 6, 2)` | `(2,)` | `8/8` within `5e-5` |
+| XGBoost | `(8, 6)` | scalar `()` | `8/8` within `1e-6` |
 
 This difference is part of the implementation contract: Random Forest may
 return an explicit class dimension, while binary XGBoost may return one
@@ -157,8 +164,8 @@ Additivity checks are not suppressed to force publication.
 
 ## Generated evidence
 
-A successful run is staged, fully verified, and only then atomically published
-under a collision-refusing ID of the form
+A successful run is staged, internally verified, and only then published with
+collision-refusing no-replace operations under an ID of the form
 `XAI-YYYYMMDD-HHMMSS-OGDC-tree-v1`:
 
 ```text
@@ -225,7 +232,8 @@ model:
 ```bash
 PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
 ```
 
 After transferring the ZIP and sidecar together, verification remains offline:
@@ -235,8 +243,20 @@ PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
-  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
 ```
+
+The adjacent sidecar is a transport-corruption check, not a provenance trust
+anchor. `status: PASS`/`integrity_status: PASS` mean the pack is internally
+consistent. `authentication_status: AUTHENTICATED` means its raw
+`artifact_manifest.json` bytes matched either the committed official allowlist
+or a caller-supplied digest obtained through an independent channel. For a new
+run, pass that value with `--expected-manifest-sha256` together with
+`--require-authenticated`. The verifier validates PNG encoding and structure;
+it does not rerender plots. Authentication proves that the accepted plot pixels
+are the exact manifest-bound bytes identified by the trust anchor; it does not
+by itself prove semantic correspondence between plots and their source tables.
 
 ## Global, local, and audit views
 
@@ -264,9 +284,13 @@ Interpret all of these fields under
 
 Official retained run `XAI-20261024-140320-OGDC-tree-v1` completed with status
 `PASS` and quality status `PASS`. It was produced from clean code commit
-`2cd4145e5e01459d13d186a6f3b697e979821a9d`. The deterministic ZIP SHA-256 is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`; the
+deterministic ZIP SHA-256 is
 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
-Directory and ZIP verification passed without loading an executable model.
+Directory and ZIP verification returned internal `PASS` and authenticated
+`AUTHENTICATED` without loading an executable model.
 
 Every model was explained in positive-class probability space over exactly 184
 shared project holdout rows and 19 ordered technical features. Each model used
@@ -313,7 +337,7 @@ additivity error.
 
 The recorded runtime is Python `3.13.7`, SHAP `0.54.1`, NumPy `2.3.5`, pandas
 `2.3.3`, scikit-learn `1.9.1`, XGBoost `3.4.1`, joblib `1.6.0`, and Matplotlib
-`3.11.2`. Final validation completed with `1339 passed, 2 skipped, 6 warnings`
+`3.11.2`. Final validation completed with `1350 passed, 2 skipped, 6 warnings`
 in the backend and `132 passed` across 10 frontend test files, plus passing
 frontend lint and build.
 

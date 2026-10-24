@@ -3,6 +3,11 @@
 This React, TypeScript, Vite, and Plotly application presents completed PAISA
 OGDC vertical-slice results from the real PAISA API.
 
+It also exposes the independently loaded Unified Six-Model Comparison view for
+completed, checksum-valid M-001 through M-006 comparison packs. The view reads
+authoritative API values and never selects a cross-criterion model, recomputes
+metrics, or loads fitted model binaries.
+
 It is a read-only presentation layer. It does not train models, create
 predictions, execute backtests or trades, recompute backend financial metrics,
 read artifacts from the filesystem, or load model binaries. API errors and
@@ -80,6 +85,8 @@ source .venv/bin/activate
 export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
 export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
 export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+export PAISA_UNIFIED_COMPARISON_ROOT=artifacts/model_comparisons
+export PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID=CMP-20261024-OGDC-price-only-02
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -99,10 +106,35 @@ Open:
 http://127.0.0.1:5173
 ```
 
-The application loads the run list first, lets the user choose a completed run,
-and then retrieves overview, historical-price, model, portfolio, experiment,
-and provenance data from the API. It does not choose a run by reading local
-directories and does not use test fixtures as a runtime fallback.
+The application loads the vertical-slice run list for the existing views. The
+Unified comparison navigation item loads its own completed comparison inventory
+only when opened, uses the API-declared default when configured, and otherwise
+uses the first deterministic completed row. It remains available when the
+vertical-slice inventory is empty or unavailable. A configured default that is
+missing or fails integrity checks is shown as an error rather than silently
+replaced. The browser never chooses a run by reading local directories and does
+not use test fixtures as a runtime fallback.
+
+The unified view reads these v1 resources:
+
+```text
+GET /api/v1/unified-comparisons
+GET /api/v1/unified-comparisons/{comparison_id}
+GET /api/v1/unified-comparisons/{comparison_id}/sources
+GET /api/v1/unified-comparisons/{comparison_id}/summary
+GET /api/v1/unified-comparisons/{comparison_id}/prediction-metrics
+GET /api/v1/unified-comparisons/{comparison_id}/validation-metrics
+GET /api/v1/unified-comparisons/{comparison_id}/portfolio-metrics
+GET /api/v1/unified-comparisons/{comparison_id}/prediction-rankings
+GET /api/v1/unified-comparisons/{comparison_id}/portfolio-rankings
+GET /api/v1/unified-comparisons/{comparison_id}/common-date-contract
+GET /api/v1/unified-comparisons/{comparison_id}/confusion-matrices
+```
+
+The dashboard retains the exact term **shared project holdout**. It presents
+validation selection, shared-holdout prediction metrics, and simulated
+portfolio outcomes separately because better classification performance does
+not necessarily produce better portfolio performance.
 
 ## Frontend commands
 
@@ -142,6 +174,9 @@ committed.
   experiment identifiers, never client-supplied filesystem paths.
 - Exact PKR values remain fixed-scale strings for display. Undefined metrics
   render as `N/A`, never `NaN` or infinity.
+- Unified-comparison responses must contain M-001 through M-006 exactly once,
+  the two controlled portfolio benchmarks, a non-combined outcome contract,
+  and the exact academic disclaimer before they are rendered.
 - Model-selection, simulated portfolio, lowest-drawdown, and buy-and-hold
   results stay visibly separate. Test accuracy is not used to relabel the
   validation-selected prediction model.

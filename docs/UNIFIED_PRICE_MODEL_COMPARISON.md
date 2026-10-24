@@ -14,6 +14,10 @@ hardened `-02` ID is immutable and must be generated afresh.
 The comparison is an academic simulation, not financial advice. It does not
 demonstrate future performance.
 
+The required evaluation terminology and consumer rules are summarized in
+[`SHARED_HOLDOUT_POLICY.md`](SHARED_HOLDOUT_POLICY.md). The detailed artifact
+contract in this document remains authoritative.
+
 ## Contract boundary
 
 The builder is a deterministic evidence transformer. It validates completed

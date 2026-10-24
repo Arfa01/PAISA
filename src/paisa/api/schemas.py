@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
+
+from paisa.api.classification_metrics import validate_confusion_derived_metrics
+
+
+_FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+_Rate = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+_NullableRate = _Rate | None
+_Correlation = Annotated[float, Field(ge=-1.0, le=1.0, allow_inf_nan=False)]
+_NonNegativeFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+_NonNegativeInt = Annotated[int, Field(ge=0)]
+_PositiveInt = Annotated[int, Field(gt=0)]
+_UnifiedClassificationCount = Annotated[int, Field(ge=0, le=10_000_000)]
+_PositiveUnifiedClassificationCount = Annotated[
+    int, Field(gt=0, le=10_000_000)
+]
+_NonNegativeMoney = Annotated[
+    str,
+    Field(pattern=r"^(?:0|[1-9][0-9]*)\.[0-9]{2}$"),
+]
+_ConfusionRow = Annotated[
+    list[_UnifiedClassificationCount], Field(min_length=2, max_length=2)
+]
+_ConfusionMatrix = Annotated[list[_ConfusionRow], Field(min_length=2, max_length=2)]
 
 
 class DateRange(BaseModel):
@@ -514,3 +537,384 @@ class SourceResponse(RunContextResponse):
     source: SourceDetails
     pipeline_evidence: PipelineEvidence | None
     migration_evidence: MigrationEvidence | None
+
+
+class UnifiedComparisonContext(BaseModel):
+    schema_version: str
+    comparison_id: str
+    status: str
+    symbol: str
+    holdout_term: str
+    outcomes_are_not_combined: bool
+    limitations: list[str]
+    disclaimer: str
+
+
+class UnifiedComparisonListItem(BaseModel):
+    schema_version: str
+    comparison_id: str
+    status: str
+    symbol: str
+    model_count: int
+    validation_count: int
+    shared_holdout_count: int
+    shared_holdout_target_start: str
+    shared_holdout_target_end: str
+    holdout_term: str
+    is_default: bool
+
+
+class UnifiedComparisonListResponse(BaseModel):
+    schema_version: str
+    total: int
+    limit: int
+    offset: int
+    default_comparison_id: str | None
+    rows: list[UnifiedComparisonListItem]
+    disclaimer: str
+
+
+class UnifiedModelIdentity(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    algorithm: str
+    configuration_family: str
+
+
+class UnifiedSelectionPolicy(BaseModel):
+    primary: str
+    tie_breakers: list[str]
+    test_metrics_used_for_selection: bool
+
+
+class UnifiedPresentation(BaseModel):
+    format: str
+    plots_included: bool
+    data_sources: list[str]
+
+
+class UnifiedComparisonDetailResponse(UnifiedComparisonContext):
+    models: list[UnifiedModelIdentity]
+    source_frequency: str
+    validation_count: int
+    shared_holdout_count: int
+    selection_policy: UnifiedSelectionPolicy
+    presentation: UnifiedPresentation
+
+
+class UnifiedSourceReference(BaseModel):
+    role: str
+    artifact_type: str
+    run_id: str
+    integrity_root_sha256: str
+    payload_file_count: int
+    integrity_root_derivation: str
+
+
+class UnifiedSourceRelationships(BaseModel):
+    vertical_slice_uses_training_run: bool
+    lstm_uses_training_run: bool
+    lstm_uses_vertical_slice: bool
+
+
+class UnifiedSourcesResponse(UnifiedComparisonContext):
+    sources: list[UnifiedSourceReference]
+    relationships: UnifiedSourceRelationships
+
+
+class UnifiedHoldoutContext(BaseModel):
+    term: str
+    common_count: int
+    target_start: str
+    target_end: str
+    previously_exposed_through: list[str]
+
+
+class UnifiedPredictionOutcome(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    criterion: str
+    scope: str
+    accuracy: _Rate
+    balanced_accuracy: _NullableRate
+    f1: _Rate
+
+
+class UnifiedPortfolioOutcome(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    portfolio_id: str
+    criterion: str
+    ending_equity: str
+    total_return: _FiniteFloat
+    maximum_drawdown: _Rate
+    fees_paid: _NonNegativeMoney
+
+
+class UnifiedBenchmarkOutcome(BaseModel):
+    initial_equity: str
+    ending_equity: str
+    total_return: _FiniteFloat
+    maximum_drawdown: _Rate
+    volatility: _NonNegativeFloat | None
+    sharpe_ratio: _FiniteFloat | None
+    number_of_trades: _NonNegativeInt
+    fees_paid: _NonNegativeMoney
+
+
+class UnifiedBeatBuyAndHoldOutcome(BaseModel):
+    value: bool
+    best_model_variant_id: str
+    best_model_minus_buy_and_hold: _FiniteFloat
+    comparison_metric: str
+
+
+class UnifiedReportedOutcomes(BaseModel):
+    validation_selected_model: UnifiedPredictionOutcome
+    lstm_validation_preferred_model: UnifiedPredictionOutcome
+    best_shared_holdout_balanced_accuracy: UnifiedPredictionOutcome
+    best_shared_holdout_f1: UnifiedPredictionOutcome
+    best_simulated_model_portfolio: UnifiedPortfolioOutcome
+    lowest_drawdown_model_portfolio: UnifiedPortfolioOutcome
+    lowest_fee_model_portfolio: UnifiedPortfolioOutcome
+    cash_only_benchmark: UnifiedBenchmarkOutcome
+    buy_and_hold_result: UnifiedBenchmarkOutcome
+    any_model_beat_buy_and_hold: UnifiedBeatBuyAndHoldOutcome
+
+
+class UnifiedSummaryResponse(UnifiedComparisonContext):
+    holdout_context: UnifiedHoldoutContext
+    reported_outcomes: UnifiedReportedOutcomes
+
+
+class UnifiedPredictionMetricRow(BaseModel):
+    competitor_id: str
+    competitor_type: str
+    registered_model_id: str | None
+    algorithm: str | None
+    configuration_family: str | None
+    evaluation_scope: str
+    row_count: _PositiveUnifiedClassificationCount
+    support: _PositiveUnifiedClassificationCount
+    accuracy: _Rate
+    balanced_accuracy: _NullableRate
+    precision: _Rate
+    recall: _Rate
+    f1: _Rate
+    matthews_corrcoef: _Correlation | None
+    roc_auc: _NullableRate
+    brier_score: _Rate
+    log_loss: _NonNegativeFloat | None
+    expected_calibration_error: _Rate
+    selection_eligible: bool
+    metric_warnings: list[str]
+    class_counts: dict[str, _UnifiedClassificationCount]
+    predicted_class_counts: dict[str, _UnifiedClassificationCount]
+    confusion_matrix: _ConfusionMatrix
+
+    @model_validator(mode="after")
+    def reconcile_confusion_counts(self) -> "UnifiedPredictionMetricRow":
+        if set(self.class_counts) != {"0", "1"} or set(
+            self.predicted_class_counts
+        ) != {"0", "1"}:
+            raise ValueError("class count maps must contain exactly classes 0 and 1")
+        if self.row_count != self.support:
+            raise ValueError("row_count and support must agree")
+        if sum(self.class_counts.values()) != self.support:
+            raise ValueError("class_counts must reconcile with support")
+        if sum(self.predicted_class_counts.values()) != self.support:
+            raise ValueError("predicted_class_counts must reconcile with support")
+        if sum(map(sum, self.confusion_matrix)) != self.support:
+            raise ValueError("confusion_matrix must reconcile with support")
+        if [sum(row) for row in self.confusion_matrix] != [
+            self.class_counts["0"],
+            self.class_counts["1"],
+        ]:
+            raise ValueError("confusion_matrix rows must reconcile with class_counts")
+        if [
+            self.confusion_matrix[0][column] + self.confusion_matrix[1][column]
+            for column in range(2)
+        ] != [
+            self.predicted_class_counts["0"],
+            self.predicted_class_counts["1"],
+        ]:
+            raise ValueError(
+                "confusion_matrix columns must reconcile with predicted_class_counts"
+            )
+        validate_confusion_derived_metrics(
+            {
+                "accuracy": self.accuracy,
+                "balanced_accuracy": self.balanced_accuracy,
+                "precision": self.precision,
+                "recall": self.recall,
+                "f1": self.f1,
+                "matthews_corrcoef": self.matthews_corrcoef,
+            },
+            self.confusion_matrix,
+            field="prediction metrics",
+        )
+        complete_class_coverage = all(
+            self.class_counts[label] > 0 for label in ("0", "1")
+        )
+        if self.selection_eligible is not complete_class_coverage:
+            raise ValueError(
+                "selection_eligible must equal complete actual-class coverage"
+            )
+        if ("single_class_actuals" in self.metric_warnings) != (
+            not complete_class_coverage
+        ):
+            raise ValueError(
+                "single_class_actuals warning must match actual-class coverage"
+            )
+        if complete_class_coverage:
+            if self.roc_auc is None or self.log_loss is None:
+                raise ValueError(
+                    "roc_auc and log_loss must be defined with both actual classes"
+                )
+        elif self.roc_auc is not None or self.log_loss is not None:
+            raise ValueError(
+                "roc_auc and log_loss must be null for single-class actuals"
+            )
+        return self
+
+
+class UnifiedPredictionMetricsResponse(UnifiedComparisonContext):
+    models: list[UnifiedPredictionMetricRow]
+    reference_baselines: list[UnifiedPredictionMetricRow]
+
+
+class UnifiedValidationMetricsResponse(UnifiedPredictionMetricsResponse):
+    evaluation_scope: str
+
+
+class UnifiedModelPortfolioMetric(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    experiment_id: str
+    portfolio_id: str
+    initial_equity: str
+    ending_equity: str
+    total_return: _FiniteFloat
+    maximum_drawdown: _Rate
+    volatility: _NonNegativeFloat | None
+    sharpe_ratio: _FiniteFloat | None
+    number_of_trades: _NonNegativeInt
+    win_rate: _NullableRate
+    average_gain: str | None
+    average_loss: str | None
+    turnover: _NonNegativeFloat
+    fees_paid: _NonNegativeMoney
+    time_in_market: _Rate
+    excess_return_vs_cash_only: _FiniteFloat
+    excess_return_vs_buy_and_hold: _FiniteFloat
+
+
+class UnifiedBenchmarkPortfolioMetric(BaseModel):
+    benchmark_id: str
+    initial_equity: str
+    ending_equity: str
+    total_return: _FiniteFloat
+    maximum_drawdown: _Rate
+    volatility: _NonNegativeFloat | None
+    sharpe_ratio: _FiniteFloat | None
+    number_of_trades: _NonNegativeInt
+    win_rate: _NullableRate
+    average_gain: str | None
+    average_loss: str | None
+    turnover: _NonNegativeFloat
+    fees_paid: _NonNegativeMoney
+    time_in_market: _Rate
+    ledger_count: _PositiveInt
+
+
+class UnifiedPortfolioMetricsResponse(UnifiedComparisonContext):
+    models: list[UnifiedModelPortfolioMetric]
+    benchmarks: list[UnifiedBenchmarkPortfolioMetric]
+
+
+class UnifiedPredictionRankingRow(BaseModel):
+    rank: _PositiveInt
+    competitor_id: str
+    registered_model_id: str
+    accuracy: _Rate
+    balanced_accuracy: _NullableRate
+    f1: _Rate
+
+
+class UnifiedPredictionRankingsResponse(UnifiedComparisonContext):
+    validation_model_selection: list[UnifiedPredictionRankingRow]
+    lstm_validation_preference: list[UnifiedPredictionRankingRow]
+    shared_project_holdout_balanced_accuracy: list[UnifiedPredictionRankingRow]
+    shared_project_holdout_f1: list[UnifiedPredictionRankingRow]
+
+
+class UnifiedPortfolioRankingRow(BaseModel):
+    rank: _PositiveInt
+    competitor_id: str
+    registered_model_id: str
+    total_return: _FiniteFloat | None
+    maximum_drawdown: _NullableRate
+    sharpe_ratio: _FiniteFloat | None
+    fees_paid: _NonNegativeMoney | None
+    number_of_trades: _NonNegativeInt | None
+
+
+class UnifiedPortfolioRankingsResponse(UnifiedComparisonContext):
+    simulated_model_portfolio_return: list[UnifiedPortfolioRankingRow]
+    simulated_model_portfolio_drawdown: list[UnifiedPortfolioRankingRow]
+    simulated_model_portfolio_fees: list[UnifiedPortfolioRankingRow]
+
+
+class UnifiedCommonDateKey(BaseModel):
+    ticker: str
+    feature_date: str
+    target_date: str
+    actual_class: int
+
+
+class UnifiedDateScope(BaseModel):
+    terminology: str
+    common_count: int
+    feature_start: str
+    feature_end: str
+    target_start: str
+    target_end: str
+    original_counts: dict[str, int]
+    common_counts: dict[str, int]
+    dropped_target_dates: dict[str, list[str]]
+    common_keys: list[UnifiedCommonDateKey]
+
+
+class UnifiedHoldoutDateScope(UnifiedDateScope):
+    previously_exposed_through: list[str]
+
+
+class UnifiedCommonDateResponse(UnifiedComparisonContext):
+    alignment_key: list[str]
+    validation: UnifiedDateScope
+    shared_project_holdout: UnifiedHoldoutDateScope
+
+
+class UnifiedConfusionMatrixRow(BaseModel):
+    competitor_id: str
+    competitor_type: str
+    registered_model_id: str | None
+    evaluation_scope: str
+    class_labels: Annotated[list[int], Field(min_length=2, max_length=2)]
+    confusion_matrix: _ConfusionMatrix
+    support: _PositiveUnifiedClassificationCount
+
+    @model_validator(mode="after")
+    def reconcile_confusion_support(self) -> "UnifiedConfusionMatrixRow":
+        if self.class_labels != [0, 1]:
+            raise ValueError("class_labels must equal [0, 1]")
+        if sum(map(sum, self.confusion_matrix)) != self.support:
+            raise ValueError("confusion_matrix must reconcile with support")
+        return self
+
+
+class UnifiedConfusionMatricesResponse(UnifiedComparisonContext):
+    validation_models: list[UnifiedConfusionMatrixRow]
+    validation_reference_baselines: list[UnifiedConfusionMatrixRow]
+    shared_project_holdout_models: list[UnifiedConfusionMatrixRow]
+    shared_project_holdout_reference_baselines: list[UnifiedConfusionMatrixRow]

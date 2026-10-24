@@ -29,6 +29,7 @@ proposal and early-v0 context.
 | [Results interpretation](docs/RESULTS_INTERPRETATION.md) | Defensible interpretation of prediction and simulated portfolio results. |
 | [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
 | [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Authoritative `CMP-20261024-OGDC-price-only-02` M-001–M-006 pack, full offline semantic replay, portable ZIP/checksum, and separate tabular outcomes. |
+| [Shared project holdout policy](docs/SHARED_HOLDOUT_POLICY.md) | Normative terminology, selection boundary, and separate-outcome rules for presenting the M-001–M-006 comparison. |
 | [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
 | [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
@@ -820,7 +821,8 @@ or user-directory paths.
 
 ### Read-only v1 experiment-results API
 
-The additive `/api/v1` API reads completed, immutable vertical-slice artifacts.
+The additive `/api/v1` API reads completed, immutable vertical-slice and
+unified-comparison artifacts.
 It does not train a model, rerun a backtest, recalculate business metrics, write
 artifacts, perform real trading, or deserialize/serve a fitted model binary.
 A completed vertical slice owns its historical-data snapshot; dashboards should
@@ -840,15 +842,20 @@ python -m pip install -e .
 export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
 export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
 export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+export PAISA_UNIFIED_COMPARISON_ROOT=artifacts/model_comparisons
+export PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID=CMP-20261024-OGDC-price-only-02
 
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-`PAISA_VERTICAL_SLICE_ROOT` and `PAISA_MODEL_TRAINING_ROOT` default to the
-values shown. `PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` is optional, but
-`GET /api/v1/leaderboard` returns `409` if it is unset instead of guessing a
-run. Run-specific URLs do not require a default. Configured relative paths are
-resolved from the repository root.
+`PAISA_VERTICAL_SLICE_ROOT`, `PAISA_MODEL_TRAINING_ROOT`, and
+`PAISA_UNIFIED_COMPARISON_ROOT` default to the values shown. Both default-run
+variables are optional. `GET /api/v1/leaderboard` returns `409` when
+`PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` is unset instead of guessing a run;
+`GET /api/v1/unified-comparisons/default` behaves the same way when
+`PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID` is unset. Run-specific URLs do not
+require a default. Configured relative paths are resolved from the repository
+root.
 
 | Endpoint | Purpose |
 |---|---|
@@ -868,6 +875,18 @@ resolved from the repository root.
 | `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/trades` | Return paginated strategy trades. |
 | `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/snapshots` | Return paginated strategy portfolio snapshots. |
 | `GET /api/v1/vertical-slices/{run_id}/experiments/{experiment_id}/benchmarks` | Return paginated cash-only and buy-and-hold snapshots and buy-and-hold trades. |
+| `GET /api/v1/unified-comparisons` | List completed, exact-inventory, checksum-valid unified comparison packs. |
+| `GET /api/v1/unified-comparisons/default` | Return details for the explicitly configured default comparison. |
+| `GET /api/v1/unified-comparisons/{comparison_id}` | Return the six model identities, selection policy, counts, and persisted-data sources. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/sources` | Return redacted source-run identities and integrity references. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/summary` | Return the separately reported comparison outcomes and holdout context. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/prediction-metrics` | Return M-001–M-006 and reference-baseline shared project holdout metrics. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/validation-metrics` | Return the separate validation evidence used for model selection. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/portfolio-metrics` | Return six independent model portfolios plus cash and buy-and-hold benchmarks. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/prediction-rankings` | Return the persisted validation and shared project holdout rankings. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/portfolio-rankings` | Return separate persisted return, drawdown, and fee rankings. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/common-date-contract` | Return the ordered validation and shared project holdout alignment evidence. |
+| `GET /api/v1/unified-comparisons/{comparison_id}/confusion-matrices` | Return persisted validation and shared project holdout confusion matrices. |
 
 The run listing and large-table endpoints accept `limit` (default `200`,
 maximum `1000`) and `offset` (default `0`) and return `total`, `limit`,
@@ -876,6 +895,8 @@ maximum `1000`) and `offset` (default `0`) and return `total`, `limit`,
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/vertical-slices
 curl -s http://127.0.0.1:8000/api/v1/leaderboard
+curl -s http://127.0.0.1:8000/api/v1/unified-comparisons
+curl -s http://127.0.0.1:8000/api/v1/unified-comparisons/default
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/stocks/OGDC/prices?limit=5&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/equity-curves?limit=25&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/vertical-slices/VSL-20261020-OGDC-main-02/experiments/VSL-20261020-OGDC-main-02-m-001/trades?limit=25&offset=0"
@@ -899,8 +920,12 @@ Run and experiment IDs accept only safe identifier characters. The repository
 rejects traversal, symlink escape, non-`PASS` or incomplete runs, missing or
 extra inventoried files, checksum mismatches, and invalid referenced training
 runs. Clients choose registered IDs, never filenames or filesystem paths, and
-v1 responses do not reveal absolute local paths. The price route selects only
-the manifest-bound `input_snapshot` CSV; it never reads
+v1 responses do not reveal absolute local paths. Unified-comparison reads also
+reject executable model payloads, never deserialize a model, and do not replay
+metrics or portfolio accounting during a request. The canonical pack declares
+that plots are not included, so the API exposes its persisted tabular data
+sources instead of inventing chart series. The price route selects only the
+manifest-bound `input_snapshot` CSV; it never reads
 `data/processed/psx_prices.csv` and never loads a model binary. See
 [`docs/api_design.md`](docs/api_design.md) for response examples and error
 semantics.
@@ -942,11 +967,13 @@ source .venv/bin/activate
 export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
 export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
 export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+export PAISA_UNIFIED_COMPARISON_ROOT=artifacts/model_comparisons
+export PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID=CMP-20261024-OGDC-price-only-02
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The configured immutable vertical-slice and model-training artifact roots must
-already contain that completed run. In a second terminal, start the frontend:
+The configured immutable roots must already contain the selected completed
+runs. In a second terminal, start the frontend:
 
 ```bash
 cd frontend
@@ -961,6 +988,14 @@ all available rows through documented pages of at most `5000`; the backend
 serves the selected run's immutable, checksum-verified input snapshot rather
 than `data/processed/psx_prices.csv`. API failures remain visible and the
 dashboard does not substitute fixture, sample, synthetic, or fake prices.
+
+The independent Unified Six-Model Comparison view reads only the validated
+comparison endpoints. It shows M-001 through M-006, their validation-selection
+evidence, shared project holdout metrics, six independent portfolios, cash and
+buy-and-hold benchmarks, and eight separate result cards. It deliberately does
+not name a universal winner: classification quality, simulated return,
+drawdown, and fees remain different measurements, and better classification
+performance does not necessarily produce better portfolio performance.
 
 Frontend quality and production-build commands are:
 

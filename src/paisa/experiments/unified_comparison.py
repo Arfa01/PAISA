@@ -51,6 +51,10 @@ from paisa.experiments.lstm_comparison import (
     align_predictions_on_common_dates,
     calibration_information,
 )
+from paisa.experiments.unified_authority import (
+    AUTHORITATIVE_SOURCE_ROOTS,
+    expected_evidence_bindings,
+)
 from paisa.trading.models import (
     Action,
     BPS_DENOMINATOR,
@@ -93,29 +97,6 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _SOURCE_ROLES = ("baseline_training", "baseline_vertical_slice", "lstm")
-AUTHORITATIVE_SOURCE_ROOTS = {
-    "baseline_training": {
-        "run_id": "TRN-20261020-191815-624662-nogit",
-        "manifest_sha256": (
-            "8d5113bc8b67f43a76639d7397b905217bda1f94321183f0438e33448f689023"
-        ),
-    },
-    "baseline_vertical_slice": {
-        "run_id": "VSL-20261020-OGDC-main-02",
-        "manifest_sha256": (
-            "2ce2f7581a5baff8487b09ae695213745c704f11715e6bd5abd0e99009337f31"
-        ),
-        "portable_certificate_sha256": (
-            "e948409e679061d0c503171be64b76d9d847a2161cb70f7baa5737089e19c314"
-        ),
-    },
-    "lstm": {
-        "run_id": "LSTM-20261024-OGDC-price-only-02",
-        "manifest_sha256": (
-            "e475e077f375071c79ce8743425831d8cd9cf5ceb37f42eca0acfa65a100f3d0"
-        ),
-    },
-}
 _PACK_REQUIRED_FILES = {
     "comparison_contract.json",
     "date_alignment.json",
@@ -2702,74 +2683,10 @@ def _write_pack_manifest(stage_dir: Path, *, comparison_id: str) -> dict[str, An
 def _expected_evidence_bindings(
     registry: Mapping[str, str],
 ) -> dict[str, tuple[str, str, str]]:
-    bindings: dict[str, tuple[str, str, str]] = {
-        "evidence/source_manifests/baseline_training_run_manifest.json": (
-            "baseline_training",
-            "run_manifest.json",
-            "source_integrity_root",
-        ),
-        "evidence/source_manifests/lstm_run_manifest.json": (
-            "lstm",
-            "run_manifest.json",
-            "source_integrity_root",
-        ),
-        "evidence/source_manifests/lstm_artifact_manifest.json": (
-            "lstm",
-            "artifact_manifest.json",
-            "source_payload_inventory",
-        ),
-        "evidence/splits/baseline_split_manifest.json": (
-            "baseline_training",
-            "split_manifest.json",
-            "chronological_split_membership",
-        ),
-        "evidence/splits/lstm_split_manifest.json": (
-            "lstm",
-            "split_manifest.json",
-            "lstm_sequence_split_membership",
-        ),
-        "evidence/market_data/baseline_psx_prices.csv": (
-            "baseline_vertical_slice",
-            "input_snapshot/psx_prices.csv",
-            "portfolio_market_observations",
-        ),
-        "evidence/market_data/lstm_ogdc_prices.csv": (
-            "lstm",
-            "frozen_input/OGDC_prices.csv",
-            "portfolio_market_observations",
-        ),
-    }
-    for variant_id in MODEL_VARIANTS:
-        role = "baseline_training" if variant_id in BASELINE_VARIANTS else "lstm"
-        bindings[
-            f"evidence/predictions/{variant_id}/predictions_all_splits.csv"
-        ] = (
-            role,
-            f"models/{registry[variant_id]}/predictions_all_splits.csv",
-            "model_prediction_rows",
-        )
-        if variant_id in BASELINE_VARIANTS:
-            experiment = (
-                f"{AUTHORITATIVE_SOURCE_ROOTS['baseline_vertical_slice']['run_id']}-"
-                f"{variant_id.lower()}"
-            )
-            prefix = f"experiments/{experiment}"
-            role = "baseline_vertical_slice"
-        else:
-            experiment = (
-                f"{AUTHORITATIVE_SOURCE_ROOTS['lstm']['run_id']}-{variant_id.lower()}"
-            )
-            prefix = f"backtests/{experiment}"
-            role = "lstm"
-        for relative in _PORTFOLIO_FILES:
-            bindings[f"evidence/portfolios/{variant_id}/{relative}"] = (
-                role,
-                f"{prefix}/{relative}",
-                "portfolio_configuration"
-                if relative == "config.json"
-                else "portfolio_ledger",
-            )
-    return bindings
+    return expected_evidence_bindings(
+        registry,
+        portfolio_files=_PORTFOLIO_FILES,
+    )
 
 
 def _source_checksum_maps(pack_root: Path) -> tuple[dict[str, dict[str, str]], dict[str, int]]:

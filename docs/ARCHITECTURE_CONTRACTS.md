@@ -188,7 +188,9 @@ Validation-only selection remains separate from descriptive results on the
 **shared project holdout**. Balanced accuracy, F1, simulated return, drawdown,
 fees, buy-and-hold, and the validation-selected model are separate reported
 outcomes; the pack must not collapse them into one cross-criterion score or
-ranking.
+ranking. API and dashboard consumers also follow the dedicated
+[`SHARED_HOLDOUT_POLICY.md`](SHARED_HOLDOUT_POLICY.md) terminology and
+presentation rules.
 
 The comparison directory uses an exact SHA-256 inventory that excludes only
 its own `manifest.json`. Publication refuses existing directory, ZIP, or

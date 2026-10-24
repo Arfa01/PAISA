@@ -2,10 +2,10 @@
 
 Repository: `Arfa01/PAISA`
 
-Snapshot base: `origin/main` at `a80594d80a884dcef129f2d4a9c896217c6793c5`
-after merge of PR #17
+Snapshot base: `origin/main` at `80105a2`
+after merge of PR #19
 
-Current comparison work: `feature/unified-price-model-comparison`
+Current integration work: `feature/unified-comparison-api-dashboard`
 
 PAISA is an academic research prototype. Every prediction, signal, trade,
 portfolio value, curve, and return is an academic simulation and is **not
@@ -41,7 +41,7 @@ evidence, follow [Current Implementation Status](CURRENT_IMPLEMENTATION_STATUS.m
 | Unified price-only comparison | A deterministic read-only builder and offline verifier recompute M-001–M-006, reference-baseline, model-portfolio, cash-only, and controlled buy-and-hold metrics from checksum-bound persisted evidence. The portable evidence now includes two raw market files and six policy-signal files so exact `Decimal` policy, execution, accounting, and benchmark semantics can be replayed without retraining, inference, or invoking the production backtest runner. The output remains price-only and tabular/report-only. |
 | Policy, portfolio, and backtesting | Threshold policy, next-session-open execution, fees, independent strategy ledgers, cash-only and controlled buy-and-hold benchmarks, trades, snapshots, drawdowns, and reports are implemented. |
 | OGDC vertical slice | One collision-refusing command connects acquisition, preparation, training, prediction, policy, simulation, validation, and reports for daily OGDC data. |
-| Results delivery | A read-only `/api/v1` validates immutable vertical-slice artifacts; the React/TypeScript/Plotly dashboard presents history, model and portfolio comparisons, experiment detail, provenance, limitations, and the disclaimer. |
+| Results delivery | A read-only `/api/v1` validates immutable vertical-slice artifacts and authoritative unified-comparison packs. The React/TypeScript/Plotly dashboard presents history, preserves the existing vertical-slice views, and adds an independent M-001–M-006 comparison view with separate prediction, portfolio, drawdown, fee, cash, and buy-and-hold outcomes. |
 | News foundation | RSS/Atom, reviewed manual CSV, and bounded metadata-only GDELT DOC adapters preserve raw evidence, normalized records, timing, deterministic deduplication, controlled OGDC links, SQLite state, and immutable quality packs. |
 | Historical coverage audit | News evidence can be mapped leakage-safely to the immutable stock calendar and exact split dates under explicit permission, provenance, completeness, and coverage gates. |
 | Article sentiment | Pinned `ProsusAI/finbert` inference produces immutable article-level class probabilities with model, tokenizer, text-policy, timing, runtime, and checksum evidence. It does not aggregate by day or emit a trading signal. |
@@ -71,6 +71,8 @@ dashboard presents results without recomputing them.
 | #15 | `cf897e1` | Contemporaneous historical evidence |
 | #16 | `d7015cb` | Price-only LSTM experiments and certified evidence |
 | #17 | `a80594d` | Project continuation roadmap and offline CI |
+| #18 | `9317f93` | Authoritative unified M-001–M-006 price-model comparison pack |
+| #19 | `80105a2` | Frontend Zod validation security hardening |
 
 Tags currently retained in Git are:
 
@@ -206,15 +208,16 @@ commit `2bd20ed`. Before the `-02` hardening changes, this comparison branch
 reported `1,082 passed, 1 skipped` backend tests with six dependency
 deprecation warnings, 57 passing frontend tests, and passing frontend
 lint/build, `pip check`, `compileall`, focused comparison/documentation tests,
-and diff checks. Final hardened-regression results must replace this historical
-branch checkpoint before publication. The frontend build retains its known
-large-chunk warning.
+and diff checks. The current unified-comparison API/dashboard integration
+reports `1,157 passed, 1 skipped` backend tests with the same six dependency
+deprecation warnings, 91 passing frontend tests, and passing frontend
+lint/build, `pip check`, `compileall`, canonical-pack endpoint smoke, and diff
+checks. The frontend build retains its known large-chunk warning.
 
 ## Active and open work
 
-- The hardened unified comparison pack is active on
-  `feature/unified-price-model-comparison`; its generated canonical artifacts
-  remain local and Git-ignored. The verified `-02` custody digest is
+- The hardened unified comparison pack is merged. Its generated canonical
+  artifacts remain local and Git-ignored. The verified `-02` custody digest is
   `8d3bd49f3f018d9134a245ee9c58eebe26a1c9d939851976702c86b66e385fbe`,
   and its total file count is `65`.
 - GitHub reports zero open issues at this snapshot.
@@ -246,19 +249,20 @@ large-chunk warning.
 5. **Missing research layers:** SHAP, general entity/sector/event graphs,
    multi-stock evaluation, daily sentiment aggregation, and controlled
    price-plus-sentiment comparison are not complete.
-6. **Delivery gap:** the certified LSTM run remains separate from the
-   vertical-slice API and dashboard, while the hardened unified comparison is
-   a local, Git-ignored derived artifact pending final `-02` regeneration. There
-   is no fixture-backed read-only
-   LSTM or unified-comparison API and no unified six-model dashboard
-   presentation.
+6. **Delivery boundary:** the certified LSTM run remains separate from the
+   vertical-slice API as a standalone run. There is no fixture-backed read-only
+   LSTM-run endpoint. The unified comparison integration reads only the
+   authoritative, local, Git-ignored `CMP-20261024-OGDC-price-only-02` pack; it
+   does not replace the need for retained artifacts, retrain models, or
+   recompute results.
 7. **Operational scope:** there is no production database service,
    authentication, scheduled ingestion/retraining, broker integration, live
    trading, or production deployment evidence.
 
 ## Exact next safe task
 
-Create one narrow, fixture-backed PR for **read-only LSTM artifact integration**:
+After the unified-comparison integration is merged, create one narrow,
+fixture-backed PR for **read-only LSTM artifact integration**:
 
 1. define an additive configured root and validated repository contract for
    immutable `artifacts/lstm_experiments/<run_id>/` packs;
@@ -271,12 +275,11 @@ Create one narrow, fixture-backed PR for **read-only LSTM artifact integration**
    contradictory identities; and
 5. document the environment variable and endpoints.
 
-Keep the PR independent of the retained private artifacts. It must not retrain a
-model, mutate or reseal `VSL-20261020-OGDC-main-02`, recompute metrics in a GET
-request, change the legacy API, or add a combined dashboard ranking. The unified
-comparison was produced early under an explicit evidence-only task; that does
-not satisfy the fixture-backed LSTM read gate or authorize using the private
-comparison pack in clean-clone tests.
+Keep that later PR independent of the retained private artifacts. It must not
+retrain a model, mutate or reseal `VSL-20261020-OGDC-main-02`, recompute metrics
+in a GET request, change the legacy API, or introduce a universal ranking. The
+unified comparison API serves the aggregate certified pack; it does not satisfy
+the separate fixture-backed LSTM-run read gate.
 
 This task is unblocked by the historical-news permission problem and preserves
 the existing model, policy, portfolio, API, and presentation boundaries.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from typing import Any, Callable, TypeVar
+from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -36,6 +37,17 @@ from paisa.api.schemas import (
     SourceResponse,
     StockPricesResponse,
     TradesResponse,
+    UnifiedCommonDateResponse,
+    UnifiedComparisonDetailResponse,
+    UnifiedComparisonListResponse,
+    UnifiedConfusionMatricesResponse,
+    UnifiedPortfolioMetricsResponse,
+    UnifiedPortfolioRankingsResponse,
+    UnifiedPredictionMetricsResponse,
+    UnifiedPredictionRankingsResponse,
+    UnifiedSourcesResponse,
+    UnifiedSummaryResponse,
+    UnifiedValidationMetricsResponse,
     VerticalSliceDetailResponse,
     VerticalSliceListResponse,
     VerticalSliceSummaryResponse,
@@ -46,7 +58,7 @@ router = APIRouter(prefix="/api/v1", tags=["experiment-results-v1"])
 MAX_TABLE_LIMIT = 1000
 MAX_PRICE_LIMIT = 5000
 T = TypeVar("T")
-_WEB_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_WEB_URL = re.compile(r"(?:https?|wss?|ftp)://[^\s\"'<>]+", re.IGNORECASE)
 _FILE_URI = re.compile(r"\bfile:(?://)?[^\s\"'<>]*", re.IGNORECASE)
 _POSIX_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?:[^\s\"'<>]*)")
 _UNC_PATH = re.compile(
@@ -56,10 +68,31 @@ _ROOTED_WINDOWS_PATH = re.compile(
     r"(?<![A-Za-z0-9\\])\\(?!\\)[^\\/\s\"'<>]+\\[^\s\"'<>]*"
 )
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
+_EXECUTABLE_MODEL_REFERENCE = re.compile(
+    r"\.(?:joblib|pkl|pickle|keras|h5|hdf5|onnx|pt|pth|pb|ckpt|safetensors)"
+    r"(?=$|[^A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 def _assert_no_absolute_local_paths(value: Any) -> None:
     if isinstance(value, str):
+        for match in _WEB_URL.finditer(value):
+            parsed_url = urlsplit(match.group(0))
+            url_metadata = unquote(f"{parsed_url.query} {parsed_url.fragment}")
+            decoded_url_path = unquote(parsed_url.path)
+            if (
+                _FILE_URI.search(url_metadata)
+                or _POSIX_ABSOLUTE_PATH.search(url_metadata)
+                or _UNC_PATH.search(url_metadata)
+                or _ROOTED_WINDOWS_PATH.search(url_metadata)
+                or _WINDOWS_ABSOLUTE_PATH.search(url_metadata)
+                or _EXECUTABLE_MODEL_REFERENCE.search(url_metadata)
+                or _EXECUTABLE_MODEL_REFERENCE.search(decoded_url_path)
+            ):
+                raise ArtifactIntegrityError(
+                    "Artifact response URL contains a prohibited absolute local path"
+                )
         without_urls = _WEB_URL.sub("", value)
         if (
             _FILE_URI.search(without_urls)
@@ -110,6 +143,173 @@ def _table_response(
         "total": len(rows),
         "rows": rows,
     }
+
+
+@router.get(
+    "/unified-comparisons", response_model=UnifiedComparisonListResponse
+)
+def list_unified_comparisons(
+    limit: int = Query(default=200, ge=1, le=MAX_TABLE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    """List only exact-inventory, checksum-valid completed comparison packs."""
+
+    rows = _repository_call(repository.list_completed_unified_comparisons)
+    default_id = _repository_call(
+        repository.configured_default_unified_comparison_id
+    )
+    return {
+        "schema_version": "1.0",
+        "total": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "default_comparison_id": default_id,
+        "rows": rows[offset : offset + limit],
+        "disclaimer": ACADEMIC_DISCLAIMER,
+    }
+
+
+@router.get(
+    "/unified-comparisons/default",
+    response_model=UnifiedComparisonDetailResponse,
+)
+def get_default_unified_comparison(
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    """Read the explicitly configured comparison; never guess a latest run."""
+
+    return _repository_call(
+        lambda: repository.load_unified_comparison_detail(
+            repository.default_unified_comparison_id
+        )
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}",
+    response_model=UnifiedComparisonDetailResponse,
+)
+def get_unified_comparison(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_comparison_detail(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/sources",
+    response_model=UnifiedSourcesResponse,
+)
+def get_unified_comparison_sources(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(lambda: repository.load_unified_sources(comparison_id))
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/summary",
+    response_model=UnifiedSummaryResponse,
+)
+def get_unified_comparison_summary(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(lambda: repository.load_unified_summary(comparison_id))
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/prediction-metrics",
+    response_model=UnifiedPredictionMetricsResponse,
+)
+def get_unified_prediction_metrics(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_prediction_metrics(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/validation-metrics",
+    response_model=UnifiedValidationMetricsResponse,
+)
+def get_unified_validation_metrics(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_validation_metrics(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/portfolio-metrics",
+    response_model=UnifiedPortfolioMetricsResponse,
+)
+def get_unified_portfolio_metrics(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_portfolio_metrics(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/prediction-rankings",
+    response_model=UnifiedPredictionRankingsResponse,
+)
+def get_unified_prediction_rankings(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_prediction_rankings(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/portfolio-rankings",
+    response_model=UnifiedPortfolioRankingsResponse,
+)
+def get_unified_portfolio_rankings(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_portfolio_rankings(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/common-date-contract",
+    response_model=UnifiedCommonDateResponse,
+)
+def get_unified_common_date_contract(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_common_date_contract(comparison_id)
+    )
+
+
+@router.get(
+    "/unified-comparisons/{comparison_id}/confusion-matrices",
+    response_model=UnifiedConfusionMatricesResponse,
+)
+def get_unified_confusion_matrices(
+    comparison_id: str,
+    repository: ArtifactRepository = Depends(get_artifact_repository),
+) -> dict[str, Any]:
+    return _repository_call(
+        lambda: repository.load_unified_confusion_matrices(comparison_id)
+    )
 
 
 @router.get("/vertical-slices", response_model=VerticalSliceListResponse)

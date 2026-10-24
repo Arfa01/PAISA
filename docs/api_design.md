@@ -11,8 +11,8 @@ PAISA exposes two additive interfaces:
 - The original unversioned v0 routes provide pipeline and baseline-prediction
   compatibility. Their routes and response shapes are unchanged.
 - `/api/v1` provides read-only access to completed immutable model,
-  experiment, portfolio, benchmark, vertical-slice, and run-owned historical
-  price results.
+  experiment, portfolio, benchmark, vertical-slice, unified-comparison, and
+  run-owned historical price results.
 
 Every prediction, signal, trade, portfolio value, benchmark, and return shown
 by either interface is an academic simulation and is not financial advice.
@@ -31,6 +31,8 @@ python -m pip install -e .
 export PAISA_VERTICAL_SLICE_ROOT=artifacts/vertical_slice
 export PAISA_MODEL_TRAINING_ROOT=artifacts/model_training
 export PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID=VSL-20261020-OGDC-main-02
+export PAISA_UNIFIED_COMPARISON_ROOT=artifacts/model_comparisons
+export PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID=CMP-20261024-OGDC-price-only-02
 
 PYTHONPATH=src python -m uvicorn paisa.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -50,6 +52,8 @@ artifacts are intentionally ignored by Git and must not be committed.
 | `PAISA_VERTICAL_SLICE_ROOT` | `artifacts/vertical_slice` | Root containing immutable vertical-slice run directories. |
 | `PAISA_MODEL_TRAINING_ROOT` | `artifacts/model_training` | Root containing training runs referenced by vertical-slice manifests. |
 | `PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` | unset | Optional completed run used only by `GET /api/v1/leaderboard`. |
+| `PAISA_UNIFIED_COMPARISON_ROOT` | `artifacts/model_comparisons` | Root containing immutable unified price-model comparison packs. |
+| `PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID` | unset | Optional completed comparison used only by `GET /api/v1/unified-comparisons/default`. |
 
 Relative roots resolve from the repository root. Absolute roots are supported,
 but a run and every resolved artifact must remain below the configured root.
@@ -61,6 +65,9 @@ The default run is deliberately explicit. When
 `PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID` is unset, `GET /api/v1/leaderboard`
 returns HTTP `409`; it does not infer a run from directory order or timestamps.
 All URLs containing an explicit `{run_id}` remain available without a default.
+The unified-comparison default is equally explicit: the `/default` route
+returns `409` when its variable is unset and never infers a pack from directory
+order or timestamps. Explicit `{comparison_id}` routes remain available.
 
 ## v1 endpoint catalog
 
@@ -84,15 +91,82 @@ All routes below use `GET` and are beneath `/api/v1`.
 | `/vertical-slices/{run_id}/experiments/{experiment_id}/trades` | Paginated strategy trade ledger. |
 | `/vertical-slices/{run_id}/experiments/{experiment_id}/snapshots` | Paginated strategy portfolio ledger. |
 | `/vertical-slices/{run_id}/experiments/{experiment_id}/benchmarks` | Paginated cash-only snapshots, buy-and-hold snapshots, and buy-and-hold trades. |
+| `/unified-comparisons` | Paginated completed, exact-inventory, checksum-valid `PASS` comparison packs. |
+| `/unified-comparisons/default` | Detail for the explicitly configured default comparison pack. |
+| `/unified-comparisons/{comparison_id}` | Six model identities, selection policy, common counts, and persisted-data source names. |
+| `/unified-comparisons/{comparison_id}/sources` | Redacted source-run and integrity-root references. |
+| `/unified-comparisons/{comparison_id}/summary` | Holdout context and separately reported outcomes. |
+| `/unified-comparisons/{comparison_id}/prediction-metrics` | Six model and two reference-baseline shared project holdout metrics. |
+| `/unified-comparisons/{comparison_id}/validation-metrics` | Separate validation-selection evidence. |
+| `/unified-comparisons/{comparison_id}/portfolio-metrics` | Six model portfolios and the cash-only and buy-and-hold benchmarks. |
+| `/unified-comparisons/{comparison_id}/prediction-rankings` | Separate validation and shared project holdout rankings. |
+| `/unified-comparisons/{comparison_id}/portfolio-rankings` | Separate model-portfolio return, drawdown, and fee rankings. |
+| `/unified-comparisons/{comparison_id}/common-date-contract` | Ordered validation and shared project holdout alignment keys. |
+| `/unified-comparisons/{comparison_id}/confusion-matrices` | Persisted validation and shared project holdout confusion matrices. |
 
 The API never accepts a client-provided artifact filename or filesystem path.
-`run_id`, `experiment_id`, and `ticker` are identifiers, not path fragments.
+`run_id`, `comparison_id`, `experiment_id`, and `ticker` are identifiers, not
+path fragments.
+
+### Unified comparison read boundary
+
+The unified endpoints project the authoritative immutable M-001 through M-006
+pack into typed JSON. They validate the manifest, exact 64-entry payload
+inventory, every SHA-256 digest, completion state, cross-file identities,
+six-model cardinality, benchmark cardinality, bounded metric domains,
+confusion-matrix/count/metric reconciliation, and the academic disclaimer.
+Acceptance is also pinned to the same authoritative
+training, vertical-slice, and LSTM source IDs and manifest digests used by the
+offline comparison verifier; a self-consistent resealed pack from other source
+roots is rejected. In addition, the top-level `manifest.json` bytes must match
+the code-defined comparison-ID-to-SHA-256 certificate. The retained production
+certificate authorizes only `CMP-20261024-OGDC-price-only-02` with manifest
+digest
+`e4b0b12bb565fa6df1f23b7e8855f84569ffcefb795c36c4bfeb4a1e2c82849d`.
+This prevents an otherwise canonical-source pack from changing a
+probability-derived metric and authorizing the change by merely rebuilding its
+self-checksummed manifest. Every copied evidence member must also match its exact
+role, source path, purpose, and SHA-256 in those anchored source inventories,
+including reconciliation of the nested LSTM inventory. They reject traversal,
+symlink escape, executable model
+payloads or public-text references, extra or missing files, and local absolute,
+UNC, or file-URI paths in responses.
+
+On platforms that provide descriptor-relative, no-follow traversal, every
+configured-root component is opened from the filesystem anchor and the run tree
+remains pinned for the complete validation read. Every field in one response is
+then projected from that single validated snapshot. This prevents an ancestor or
+configured-root rename from redirecting a request after validation has begun.
+Regular members are opened nonblocking before their descriptor type is checked,
+so a regular-file-to-FIFO swap cannot stall a worker. A captured comparison tree
+is limited to 128 total directory and file entries and eight relative path
+components; both limits are enforced while scanning and before deeper recursion.
+The unified endpoints fail closed when that traversal guarantee is unavailable.
+Completed comparison roots and their parent directories should still be owned
+by a separate publisher and mounted read-only for the API identity.
+
+The configured source and comparison-manifest authorities are copied and deeply
+frozen when an `ArtifactRepository` is constructed, so cached validation cannot
+observe later caller mutations. Tests may inject deterministic authorities only
+through an explicit `RepositorySettings` instance. Environment-backed production
+repository construction has no authority-override input and continues to use the
+code-defined certificates, preserving its existing root/default cache partition.
+
+A request does not retrain, infer, recompute a metric, replay a portfolio, or
+deserialize a model. The canonical pack is explicitly tabular and declares
+`plots_included: false`; its detail response therefore names the persisted data
+endpoints that a client may visualize instead of fabricating plot artifacts.
+Every applicable response retains the exact term **shared project holdout**.
+Validation selection, shared project holdout classification, simulated portfolio,
+drawdown, fee, cash-only, and buy-and-hold outcomes stay separate. The API does
+not expose a universal winner.
 
 ## Pagination and deterministic ordering
 
 These endpoints accept query parameters `limit` and `offset`:
 
 - `/vertical-slices`
+- `/unified-comparisons`
 - `/equity-curves`
 - `/drawdowns`
 - `/trades`

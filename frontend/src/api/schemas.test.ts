@@ -15,6 +15,17 @@ import {
   snapshotsSchema,
   sourceSchema,
   tradesSchema,
+  unifiedCommonDateSchema,
+  unifiedComparisonDetailSchema,
+  unifiedComparisonListSchema,
+  unifiedConfusionMatricesSchema,
+  unifiedPortfolioMetricsSchema,
+  unifiedPortfolioRankingsSchema,
+  unifiedPredictionMetricsSchema,
+  unifiedPredictionRankingsSchema,
+  unifiedSourcesSchema,
+  unifiedSummarySchema,
+  unifiedValidationMetricsSchema,
   verticalSliceDetailSchema,
   verticalSliceListSchema,
   verticalSliceSummarySchema,
@@ -26,6 +37,8 @@ import {
   makeCoreRunData,
   makeExperimentDetail,
   makeHistoricalPrices,
+  makeUnifiedComparisonData,
+  makeUnifiedComparisonList,
   makeRunList,
   makeRunListItem,
   makeSnapshotsResponse,
@@ -445,5 +458,333 @@ describe("Zod API response contracts", () => {
     expect(parsedSource.pipeline_evidence?.prices_artifact).toEqual({
       relative_reference: "frozen_input/OGDC_prices.csv",
     });
+  });
+
+  it("parses every valid unified-comparison response contract", () => {
+    const data = makeUnifiedComparisonData();
+
+    expect(unifiedComparisonListSchema.safeParse(makeUnifiedComparisonList()).success).toBe(true);
+    expect(unifiedComparisonDetailSchema.safeParse(data.detail).success).toBe(true);
+    expect(unifiedSourcesSchema.safeParse(data.sources).success).toBe(true);
+    expect(unifiedSummarySchema.safeParse(data.summary).success).toBe(true);
+    expect(unifiedPredictionMetricsSchema.safeParse(data.predictionMetrics).success).toBe(true);
+    expect(unifiedValidationMetricsSchema.safeParse(data.validationMetrics).success).toBe(true);
+    expect(unifiedPortfolioMetricsSchema.safeParse(data.portfolioMetrics).success).toBe(true);
+    expect(unifiedPredictionRankingsSchema.safeParse(data.predictionRankings).success).toBe(true);
+    expect(unifiedPortfolioRankingsSchema.safeParse(data.portfolioRankings).success).toBe(true);
+    expect(unifiedCommonDateSchema.safeParse(data.commonDateContract).success).toBe(true);
+    expect(unifiedConfusionMatricesSchema.safeParse(data.confusionMatrices).success).toBe(true);
+  });
+
+  it("requires M-001 through M-006 exactly once in every six-model collection", () => {
+    const data = makeUnifiedComparisonData();
+    const duplicateMetrics = structuredClone(data.predictionMetrics);
+    duplicateMetrics.models[5] = { ...duplicateMetrics.models[0]! };
+    const missingPortfolio = structuredClone(data.portfolioMetrics);
+    missingPortfolio.models.pop();
+    const duplicateConfusion = structuredClone(data.confusionMatrices);
+    duplicateConfusion.shared_project_holdout_models[5] = {
+      ...duplicateConfusion.shared_project_holdout_models[0]!,
+    };
+
+    expect(unifiedPredictionMetricsSchema.safeParse(duplicateMetrics).success).toBe(false);
+    expect(unifiedPortfolioMetricsSchema.safeParse(missingPortfolio).success).toBe(false);
+    expect(unifiedConfusionMatricesSchema.safeParse(duplicateConfusion).success).toBe(false);
+  });
+
+  it("requires the shared project holdout term and separate-outcome contract", () => {
+    const data = makeUnifiedComparisonData();
+
+    expect(
+      unifiedComparisonDetailSchema.safeParse({
+        ...data.detail,
+        holdout_term: "test set",
+      }).success,
+    ).toBe(false);
+    expect(
+      unifiedSummarySchema.safeParse({
+        ...data.summary,
+        outcomes_are_not_combined: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      unifiedSummarySchema.parse({
+        ...data.summary,
+        universal_winner: "M-006",
+      }),
+    ).not.toHaveProperty("universal_winner");
+  });
+
+  it("requires canonical source roles, artifact types, run-ID families, and relationships", () => {
+    const data = makeUnifiedComparisonData();
+    const duplicateRole = structuredClone(data.sources);
+    Object.assign(duplicateRole.sources[1], {
+      role: "baseline_training",
+      artifact_type: "model_training_run",
+    });
+    const wrongRunFamily = structuredClone(data.sources);
+    Object.assign(wrongRunFamily.sources[2], { run_id: "TRN-wrong-family" });
+    const falseRelationship = structuredClone(data.sources);
+    Object.assign(falseRelationship.relationships, {
+      lstm_uses_vertical_slice: false,
+    });
+
+    expect(unifiedSourcesSchema.safeParse(duplicateRole).success).toBe(false);
+    expect(unifiedSourcesSchema.safeParse(wrongRunFamily).success).toBe(false);
+    expect(unifiedSourcesSchema.safeParse(falseRelationship).success).toBe(false);
+  });
+
+  it("accepts declared null metrics and rejects NaN or Infinity", () => {
+    const data = makeUnifiedComparisonData();
+    expect(unifiedPredictionMetricsSchema.safeParse(data.predictionMetrics).success).toBe(true);
+    expect(unifiedPortfolioMetricsSchema.safeParse(data.portfolioMetrics).success).toBe(true);
+
+    const singleClass = structuredClone(data.predictionMetrics);
+    Object.assign(singleClass.models[2]!, {
+      accuracy: 1,
+      balanced_accuracy: null,
+      precision: 0,
+      recall: 0,
+      f1: 0,
+      matthews_corrcoef: null,
+      roc_auc: null,
+      log_loss: null,
+      selection_eligible: false,
+      metric_warnings: ["single_class_actuals"],
+      class_counts: { "0": 184, "1": 0 },
+      predicted_class_counts: { "0": 184, "1": 0 },
+      confusion_matrix: [[184, 0], [0, 0]],
+    });
+    expect(singleClass.models[2]?.balanced_accuracy).toBeNull();
+    expect(unifiedPredictionMetricsSchema.safeParse(singleClass).success).toBe(true);
+
+    const nanMetrics = structuredClone(data.predictionMetrics);
+    nanMetrics.models[0]!.accuracy = Number.NaN;
+    const infinitePortfolio = structuredClone(data.portfolioMetrics);
+    infinitePortfolio.models[0]!.total_return = Number.POSITIVE_INFINITY;
+    expect(unifiedPredictionMetricsSchema.safeParse(nanMetrics).success).toBe(false);
+    expect(unifiedPortfolioMetricsSchema.safeParse(infinitePortfolio).success).toBe(false);
+  });
+
+  it("enforces metric domains and accepts their inclusive boundaries", () => {
+    const data = makeUnifiedComparisonData();
+    const outOfRangeCases: Array<[unknown, { safeParse: (value: unknown) => { success: boolean } }]> = [];
+
+    const accuracy = structuredClone(data.predictionMetrics);
+    accuracy.models[0]!.accuracy = 1.5;
+    outOfRangeCases.push([accuracy, unifiedPredictionMetricsSchema]);
+
+    const f1 = structuredClone(data.summary);
+    f1.reported_outcomes.best_shared_holdout_f1.f1 = 99;
+    outOfRangeCases.push([f1, unifiedSummarySchema]);
+
+    const mcc = structuredClone(data.validationMetrics);
+    mcc.models[0]!.matthews_corrcoef = -1.1;
+    outOfRangeCases.push([mcc, unifiedValidationMetricsSchema]);
+
+    const loss = structuredClone(data.predictionMetrics);
+    loss.models[0]!.log_loss = -0.01;
+    outOfRangeCases.push([loss, unifiedPredictionMetricsSchema]);
+
+    const drawdown = structuredClone(data.portfolioMetrics);
+    drawdown.models[0]!.maximum_drawdown = -0.2;
+    outOfRangeCases.push([drawdown, unifiedPortfolioMetricsSchema]);
+
+    const oversizedDrawdown = structuredClone(data.portfolioRankings);
+    oversizedDrawdown.simulated_model_portfolio_drawdown[0]!.maximum_drawdown = 1.01;
+    outOfRangeCases.push([oversizedDrawdown, unifiedPortfolioRankingsSchema]);
+
+    const volatility = structuredClone(data.portfolioMetrics);
+    volatility.benchmarks[1]!.volatility = -0.1;
+    outOfRangeCases.push([volatility, unifiedPortfolioMetricsSchema]);
+
+    const turnover = structuredClone(data.portfolioMetrics);
+    turnover.models[0]!.turnover = -0.1;
+    outOfRangeCases.push([turnover, unifiedPortfolioMetricsSchema]);
+
+    const winRate = structuredClone(data.portfolioMetrics);
+    winRate.models[0]!.win_rate = 5;
+    outOfRangeCases.push([winRate, unifiedPortfolioMetricsSchema]);
+
+    const timeInMarket = structuredClone(data.portfolioMetrics);
+    timeInMarket.models[0]!.time_in_market = 5;
+    outOfRangeCases.push([timeInMarket, unifiedPortfolioMetricsSchema]);
+
+    const ranking = structuredClone(data.predictionRankings);
+    ranking.validation_model_selection[0]!.balanced_accuracy = -0.1;
+    outOfRangeCases.push([ranking, unifiedPredictionRankingsSchema]);
+
+    for (const [payload, schema] of outOfRangeCases) {
+      expect(schema.safeParse(payload).success).toBe(false);
+    }
+
+    const lowerBoundaries = structuredClone(data.predictionMetrics);
+    Object.assign(lowerBoundaries.models[0]!, {
+      accuracy: 0,
+      balanced_accuracy: 0,
+      precision: 0,
+      recall: 0,
+      f1: 0,
+      matthews_corrcoef: -1,
+      roc_auc: 0,
+      brier_score: 0,
+      log_loss: 0,
+      expected_calibration_error: 0,
+      predicted_class_counts: { "0": 91, "1": 93 },
+      confusion_matrix: [[0, 93], [91, 0]],
+    });
+    expect(unifiedPredictionMetricsSchema.safeParse(lowerBoundaries).success).toBe(true);
+
+    const upperBoundaries = structuredClone(data.predictionMetrics);
+    Object.assign(upperBoundaries.models[0]!, {
+      accuracy: 1,
+      balanced_accuracy: 1,
+      precision: 1,
+      recall: 1,
+      f1: 1,
+      matthews_corrcoef: 1,
+      roc_auc: 1,
+      brier_score: 1,
+      log_loss: 0,
+      expected_calibration_error: 1,
+      predicted_class_counts: { "0": 93, "1": 91 },
+      confusion_matrix: [[93, 0], [0, 91]],
+    });
+    expect(unifiedPredictionMetricsSchema.safeParse(upperBoundaries).success).toBe(true);
+
+    const portfolioBoundaries = structuredClone(data.portfolioMetrics);
+    Object.assign(portfolioBoundaries.models[0]!, {
+      maximum_drawdown: 1,
+      volatility: 0,
+      turnover: 0,
+      win_rate: 1,
+      time_in_market: 0,
+    });
+    expect(unifiedPortfolioMetricsSchema.safeParse(portfolioBoundaries).success).toBe(true);
+  });
+
+  it("reconciles class and predicted-class counts with confusion-matrix axes", () => {
+    const data = makeUnifiedComparisonData();
+    const badModelCounts = structuredClone(data.predictionMetrics);
+    badModelCounts.models[0]!.class_counts = {
+      "0": (badModelCounts.models[0]!.class_counts["0"] ?? 0) - 1,
+      "1": (badModelCounts.models[0]!.class_counts["1"] ?? 0) + 1,
+    };
+    const badReferenceCounts = structuredClone(data.predictionMetrics);
+    badReferenceCounts.reference_baselines[0]!.predicted_class_counts = {
+      "0": (badReferenceCounts.reference_baselines[0]!.predicted_class_counts["0"] ?? 0) + 1,
+      "1": (badReferenceCounts.reference_baselines[0]!.predicted_class_counts["1"] ?? 0) - 1,
+    };
+
+    expect(unifiedPredictionMetricsSchema.safeParse(badModelCounts).success).toBe(false);
+    expect(unifiedPredictionMetricsSchema.safeParse(badReferenceCounts).success).toBe(false);
+  });
+
+  it("rejects within-range metrics that contradict model and reference matrices", () => {
+    const data = makeUnifiedComparisonData();
+    const badModelMetric = structuredClone(data.predictionMetrics);
+    badModelMetric.models[0]!.accuracy = 0.25;
+    const badReferenceMetric = structuredClone(data.predictionMetrics);
+    badReferenceMetric.reference_baselines[0]!.f1 = 0.25;
+
+    expect(unifiedPredictionMetricsSchema.safeParse(badModelMetric).success).toBe(false);
+    expect(unifiedPredictionMetricsSchema.safeParse(badReferenceMetric).success).toBe(false);
+
+    const serializerNoise = structuredClone(data.predictionMetrics);
+    serializerNoise.models[0]!.accuracy += 5e-10;
+    expect(unifiedPredictionMetricsSchema.safeParse(serializerNoise).success).toBe(true);
+  });
+
+  it("enforces producer class-coverage semantics and safe classification counts", () => {
+    const data = makeUnifiedComparisonData();
+    const completeButIneligible = structuredClone(data.predictionMetrics);
+    completeButIneligible.models[0]!.selection_eligible = false;
+    const completeButWarned = structuredClone(data.predictionMetrics);
+    completeButWarned.models[0]!.metric_warnings = ["single_class_actuals"];
+    const completeWithoutAuc = structuredClone(data.predictionMetrics);
+    completeWithoutAuc.models[0]!.roc_auc = null;
+    const completeWithoutLogLoss = structuredClone(data.predictionMetrics);
+    completeWithoutLogLoss.models[0]!.log_loss = null;
+    const undefinedBrier = structuredClone(data.predictionMetrics);
+    Object.assign(undefinedBrier.models[0]!, { brier_score: null });
+    const undefinedCalibrationError = structuredClone(data.predictionMetrics);
+    Object.assign(undefinedCalibrationError.models[0]!, {
+      expected_calibration_error: null,
+    });
+    const oversized = structuredClone(data.predictionMetrics);
+    Object.assign(oversized.models[0]!, {
+      row_count: 10_000_001,
+      support: 10_000_001,
+      accuracy: 1,
+      balanced_accuracy: 1,
+      precision: 1,
+      recall: 1,
+      f1: 1,
+      matthews_corrcoef: 1,
+      class_counts: { "0": 10_000_000, "1": 1 },
+      predicted_class_counts: { "0": 10_000_000, "1": 1 },
+      confusion_matrix: [[10_000_000, 0], [0, 1]],
+    });
+
+    for (const payload of [
+      completeButIneligible,
+      completeButWarned,
+      completeWithoutAuc,
+      completeWithoutLogLoss,
+      undefinedBrier,
+      undefinedCalibrationError,
+      oversized,
+    ]) {
+      expect(unifiedPredictionMetricsSchema.safeParse(payload).success).toBe(false);
+    }
+  });
+
+  it("strips unknown fields outside the unified API contract", () => {
+    const detail = makeUnifiedComparisonData().detail;
+    const parsed = unifiedComparisonDetailSchema.parse({
+      ...detail,
+      model_binary: "models/private.joblib",
+      local_path: "/Users/private-owner/artifacts",
+      models: detail.models.map((row) => ({
+        ...row,
+        artifact_path: `models/${row.variant_id}.joblib`,
+      })),
+    });
+
+    expect(parsed).not.toHaveProperty("model_binary");
+    expect(parsed).not.toHaveProperty("local_path");
+    expect(parsed.models.every((row) => !("artifact_path" in row))).toBe(true);
+  });
+
+  it.each([
+    "models/private.joblib",
+    "models/private.joblib/metadata",
+    "models\\private.joblib\\metadata",
+    "models/private.joblib.",
+    "models/private.pb",
+    "//server/share/model.keras",
+    "note,/Users/private/report.csv",
+    "note;//server/share/report.csv",
+    "source:file:C:\\private\\report.csv",
+    "See https://example.test/report?source=/Users/private/report.csv",
+    "See https://example.test/report?source=%2FUsers%2Fprivate%2Freport.csv",
+    "See https://example.test/models/private%2Ejoblib",
+  ])("rejects prohibited text in a schema-approved public field: %s", (unsafeText) => {
+    const summary = makeUnifiedComparisonData().summary;
+    summary.limitations = [unsafeText];
+
+    expect(unifiedSummarySchema.safeParse(summary).success).toBe(false);
+  });
+
+  it("allows ordinary profile text in a schema-approved public field", () => {
+    const summary = makeUnifiedComparisonData().summary;
+    summary.limitations = [
+      "profile:academic_research",
+      "See https://models.example.test/usr/local/share/model-card.html",
+      "See wss://models.example.test/usr/local/share/model-card.html",
+      "See ftp://models.example.test/usr/local/share/model-card.html",
+    ];
+
+    expect(unifiedSummarySchema.safeParse(summary).success).toBe(true);
   });
 });

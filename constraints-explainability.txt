@@ -1,0 +1,11 @@
+# Certified direct runtime for the immutable M-001 through M-004 Tree SHAP
+# evidence workflow. This is a pip constraints file, not a standalone install
+# list. Apply it while installing both requirements.txt and
+# requirements-explainability.txt under Python 3.13.7.
+numpy==2.3.5
+pandas==2.3.3
+scikit-learn==1.9.1
+xgboost==3.4.1
+joblib==1.6.0
+matplotlib==3.11.2
+shap==0.54.1

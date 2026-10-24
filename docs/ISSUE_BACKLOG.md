@@ -500,6 +500,12 @@ comparison report, and record prediction and portfolio outcomes separately.
 
 **Gate:** `G0-INTEGRITY`
 
+**Implementation status:** Completed on
+`feature/tree-model-shap-explainability`, pending merge. The accepted local
+pack is `XAI-20261024-140320-OGDC-tree-v1`; its independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`.
+
 ### Scope
 
 Define and implement model-appropriate SHAP generation for one retained model
@@ -514,12 +520,24 @@ expected value, local values, aggregate values, and checksums.
 
 ### Acceptance checklist
 
-- [ ] A small deterministic fitted fixture exercises the supported explainer offline.
-- [ ] Additivity/reconciliation is checked within a documented tolerance.
-- [ ] Feature order and explained class/output are unambiguous.
-- [ ] Unsupported algorithms fail clearly rather than switching explainers silently.
-- [ ] Existing explanation IDs are collision-refusing and source roots are revalidated.
-- [ ] Contract, limitations, dependency, and verification commands are documented.
+- [x] Deterministic fixtures exercise the contract offline, and dedicated
+      Python 3.13.7 CI runs real `shap.TreeExplainer` calls for small Random
+      Forest and XGBoost estimators under the certified direct pins in
+      `constraints-explainability.txt`; that file is not a standalone or fully
+      hashed lock.
+- [x] Additivity/reconciliation is checked within documented family-specific
+      tolerances.
+- [x] Feature order and explained class/output are unambiguous.
+- [x] Unsupported algorithms fail clearly rather than switching explainers silently.
+- [x] Existing explanation IDs are collision-refusing and source roots are revalidated.
+- [x] Verification distinguishes internal `PASS`, sidecar transport integrity,
+      and manifest authentication. Official use requires
+      `--require-authenticated`; a non-allowlisted run also requires an
+      independently retained `--expected-manifest-sha256`.
+- [x] PNG checks are structural rather than a semantic rerender; authenticated
+      manifest bytes bind the accepted plots.
+- [x] Contract, limitations, constrained dependencies, and strict verification
+      commands are documented.
 
 ---
 

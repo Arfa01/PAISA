@@ -69,6 +69,30 @@ this configuration to non-commercial academic use:
 python -m pip install -r requirements-sentiment.txt
 ```
 
+Run tree-model explanations only in a separate Python 3.12+ / NumPy 2+
+environment. Python 3.13 matches the retained model runtime; the default PAISA
+environment continues to support Python 3.10+.
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
+```
+
+`constraints-explainability.txt` pins the certified direct NumPy, pandas,
+scikit-learn, XGBoost, joblib, Matplotlib, and SHAP versions; it is applied
+alongside both requirements files and is not a standalone or fully hashed
+lock. The dedicated Python 3.13.7 explainability-runtime CI job exercises real
+`shap.TreeExplainer` calls for small Random Forest and XGBoost estimators
+without needing the retained explanation pack.
+
 ## Current component entry points
 
 | Component | Primary entry points |
@@ -77,6 +101,7 @@ python -m pip install -r requirements-sentiment.txt
 | Experiment data and targets | `src/paisa/experiments/training_features.py`, `src/paisa/experiments/training_targets.py`, `src/paisa/splits.py` |
 | Model training and evaluation | `src/paisa/experiments/trainer.py`, `src/paisa/experiments/evaluation.py`, `src/paisa/experiments/artifacts.py`, `src/paisa/experiments/registry.py`, `scripts/train_ogdc_models.py` |
 | Price-only LSTM experiments | `src/paisa/experiments/lstm.py`, `src/paisa/experiments/lstm_runner.py`, `scripts/run_lstm_price_only_experiments.py`, `notebooks/PAISA_OGDC_LSTM_Experiments.ipynb`, `docs/LSTM_PRICE_ONLY_EXPERIMENTS.md`, `docs/LSTM_SEQUENCE_CONTRACT.md` |
+| Tree-model SHAP evidence | `src/paisa/explainability/tree_shap.py`, `scripts/run_tree_shap_explainability.py`, `scripts/verify_explainability_run.py`, `docs/TREE_MODEL_SHAP_EXPLAINABILITY.md`, `docs/EXPLAINABILITY_DATA_CONTRACT.md`, `docs/SHAP_INTERPRETATION_POLICY.md` |
 | Decision policy and portfolio | `src/paisa/trading/policy.py`, `src/paisa/trading/execution.py`, `src/paisa/trading/portfolio.py`, `src/paisa/trading/models.py` |
 | Backtesting and benchmarks | `src/paisa/backtesting/engine.py`, `src/paisa/backtesting/metrics.py`, `src/paisa/backtesting/benchmarks.py`, `src/paisa/backtesting/reports.py`, `scripts/run_backtest.py` |
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
@@ -126,10 +151,56 @@ news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
 audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
 evidence. Contemporaneous source packs use
 `artifacts/contemporaneous_evidence/<run_id>/`, while four-profile audits use
-`artifacts/evidence_coverage/<run_id>/`. Never overwrite an existing model,
-experiment, portfolio, or run ID.
+`artifacts/evidence_coverage/<run_id>/`. Tree-model explanations use
+`artifacts/explainability/<run_id>/`, `<run_id>.zip`, and
+`<run_id>.zip.sha256`. The accepted local pack is
+`XAI-20261024-140320-OGDC-tree-v1`; its independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and its
+ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Never overwrite an existing model, experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
+
+The accepted explanation pack was produced from clean implementation commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its 24-file inventory and quality
+report are `PASS`; authenticated directory, ZIP, and extracted-directory
+verification passed, as did the separate ZIP-sidecar transport-integrity
+check. The adjacent sidecar is not a provenance credential. The manifest
+anchor is what authenticates the accepted file bytes; PNG checks are structural
+and do not rerender plots from their CSV inputs. A bare internal `PASS` without
+`authentication_status: AUTHENTICATED` is not an official provenance claim.
+The manifest records Python 3.13.7, NumPy 2.3.5,
+pandas 2.3.3, scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib
+3.11.2, and SHAP 0.54.1. All M-001--M-004 results cover the exact 184-row
+shared project holdout and 19 transformed features in positive-class
+probability space. Every row passed its family tolerance; all seven audit
+categories were available for every model.
+
+The model-wise maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06` for M-001,
+`4.302598055616613e-09` / `7.864803434113863e-10` for M-002,
+`2.7466758000471714e-05` / `2.7464541568790406e-05` for M-003, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08` for M-004. The code-stage
+validation recorded 1,350 backend tests passed with two skipped and six
+warnings, 138 focused tests passed, 132 frontend tests passed, and passing
+doctor, dependency, bytecode-compilation, frontend lint, frontend build, and
+diff checks.
+
+The ordered top five features are M-001 (`close_lag_1`,
+`return_volatility_5`, `close`, `close_lag_5`, `ma_20`), M-002
+(`return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`), M-003
+(`close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5`), and
+M-004 (`ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`). The
+Spearman/top-five-overlap agreement pairs are M-001/M-002
+`0.8228070175438595`/4, M-001/M-003 `0.8210526315789475`/5, and M-002/M-003
+`0.7543859649122807`/4; the disagreement pairs are M-001/M-004
+`0.5964912280701754`/4, M-003/M-004 `0.6175438596491227`/4, and M-002/M-004
+`0.7`/4. These attributions describe fitted-model behavior on a previously
+exposed shared holdout. They cover one stock, one period, one feature family,
+and four tree configurations; they do not establish causality, profitability,
+or future results. Academic simulation; not financial advice.
 
 The accepted local LSTM run is `LSTM-20261024-OGDC-price-only-02`. It was
 executed on CPU from clean source commit
@@ -987,8 +1058,11 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    post-freeze test balanced accuracy. After the sentiment coverage gate passes,
    train paired price-only and price-plus-sentiment experiments without using
    test results for selection.
-4. Add SHAP result views only after Waqas exposes a validated artifact/API
-   schema; explain model behavior, not causality.
+4. Use authenticated pack `XAI-20261024-140320-OGDC-tree-v1` when adding SHAP
+   result views after Waqas exposes the validated read-only API schema. Require
+   `authentication_status: AUTHENTICATED`, consume persisted evidence without
+   recalculating SHAP in React, and explain model behavior rather than
+   causality.
 5. Extend dashboard components and client schemas without recalculating backend
    metrics in React.
 6. Lead additional-stock data quality, evaluation, screenshots, and supervisor
@@ -1012,7 +1086,9 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    relationship/knowledge-graph component only after its contract is written.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
    and `src/paisa/api/router_v1.py` additively for news, sentiment,
-   explanations, and relationships; keep GET requests read-only.
+   explanations, and relationships; keep GET requests read-only. For SHAP,
+   validate a small portable fixture with the offline verifier and never load a
+   model in a GET request.
 6. Provide contract fixtures and API tests for each new result before dashboard
    integration.
 
@@ -1126,6 +1202,32 @@ python scripts/run_lstm_price_only_experiments.py \
   --baseline-training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --baseline-vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02
 
+# Optional isolated tree-SHAP evidence for retained M-001 through M-004.
+# SHAP 0.54.1 requires Python 3.12+ and NumPy 2+; use the dedicated
+# explainability environment and never replace an existing XAI run.
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+
+# Verify the accepted immutable local evidence pack. For a fresh run, retain
+# its independent manifest digest and use both strict options described below.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
+deactivate
+
 # Full OGDC vertical slice with a new immutable ID. The command still attempts
 # live PSX-DPS first, then validates this complete checksum-bound cache bundle.
 PAISA_NEW_VERTICAL_RUN_ID="VSL-20261022-OGDC-team-handoff-01"
@@ -1159,6 +1261,14 @@ npm run build
 cd ..
 git diff --check origin/main...HEAD
 ```
+
+For a new `XAI-...` run, preserve the raw `artifact_manifest.json` SHA-256 in a
+separate trusted handoff record and verify with
+`--expected-manifest-sha256 <digest> --require-authenticated`. A verifier
+`status: PASS` without `authentication_status: AUTHENTICATED` establishes only
+internal consistency. `checksum_verified` and `sidecar_checksum_verified` are
+transport-corruption checks. Plot validation is structural; the manifest trust
+root binds the accepted plot bytes but does not rerender them from CSV data.
 
 Independent validation of reviewed PR head `4d7084b` produced two historical
 pre-fix matrices:

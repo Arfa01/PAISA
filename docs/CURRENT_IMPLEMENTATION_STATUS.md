@@ -18,6 +18,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Versioned model comparison | `M-001`, `M-002`, and `M-003` are Random Forest variants; `M-004` is XGBoost. All four use the same daily OGDC feature set, target, split dates, and held-out test observations. Each has a unique registered model identity and checksum-protected artifacts. The later M-005/M-006 comparison reused those 184 dates and the already-exposed baseline outcomes, making the period the shared project holdout. |
 | Price-only LSTM comparison | The isolated optional-TensorFlow workflow adds `M-005`, a 20-session/64-unit baseline with dropout `0.20`, and `M-006`, the same sequence length and hidden width with stronger dropout and recurrent regularization. It reuses the frozen OGDC input and split evidence, fits preprocessing on training data only, chooses the preferred variant from validation evidence, evaluates test data post-freeze, and publishes immutable run artifacts. Certified CPU run `LSTM-20261024-OGDC-price-only-02` completed from clean commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f`; its local, Git-ignored `final_summary.json` is authoritative. |
 | Unified price-only comparison | The evidence-only builder accepts exactly `VSL-20261020-OGDC-main-02`, `TRN-20261020-191815-624662-nogit`, and `LSTM-20261024-OGDC-price-only-02`; recomputes prediction and reference-baseline metrics; and reconstructs policy, execution, trades, accounting, returns, drawdowns, and fees with exact `Decimal` arithmetic from two raw market files and six signal files. It preserves separate validation, shared project holdout, and portfolio outcomes and publishes collision-refusing directory/ZIP/checksum artifacts. Authoritative local identity `CMP-20261024-OGDC-price-only-02` verifies offline without TensorFlow, model loading, retraining, inference, the production backtest runner, or Matplotlib. It is price-only and tabular/report-only. |
+| Tree-model SHAP explainability | The additive `paisa.explainability` producer explains only M-001 through M-004 on the exact 184-date shared project holdout. It validates fixed source identities and checksums, loads models only from the trusted training root, applies only the fitted median imputer, uses a deterministic 100-row training background, and emits class-1 probability-space local/global attributions with additivity gates of `5e-5` for Random Forest and `1e-6` for XGBoost. It stages an immutable directory plus deterministic ZIP/sidecar; the portable verifier reloads no executable model. Internal `PASS`, sidecar transport integrity, and manifest authentication are reported separately, and official claims require strict `--require-authenticated` verification. PNG checks are structural. The certified direct runtime is constrained and exercised with real Tree SHAP in dedicated CI. Official retained run `XAI-20261024-140320-OGDC-tree-v1`, produced from clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`, has quality status `PASS`, manifest trust root `cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and ZIP SHA-256 `7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`. All four `184 × 19` probability-space explanations pass additivity and provide all seven audit categories. |
 | Decision and simulation | Predictions pass through a separate threshold policy into separate long-only portfolio ledgers. The retained run uses buy at `probability_up >= 0.60`, sell at `probability_up <= 0.40`, a 50% maximum allocation, whole shares, 10-basis-point execution fees, next-session-open execution, and close valuation. |
 | Independent comparisons | Each model has its own experiment, portfolio, trades, cash, holdings, and snapshots. Cash-only and 50%-allocated buy-and-hold benchmarks use the common test window and cost assumptions. |
 | Immutable vertical slice | `scripts/run_ogdc_vertical_slice.py` joins acquisition, preparation, training, predictions, policies, backtests, benchmarks, evidence validation, and reports without overwriting an existing run ID. |
@@ -27,7 +28,7 @@ portfolio curves, and simulated returns are not financial advice.
 | Article sentiment foundation | The isolated sentiment stage reads canonical normalized articles from a completed ingestion run, applies an exact pinned `ProsusAI/finbert` model/tokenizer revision, maps the upstream class indices explicitly, records bounded text/token policy and runtime identity, persists immutable article probabilities/errors in SQLite, publishes checksum-inventoried `SENT-...` artifacts, and exposes a leakage-safe decision-cutoff filter. It does not aggregate by day or alter stock models, policies, portfolios, API, or dashboard. |
 | Results API | The additive `/api/v1` FastAPI surface reads completed, checksum-valid artifacts. It lists runs and exposes run metadata, source provenance, historical prices, model metrics, portfolio metrics, curves, experiments, trades, snapshots, and benchmarks. It does not retrain models or recalculate accounting in a GET request. |
 | Dashboard | The React/TypeScript/Plotly application reads only the API and shows run overview, immutable OGDC history, model comparison, portfolio comparison, experiment detail, trades, snapshots, provenance, limitations, and the academic-simulation disclaimer. It has no model, policy, or accounting business logic. |
-| Verification | Independent verification of reviewed PR head `4d7084b` produced `609 passed, 1 skipped` in the artifact-present checkout, where only optional TensorFlow/LSTM skipped and the retained-artifact integration ran. Its clean Git clone produced `608 passed, 2 skipped`; optional TensorFlow/LSTM and the absent local-real-run artifact integration skipped. These remain historical pre-fix results. The hardened certified LSTM source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f` completed with `1036 passed, 1 skipped` in the backend and `57 passed` in the frontend. Before `CMP-20261024-OGDC-price-only-02` hardening, the unified comparison branch completed with `1082 passed, 1 skipped` in the backend and `57 passed` in the frontend, plus passing frontend lint/build, `pip check`, bytecode compilation, focused comparison/documentation tests, and diff checks. Final hardening regressions are pending this snapshot. The backend reported six dependency deprecation warnings, the frontend build retained its known large-chunk warning, and the skip was the Windows-only junction test on macOS. |
+| Verification | Independent verification of reviewed PR head `4d7084b` produced `609 passed, 1 skipped` in the artifact-present checkout, where only optional TensorFlow/LSTM skipped and the retained-artifact integration ran. Its clean Git clone produced `608 passed, 2 skipped`; optional TensorFlow/LSTM and the absent local-real-run artifact integration skipped. These remain historical pre-fix results. The hardened certified LSTM source commit `2bd20edebac9f5a063e2e10cc0394343067d8c7f` completed with `1036 passed, 1 skipped` in the backend and `57 passed` in the frontend. Before `CMP-20261024-OGDC-price-only-02` hardening, the unified comparison branch completed with `1082 passed, 1 skipped` in the backend and `57 passed` in the frontend. Final validation for the tree-SHAP implementation and official run completed with `1350 passed, 2 skipped, 6 warnings` in the backend and `132 passed` across 10 frontend test files, plus passing frontend lint and build. |
 
 ## Retained real-run evidence
 
@@ -108,6 +109,57 @@ opt-in debug diagnostics are sanitized. This comparison does not integrate
 sentiment, includes no plots, and does not import Matplotlib; its presentation
 is tabular/report-only. Selection, shared project holdout prediction metrics,
 and portfolio outcomes remain distinct findings.
+
+### Tree-model SHAP execution status
+
+The generator, schema-1.0 portable pack, offline verifier, and deterministic
+fixture/smoke path are implemented for M-001 through M-004. Every official
+model explanation is class `1` in probability space using interventional Tree
+SHAP, 100 evenly spaced chronological training rows, and the model's original
+fitted median imputer. Random Forest and XGBoost output shapes are normalized
+separately, and every one of the 184 direct probabilities must reconstruct
+within its declared tolerance (`5e-5` for Random Forest, `1e-6` for XGBoost).
+
+Official retained execution `XAI-20261024-140320-OGDC-tree-v1` completed from
+clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d` with run and quality
+status `PASS`. Its deterministic ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Its independently committed `artifact_manifest.json` trust root is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`.
+Strict authenticated verification passed for the directory, ZIP, and extracted
+directory. The ZIP sidecar is a separate transport-corruption check, not a
+provenance credential; PNG checks are structural and do not rerender plots
+from their CSV inputs. Thus internal `PASS` alone is not an official provenance
+claim: official verification requires `--require-authenticated`, plus an
+independently retained `--expected-manifest-sha256` for a non-allowlisted run.
+All models use a `184 × 19` matrix in positive-class probability space, and
+all seven audit categories are available for every model.
+
+| Model | Top five features | Maximum / mean absolute additivity error |
+|---|---|---:|
+| `M-001` | `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20` | `5.78484978308591e-06` / `5.781760213738571e-06` |
+| `M-002` | `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14` | `4.302598055616613e-09` / `7.864803434113863e-10` |
+| `M-003` | `close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5` | `2.7466758000471714e-05` / `2.7464541568790406e-05` |
+| `M-004` | `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open` | `1.5920226559273942e-07` / `3.5509845686483396e-08` |
+
+Every one of the 184 rows per model passes tolerance. The recorded rank
+agreements are `M-001`/`M-002` (`0.8228070175438595`, four top-five features
+shared), `M-001`/`M-003` (`0.8210526315789475`, all five shared), and
+`M-002`/`M-003` (`0.7543859649122807`, four shared). The recorded rank
+disagreements are the `M-004` pairings: `M-001`/`M-004`
+(`0.5964912280701754`), `M-003`/`M-004` (`0.6175438596491227`), and
+`M-002`/`M-004` (`0.7`), each with four shared top-five features. The runtime
+records Python `3.13.7`, SHAP `0.54.1`, NumPy `2.3.5`, pandas `2.3.3`,
+scikit-learn `1.9.1`, XGBoost `3.4.1`, joblib `1.6.0`, and Matplotlib `3.11.2`.
+Those certified direct versions are pinned by
+`constraints-explainability.txt`, applied alongside both requirements files;
+the constraints file is not a standalone or fully hashed lock. A dedicated
+Python 3.13.7 CI job runs real Tree SHAP against small Random Forest and
+XGBoost estimators without relying on retained artifacts.
+Follow
+[`TREE_MODEL_SHAP_EXPLAINABILITY.md`](TREE_MODEL_SHAP_EXPLAINABILITY.md),
+[`EXPLAINABILITY_DATA_CONTRACT.md`](EXPLAINABILITY_DATA_CONTRACT.md), and
+[`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md).
 
 ### Accepted news-ingestion execution
 
@@ -388,8 +440,10 @@ classifier-accuracy claims, or price-plus-sentiment comparison.
   Colab GPU, with optional Apple Metal, but does not promise bit-identical
   results across devices. The separate certified LSTM run is retained locally;
   neither LSTM is part of the four-model vertical-slice run above.
-- Stored Random Forest feature importance is preliminary explainability. SHAP
-  explanations have not been implemented.
+- Stored Random Forest impurity importance remains preliminary evidence. The
+  tree-SHAP producer, portable verifier, and authoritative real explanation
+  pack are complete for M-001 through M-004, but any API/dashboard
+  presentation remains pending.
 - News entity linking is a deterministic first stage for controlled OGDC
   aliases only. It is not general NER or event reasoning.
 - FinBERT output is article-level classifier evidence, not a stock prediction,
@@ -409,7 +463,7 @@ classifier-accuracy claims, or price-plus-sentiment comparison.
 | Compare models with and without sentiment | Not implemented. Article-level inference is implemented, but daily aggregation and the controlled stock-feature comparison remain. The current stock comparison is price-only. |
 | Deploy the best-performing model as the prediction engine | Not complete. The v1 API deliberately serves retained results and does not load `M-001` for live inference; the legacy `/predict/{ticker}` route remains the v0 baseline compatibility path. |
 | Add event-driven company/sector reasoning | Partly complete only at the ingestion boundary: reviewed OGDC aliases are linked deterministically with evidence. General entities, sectors, events, graphs, and propagation are not implemented. |
-| Deliver predictions, visualizations, explanations, and current feeds | Partly complete. Historical results and provenance are visible in FastAPI and React; sentiment, event explanations, SHAP, and current feeds remain. |
+| Deliver predictions, visualizations, explanations, and current feeds | Partly complete. Historical results and provenance are visible in FastAPI and React; the tree-SHAP artifact/verifier layer and official real run are complete, but its API/dashboard view remains pending, while sentiment/event explanations and current feeds remain. |
 
 ## Remaining work
 
@@ -418,8 +472,9 @@ Dawn fields or another licensed source, then acquisition/import of news whose
 publication and defensible cutoff availability overlap the frozen OGDC period.
 Only after a new immutable audit passes the configured coverage gate should the
 team review article sentiment and define daily aggregation. Price-only versus
-price-plus-sentiment comparison, SHAP, additional stocks, and sector/event
-relationships remain later work. Production storage, authentication, scheduled
+price-plus-sentiment comparison, read-only presentation of the verified SHAP
+evidence, additional stocks, and sector/event relationships remain later work.
+Production storage, authentication, scheduled
 ingestion/retraining, cloud deployment, broker integration, and live trading
 are also absent. Reinforcement learning is explicitly deferred until the data,
 sentiment, supervised-model, evaluation, and explanation components are stable.

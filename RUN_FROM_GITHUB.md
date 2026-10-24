@@ -6,11 +6,15 @@ dashboard from a fresh clone.
 Source installation, offline tests, and newly generated runs work from a fresh
 clone. Git intentionally excludes retained model, news, database, sentiment,
 and coverage artifacts. Commands below that name a `NEWS-...`, `COVERAGE-...`,
-`SENT-...`, `TRN-...`, or `VSL-...` identity are therefore marked
-**artifact-present**: obtain a checksum-verified custodian export as documented
-in [`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs.
-The repository does not publish a download URL or a fixed checksum for those
-local archives.
+`SENT-...`, `TRN-...`, `VSL-...`, `CMP-...`, or `XAI-...` identity are therefore marked
+**artifact-present**: obtain a custodian export as documented in
+[`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs. The
+repository does not publish a download URL for those local archives. An
+archive-adjacent checksum sidecar detects transfer corruption, but because it
+travels with the archive it does not authenticate provenance. For retained
+Tree-SHAP evidence, require the verifier's independently committed manifest
+trust anchor; for a new run, obtain the expected manifest SHA-256 through a
+separate trusted channel.
 
 ## 1. Clone the repo
 
@@ -54,6 +58,30 @@ sentiment stage:
 ```bash
 python -m pip install -r requirements-sentiment.txt
 ```
+
+Tree-model SHAP generation is another optional, isolated runtime. The pinned
+`shap==0.54.1` requires Python 3.12+ and NumPy 2+, while the default PAISA
+package continues to support Python 3.10+. Use Python 3.13 to match the retained
+model serialization environment most closely:
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
+```
+
+`constraints-explainability.txt` pins the certified direct runtime versions
+used to deserialize and explain the retained models; it is applied alongside,
+not instead of, both requirements files. Hosted CI repeats that installation
+under Python 3.13.7 and runs real `shap.TreeExplainer` integration against tiny
+Random Forest and XGBoost estimators without retained artifacts.
 
 ## 4. Generate PSX data, features, dataset, and baseline model
 
@@ -849,6 +877,133 @@ summary as a substitute artifact. See the [LSTM experiment runbook](docs/LSTM_PR
 [`docs/model_training_stage.md`](docs/model_training_stage.md) for the full
 contract and artifact layout. All outputs are an academic simulation and not
 financial advice.
+
+## Run tree-model SHAP explanations
+
+This is an **artifact-present** workflow. Restore all three fixed source roots
+before running it:
+
+```text
+artifacts/model_training/TRN-20261020-191815-624662-nogit/
+artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02/
+artifacts/vertical_slice/VSL-20261020-OGDC-main-02/
+```
+
+The generator explains M-001 through M-004 only. It does not retrain a model,
+explain either LSTM, or change a source artifact. Models are loaded only from
+the trusted training root after manifest and binary checksums pass. The
+portable result contains no executable model.
+
+```bash
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+```
+
+Record the newly printed `XAI-...` run ID. Existing directory, ZIP, or sidecar
+targets are never overwritten. Verify the published directory:
+
+```bash
+# Accepted retained pack only; new runs need the independent digest command below.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
+```
+
+The ZIP/sidecar pair can be moved together and verified without source models:
+
+```bash
+# Accepted retained pack only; new runs need the independent digest command below.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
+```
+
+The verifier checks the exact inventory and checksums, exact 184-date shared
+project holdout, model and feature identities, additivity, global metrics,
+cross-model ranks, deterministic audit sample, portable paths, and prohibited
+causal language. It does not deserialize joblib or load XGBoost binaries.
+`status: PASS` and `integrity_status: PASS` establish internal consistency;
+only `authentication_status: AUTHENTICATED` establishes a match to an
+independent trust anchor. `checksum_verified` and
+`sidecar_checksum_verified` mean only that the ZIP matched its adjacent
+transport sidecar. Plot checks validate PNG structure; authentication binds the
+accepted plot bytes, but the verifier does not rerender plots from the tables.
+
+The retained run is authenticated automatically from the committed run-ID,
+manifest, and ZIP digest allowlist. To authenticate a newly generated run,
+capture its `artifact_manifest.json` SHA-256 immediately after generation:
+
+```bash
+PAISA_XAI_RUN_ID="<new printed XAI-... run ID>"
+export PAISA_XAI_MANIFEST_SHA256="$(
+  python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+    "artifacts/explainability/$PAISA_XAI_RUN_ID/artifact_manifest.json"
+)"
+printf '%s\n' "$PAISA_XAI_MANIFEST_SHA256"
+```
+
+Before transferring the pack, preserve that printed digest in a trusted record
+outside the artifact directory, ZIP, and sidecar. When verifying a received
+copy, set `PAISA_XAI_MANIFEST_SHA256` from that independently retained record,
+not from the received pack, and use both strict options:
+
+```bash
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --expected-manifest-sha256 "$PAISA_XAI_MANIFEST_SHA256" \
+  --require-authenticated
+```
+
+The accepted local pack is
+`artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
+ZIP and sidecar. It was produced from clean implementation commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`; the independently committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, and the
+ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+The 24-file pack reports internal `PASS` and authenticated `AUTHENTICATED` for
+the directory, ZIP, and extracted directory. The sidecar check also passed as
+a separate transport-integrity check.
+
+All four models explain 184 rows and 19 transformed features in positive-class
+probability space. The observed maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06` for M-001,
+`4.302598055616613e-09` / `7.864803434113863e-10` for M-002,
+`2.7466758000471714e-05` / `2.7464541568790406e-05` for M-003, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08` for M-004. All 184 rows
+per model passed the declared `5e-5` Random Forest or `1e-6` XGBoost gate, and
+all seven audit categories were available for every model.
+
+The ordered top five features were:
+
+- M-001: `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20`;
+- M-002: `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`;
+- M-003: `close`, `ma_20`, `close_lag_1`, `close_lag_5`,
+  `return_volatility_5`; and
+- M-004: `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`.
+
+These are verified SHAP results, not the old impurity-based
+`feature_importance.csv`. See the
+[explainability runbook](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
+contract](docs/EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
+policy](docs/SHAP_INTERPRETATION_POLICY.md). These explanations describe fitted
+model behavior on a previously exposed shared holdout, not economic causality,
+profitability, or future performance. Academic simulation; not financial
+advice.
 
 ## Run a versioned OGDC backtest
 

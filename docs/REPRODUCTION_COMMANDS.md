@@ -19,7 +19,11 @@ There are two distinct profiles:
 
 The Python package supports Python 3.10 or newer. The certified LSTM run used
 Python 3.13.7, and TensorFlow 2.21 is supported here only on CPython 3.10 through
-3.13. The frontend supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
+3.13. The optional `shap==0.54.1` explainability runtime requires Python 3.12+
+and NumPy 2+. Its certified direct versions are pinned in
+`constraints-explainability.txt`, and dedicated Python 3.13.7 CI exercises
+real Tree SHAP against small Random Forest and XGBoost estimators. The frontend
+supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
 22.20.0 is the version recorded in the current dashboard runbook.
 
 All generated run destinations are immutable. Every producer below requires a
@@ -60,13 +64,34 @@ python -m pip install -r requirements-sentiment.txt
 # Only in a CPython 3.10--3.13 LSTM environment or Colab runtime.
 python -m pip install -r requirements-lstm.txt
 
+# Only in a separate CPython 3.12+ / NumPy 2+ explainability environment.
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
+
 # Optional full-OHLCV provider; not required for the official psx-dps path.
 python -m pip install -r requirements-provider-pypsx.txt
 python -c "import pypsx_toolkit"
 ```
 
-For the cleanest separation, create `.venv-lstm` or a Colab runtime instead of
-adding TensorFlow to the default development environment.
+For the cleanest separation, create `.venv-lstm` or a Colab runtime for
+TensorFlow and `.venv-explainability` for SHAP instead of adding either optional
+stack to the default development environment. A matching explainability setup
+is:
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
+  -c constraints-explainability.txt \
+  -r requirements.txt \
+  -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
+```
 
 ## Offline validation and CI-equivalent checks
 
@@ -529,6 +554,124 @@ git diff --check
 git diff --check origin/main...HEAD
 git status --short
 ```
+
+## Tree-model SHAP explainability
+
+The optional explainability producer consumes only the authoritative
+M-001--M-004 training run, the authoritative unified comparison, and its bound
+vertical slice. It does not retrain, tune, recalibrate, explain M-005/M-006,
+modify a source, or create a portfolio. The exact 184 rows are the reused
+**shared project holdout**, not a fresh independent evaluation.
+
+Official runs require `shap==0.54.1` in the separate Python 3.12+ / NumPy 2+
+environment documented above. `constraints-explainability.txt` pins the
+certified direct NumPy, pandas, scikit-learn, XGBoost, joblib, Matplotlib, and
+SHAP versions while both requirements files declare the environment; it is not
+a standalone or fully hashed lock. The dedicated artifact-free Python 3.13.7
+CI job runs real `shap.TreeExplainer` calls. Random Forest returns an explicit
+class dimension and reconstructs within `5e-5`; XGBoost returns a
+two-dimensional class-1 matrix and reconstructs within `1e-6`.
+
+Restore the three generated, Git-ignored source roots before running:
+
+```bash
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+```
+
+The command validates fixed source integrity roots, trusted model paths,
+manifest/model checksums, registered IDs, estimator classes, class order,
+ordered features, dates, labels, and fitted preprocessing before explanation.
+It uses interventional Tree SHAP in class-1 probability space with 100
+deterministic training-background rows. Every one of the 184 rows per model
+must satisfy its estimator-family additivity tolerance: `5e-5` for Random
+Forest and `1e-6` for XGBoost.
+
+The producer stages and verifies all files before collision-refusing,
+no-replace publication. Record the returned run ID, then verify the directory:
+
+```bash
+# Accepted retained pack only; new runs also need the independent digest below.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID" \
+  --require-authenticated
+```
+
+Verify a transferred deterministic ZIP with its sidecar:
+
+```bash
+# Accepted retained pack only; new runs also need the independent digest below.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256" \
+  --require-authenticated
+```
+
+The verifier is offline and model-free. It validates the exact inventory and
+SHA-256 values, source/model/feature/date contracts, all local rows,
+probability-space reconstruction, global importance, cross-model ranks,
+deterministic audit selection, summaries, plots, portable paths, canonical ZIP
+metadata, and prohibited causal/advice wording. It rejects missing and added
+files, tampering, absolute paths, symlinks, executable model payloads, unsafe
+ZIP members, and any false `PASS`.
+
+The result deliberately separates integrity from provenance. `status: PASS`
+and `integrity_status: PASS` mean that the pack is internally consistent.
+`checksum_verified`/`sidecar_checksum_verified` mean only that an archive
+matched its adjacent transport sidecar. Require
+`authentication_status: AUTHENTICATED` for official use. The retained run is
+anchored by a committed manifest and ZIP digest allowlist; a new run needs an
+independently obtained `artifact_manifest.json` digest supplied with
+`--expected-manifest-sha256` and enforced with `--require-authenticated`.
+PNG checks are structural; the authenticated manifest binds the accepted plot
+bytes without claiming that the verifier rerendered them.
+
+The accepted local real pack is
+`artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
+ZIP and sidecar. Its clean code version/source fingerprint is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`, its committed
+`artifact_manifest.json` SHA-256 is
+`cd43f76a208bed6b549d6dbfb3b4e468dd91db021f4543f1cfefdbbc7a661fda`, its ZIP
+SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`, and
+its exact 24-file inventory reports `PASS`. Authenticated directory, ZIP, and
+extracted-directory verification all passed; the sidecar transport-integrity
+check also passed. The recorded runtime is Python 3.13.7, NumPy 2.3.5, pandas
+2.3.3, scikit-learn 1.9.1,
+XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP 0.54.1.
+
+All M-001--M-004 results contain 184 rows and 19 transformed features in
+positive-class probability space. Maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06`,
+`4.302598055616613e-09` / `7.864803434113863e-10`,
+`2.7466758000471714e-05` / `2.7464541568790406e-05`, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08`, respectively. Every one
+of the 184 rows per model passed its `5e-5` Random Forest or `1e-6` XGBoost
+tolerance, and all seven audit categories were available for each model.
+
+The strongest rank agreements were M-001/M-002 (`0.8228070175438595`, four
+top-five overlaps), M-001/M-003 (`0.8210526315789475`, five), and M-002/M-003
+(`0.7543859649122807`, four). The reported disagreements were M-001/M-004
+(`0.5964912280701754`, four), M-003/M-004 (`0.6175438596491227`, four), and
+M-002/M-004 (`0.7`, four). Generated explanation directories and ZIPs stay
+out of Git. See
+[`TREE_MODEL_SHAP_EXPLAINABILITY.md`](TREE_MODEL_SHAP_EXPLAINABILITY.md),
+[`EXPLAINABILITY_DATA_CONTRACT.md`](EXPLAINABILITY_DATA_CONTRACT.md), and
+[`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md). Explanations
+describe fitted-model behavior on a previously exposed shared project holdout,
+not economic causality, profitability, or future results. Evidence covers one
+stock, one period, one feature family, and four tree configurations. Academic
+simulation; not financial advice.
 
 ## Final handoff checks
 

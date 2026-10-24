@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { ZodSafeParseResult } from "zod";
 
 import {
   benchmarksSchema,
@@ -10,6 +11,7 @@ import {
   leaderboardSchema,
   modelsSchema,
   portfoliosSchema,
+  runContextSchema,
   snapshotsSchema,
   sourceSchema,
   tradesSchema,
@@ -31,6 +33,36 @@ import {
   RUN_ID,
   runContext,
 } from "../test/fixtures";
+
+const OVERSIZED_COLLECTION_LENGTH = 10_001;
+
+function oversizedInvalidArray(): null[] {
+  return Array.from({ length: OVERSIZED_COLLECTION_LENGTH }, () => null);
+}
+
+function oversizedInvalidRecord(): Record<string, null> {
+  return Object.fromEntries(
+    Array.from({ length: OVERSIZED_COLLECTION_LENGTH }, (_, index) => [
+      `invalid-${index}`,
+      null,
+    ]),
+  );
+}
+
+function expectSingleCollectionIssue(
+  result: ZodSafeParseResult<unknown>,
+  path: PropertyKey[],
+  code?: string,
+): void {
+  expect(result.success).toBe(false);
+  if (result.success) return;
+
+  expect(result.error.issues).toHaveLength(1);
+  expect(result.error.issues[0]).toEqual(expect.objectContaining({ path }));
+  if (code) {
+    expect(result.error.issues[0]?.code).toBe(code);
+  }
+}
 
 function makeHistoricalPricePage() {
   const history = makeHistoricalPrices();
@@ -264,6 +296,132 @@ describe("Zod API response contracts", () => {
     expect(result.error.issues).toEqual([
       expect.objectContaining({ code: "too_big", path: ["rows"] }),
     ]);
+  });
+
+  it("bounds every shared-context and detail collection before item validation", () => {
+    const context = runContext();
+    const detail = makeCoreRunData().detail;
+    const oversized = oversizedInvalidArray();
+
+    for (const field of ["warnings", "limitations"] as const) {
+      expectSingleCollectionIssue(
+        runContextSchema.safeParse({ ...context, [field]: oversized }),
+        [field],
+        "too_big",
+      );
+    }
+
+    for (const field of ["model_variants", "experiment_ids"] as const) {
+      expectSingleCollectionIssue(
+        verticalSliceDetailSchema.safeParse({ ...detail, [field]: oversized }),
+        [field],
+        "too_big",
+      );
+    }
+  });
+
+  it("rejects an oversized registered-model record before validating its values", () => {
+    const detail = makeCoreRunData().detail;
+    const result = verticalSliceDetailSchema.safeParse({
+      ...detail,
+      registered_model_ids: oversizedInvalidRecord(),
+    });
+
+    expectSingleCollectionIssue(result, ["registered_model_ids"], "too_big");
+  });
+
+  it("bounds every unpaginated result table before row validation", () => {
+    const core = makeCoreRunData();
+    const rows = oversizedInvalidArray();
+    const cases = [
+      { schema: modelsSchema, response: core.models },
+      { schema: portfoliosSchema, response: core.portfolios },
+      { schema: leaderboardSchema, response: core.leaderboard },
+      { schema: experimentsSchema, response: core.experiments },
+    ];
+
+    for (const { schema, response } of cases) {
+      const result = schema.safeParse({
+        ...response,
+        total: OVERSIZED_COLLECTION_LENGTH,
+        rows,
+      });
+      expectSingleCollectionIssue(result, ["rows"], "too_big");
+    }
+  });
+
+  it("bounds source-evidence arrays and records before nested validation", () => {
+    const source = makeCoreRunData().source;
+    const oversizedArray = oversizedInvalidArray();
+    const oversizedRecord = oversizedInvalidRecord();
+    const cases = [
+      {
+        response: {
+          ...source,
+          pipeline_evidence: {
+            ...source.pipeline_evidence!,
+            symbols_requested: oversizedArray,
+          },
+        },
+        path: ["pipeline_evidence", "symbols_requested"],
+        code: "too_big",
+      },
+      {
+        response: {
+          ...source,
+          pipeline_evidence: {
+            ...source.pipeline_evidence!,
+            producer: oversizedRecord,
+          },
+        },
+        path: ["pipeline_evidence", "producer"],
+      },
+      {
+        response: {
+          ...source,
+          pipeline_evidence: {
+            ...source.pipeline_evidence!,
+            prices_artifact: oversizedRecord,
+          },
+        },
+        path: ["pipeline_evidence", "prices_artifact"],
+        code: "too_big",
+      },
+      {
+        response: {
+          ...source,
+          migration_evidence: {
+            ...source.migration_evidence!,
+            producer: oversizedRecord,
+          },
+        },
+        path: ["migration_evidence", "producer"],
+      },
+      {
+        response: {
+          ...source,
+          migration_evidence: {
+            ...source.migration_evidence!,
+            limitations: oversizedArray,
+          },
+        },
+        path: ["migration_evidence", "limitations"],
+        code: "too_big",
+      },
+    ];
+
+    for (const { response, path, code } of cases) {
+      expectSingleCollectionIssue(sourceSchema.safeParse(response), path, code);
+    }
+  });
+
+  it("bounds historical-price warnings independently from the price-page limit", () => {
+    const result = historicalPricesSchema.safeParse({
+      ...makeHistoricalPricePage(),
+      warnings: oversizedInvalidArray(),
+    });
+
+    expectSingleCollectionIssue(result, ["warnings"], "too_big");
   });
 
   it("strips unknown object fields while preserving intentionally open evidence records", () => {

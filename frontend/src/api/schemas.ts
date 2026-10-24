@@ -8,6 +8,7 @@ const nonNegativeInteger = integer.nonnegative();
 const text = z.string();
 const MAX_TABLE_PAGE_SIZE = 1_000;
 const MAX_PRICE_PAGE_SIZE = 5_000;
+const MAX_UNPAGINATED_COLLECTION_SIZE = 1_000;
 const money = z.string().regex(/^-?\d+\.\d{2}$/);
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
@@ -52,6 +53,27 @@ function requireExactRowCount<T extends z.ZodRawShape>(schema: z.ZodObject<T>) {
   );
 }
 
+function boundedRecord<T extends z.ZodType>(valueSchema: T) {
+  return z.preprocess((value, context) => {
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.keys(value).length > MAX_UNPAGINATED_COLLECTION_SIZE
+    ) {
+      context.addIssue({
+        code: "too_big",
+        origin: "record",
+        maximum: MAX_UNPAGINATED_COLLECTION_SIZE,
+        inclusive: true,
+        message: `record must contain at most ${MAX_UNPAGINATED_COLLECTION_SIZE} entries`,
+      });
+      return z.NEVER;
+    }
+    return value;
+  }, z.record(z.string(), valueSchema));
+}
+
 export const dateRangeSchema = z.object({ start: text, end: text });
 export const evaluationDateRangeSchema = z.object({
   feature_start: text,
@@ -65,8 +87,8 @@ const runContextShape = {
   run_id: text,
   source_mode: text,
   data_date_range: dateRangeSchema,
-  warnings: z.array(text),
-  limitations: z.array(text),
+  warnings: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+  limitations: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
   disclaimer: academicDisclaimer,
 };
 
@@ -109,9 +131,9 @@ export const verticalSliceDetailSchema = z.object({
   created_at: text,
   evaluation_dates: evaluationDateRangeSchema,
   model_training_run_id: text,
-  model_variants: z.array(text),
-  registered_model_ids: z.record(z.string(), text),
-  experiment_ids: z.array(text),
+  model_variants: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+  registered_model_ids: boundedRecord(text),
+  experiment_ids: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
   shared_experiment_assumptions: z.object({
     initial_cash_pkr: money,
     buy_probability_up_gte: probability,
@@ -200,7 +222,7 @@ export const modelMetricRowSchema = z.object({
 export const modelsSchema = requireExactRowCount(z.object({
   ...runContextShape,
   total: nonNegativeInteger,
-  rows: z.array(modelMetricRowSchema),
+  rows: z.array(modelMetricRowSchema).max(MAX_UNPAGINATED_COLLECTION_SIZE),
 }));
 
 export const portfolioMetricRowSchema = z.object({
@@ -220,7 +242,7 @@ export const portfolioMetricRowSchema = z.object({
 export const portfoliosSchema = requireExactRowCount(z.object({
   ...runContextShape,
   total: nonNegativeInteger,
-  rows: z.array(portfolioMetricRowSchema),
+  rows: z.array(portfolioMetricRowSchema).max(MAX_UNPAGINATED_COLLECTION_SIZE),
 }));
 
 export const leaderboardSchema = requireExactRowCount(z.object({
@@ -246,7 +268,7 @@ export const leaderboardSchema = requireExactRowCount(z.object({
       fees_paid: money,
       result_versus_buy_and_hold: finite,
     }),
-  ),
+  ).max(MAX_UNPAGINATED_COLLECTION_SIZE),
 }));
 
 export const equityCurveRowSchema = z.object({
@@ -315,7 +337,7 @@ export const experimentsSchema = requireExactRowCount(z.object({
       sharpe_ratio: nullableFinite,
       number_of_trades: nonNegativeInteger,
     }),
-  ),
+  ).max(MAX_UNPAGINATED_COLLECTION_SIZE),
 }));
 
 const experimentConfigurationSchema = z.object({
@@ -510,21 +532,21 @@ export const sourceSchema = z.object({
   pipeline_evidence: z
     .object({
       schema_version: text.nullable(),
-      producer: z.union([z.record(z.string(), z.unknown()), text]).nullable(),
+      producer: z.union([boundedRecord(z.unknown()), text]).nullable(),
       generated_at: text.nullable(),
       provider: text.nullable(),
-      symbols_requested: z.array(text),
-      prices_artifact: z.record(z.string(), z.unknown()).nullable(),
+      symbols_requested: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+      prices_artifact: boundedRecord(z.unknown()).nullable(),
     })
     .nullable(),
   migration_evidence: z
     .object({
       schema_version: text.nullable(),
       status: text.nullable(),
-      producer: z.union([z.record(z.string(), z.unknown()), text]).nullable(),
+      producer: z.union([boundedRecord(z.unknown()), text]).nullable(),
       migration_strategy: text.nullable(),
       provenance_strength: text.nullable(),
-      limitations: z.array(text),
+      limitations: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
     })
     .nullable(),
 });
@@ -549,7 +571,7 @@ export const historicalPricesSchema = z.object({
       source: priceSource,
     }),
   ).max(MAX_PRICE_PAGE_SIZE),
-  warnings: z.array(text),
+  warnings: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
   disclaimer: academicDisclaimer,
 }).superRefine((value, context) => {
   if (value.data_date_range.start > value.data_date_range.end) {

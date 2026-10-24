@@ -16,7 +16,13 @@ code. It does not replace the repository's normal test and review requirements.
 The controlled Zod 4 migration preserved the dashboard's response contracts,
 made record key schemas explicit, and added the backend's documented 1,000-row
 table-page and 5,000-row historical-price-page bounds to the runtime validators.
-It did not upgrade another dependency or add fallback data.
+As defense in depth, every unpaginated API array and open evidence record also
+has a 1,000-entry frontend safety ceiling. Oversized collections are rejected
+before their elements or record values are validated, preventing malformed
+responses from amplifying validation work and issue allocation. The ceiling
+comfortably preserves the unified six-model response and the current evidence
+metadata; it does not replace the backend's endpoint contracts. This work did
+not upgrade another dependency or add fallback data.
 
 Verification commands:
 

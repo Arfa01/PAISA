@@ -21,6 +21,7 @@ proposal and early-v0 context.
 | [Remaining roadmap](docs/REMAINING_ROADMAP.md) | Dependency-ordered, PR-sized continuation tasks with priorities and exit criteria. |
 | [Issue backlog](docs/ISSUE_BACKLOG.md) | Paste-ready GitHub issues for the remaining research, integration, report, and demo work. |
 | [Reproduction commands](docs/REPRODUCTION_COMMANDS.md) | Tested setup, validation, application, artifact, data, sentiment, coverage, and LSTM commands. |
+| [Security maintenance](docs/SECURITY_MAINTENANCE.md) | Dated dependency advisories, controlled migrations, and verification commands. |
 | [Limited-usage workflow](docs/FREE_PLAN_WORKFLOW.md) | Sequential local/CI/Colab/GitHub workflow for continuing PAISA with limited agent usage. |
 | [Codex prompt library](docs/CODEX_PROMPT_LIBRARY.md) | Reusable implementation, review, repair, acceptance, triage, release, and report prompts. |
 | [Current implementation status](docs/CURRENT_IMPLEMENTATION_STATUS.md) | Canonical status of implemented code, retained evidence, and incomplete scope. |

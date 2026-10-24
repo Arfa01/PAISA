@@ -593,3 +593,537 @@ export const historicalPricesSchema = z.object({
     });
   }
 });
+
+export const UNIFIED_MODEL_VARIANTS = [
+  "M-001",
+  "M-002",
+  "M-003",
+  "M-004",
+  "M-005",
+  "M-006",
+] as const;
+const UNIFIED_REFERENCE_BASELINES = [
+  "majority-class-baseline",
+  "previous-direction-baseline",
+] as const;
+const UNIFIED_BENCHMARKS = ["cash-only", "buy-and-hold"] as const;
+const unifiedVariant = z.enum(UNIFIED_MODEL_VARIANTS);
+const unifiedReferenceBaseline = z.enum(UNIFIED_REFERENCE_BASELINES);
+const unifiedBenchmark = z.enum(UNIFIED_BENCHMARKS);
+const unifiedHoldoutTerm = z.literal("shared project holdout");
+const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
+
+const unifiedContextShape = {
+  schema_version: text,
+  comparison_id: text,
+  status: z.literal("PASS"),
+  symbol: z.literal("OGDC"),
+  holdout_term: unifiedHoldoutTerm,
+  outcomes_are_not_combined: z.literal(true),
+  limitations: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+  disclaimer: academicDisclaimer,
+};
+
+function requireExactIdentifiers(
+  values: readonly string[],
+  expected: readonly string[],
+  context: z.RefinementCtx,
+  path: PropertyKey[],
+): void {
+  if (
+    values.length !== expected.length ||
+    values.some((value, index) => value !== expected[index])
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `identifiers must be exactly ${expected.join(", ")} in canonical order`,
+      path,
+    });
+  }
+}
+
+function requireRankedIdentifiers(
+  values: ReadonlyArray<{ rank: number; competitor_id: string }>,
+  expected: readonly string[],
+  context: z.RefinementCtx,
+  path: PropertyKey[],
+): void {
+  const identities = values.map((row) => row.competitor_id);
+  const ranks = values.map((row) => row.rank).sort((left, right) => left - right);
+  if (
+    identities.length !== expected.length ||
+    new Set(identities).size !== expected.length ||
+    identities.some((identity) => !expected.includes(identity)) ||
+    ranks.some((rank, index) => rank !== index + 1)
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "ranking must contain every expected competitor exactly once with contiguous ranks",
+      path,
+    });
+  }
+}
+
+export const unifiedComparisonListSchema = z.object({
+  schema_version: text,
+  total: nonNegativeInteger.safe(),
+  limit: integer.positive().max(MAX_TABLE_PAGE_SIZE),
+  offset: nonNegativeInteger.safe(),
+  default_comparison_id: text.nullable(),
+  rows: z.array(z.object({
+    schema_version: text,
+    comparison_id: text,
+    status: z.literal("PASS"),
+    symbol: z.literal("OGDC"),
+    model_count: z.literal(6),
+    validation_count: integer.positive(),
+    shared_holdout_count: integer.positive(),
+    shared_holdout_target_start: isoDate,
+    shared_holdout_target_end: isoDate,
+    holdout_term: unifiedHoldoutTerm,
+    is_default: z.boolean(),
+  })).max(MAX_TABLE_PAGE_SIZE),
+  disclaimer: academicDisclaimer,
+}).superRefine((value, context) => {
+  if (
+    value.rows.length > value.limit ||
+    value.offset > value.total ||
+    value.offset + value.rows.length > value.total
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "comparison page metadata is inconsistent",
+      path: ["rows"],
+    });
+  }
+  if (
+    value.rows.some(
+      (row) => row.is_default !== (row.comparison_id === value.default_comparison_id),
+    )
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "default comparison markers are inconsistent",
+      path: ["rows"],
+    });
+  }
+});
+
+const unifiedModelIdentitySchema = z.object({
+  variant_id: unifiedVariant,
+  registered_model_id: text,
+  algorithm: text,
+  configuration_family: text,
+});
+
+export const unifiedComparisonDetailSchema = z.object({
+  ...unifiedContextShape,
+  models: z.array(unifiedModelIdentitySchema).max(UNIFIED_MODEL_VARIANTS.length),
+  source_frequency: text,
+  validation_count: integer.positive(),
+  shared_holdout_count: integer.positive(),
+  selection_policy: z.object({
+    primary: text,
+    tie_breakers: z.array(text).max(10),
+    test_metrics_used_for_selection: z.literal(false),
+  }),
+  presentation: z.object({
+    format: z.literal("tabular_report_only"),
+    plots_included: z.literal(false),
+    data_sources: z.array(text).max(20),
+  }),
+}).superRefine((value, context) => {
+  requireExactIdentifiers(
+    value.models.map((row) => row.variant_id),
+    UNIFIED_MODEL_VARIANTS,
+    context,
+    ["models"],
+  );
+});
+
+export const unifiedSourcesSchema = z.object({
+  ...unifiedContextShape,
+  sources: z.array(z.object({
+    role: text,
+    artifact_type: text,
+    run_id: text,
+    integrity_root_sha256: sha256,
+    payload_file_count: integer.positive(),
+    integrity_root_derivation: text,
+  })).length(3),
+  relationships: z.object({
+    vertical_slice_uses_training_run: z.boolean(),
+    lstm_uses_training_run: z.boolean(),
+    lstm_uses_vertical_slice: z.boolean(),
+  }),
+});
+
+const unifiedPredictionOutcomeSchema = z.object({
+  variant_id: unifiedVariant,
+  registered_model_id: text,
+  criterion: text,
+  scope: text,
+  accuracy: finite,
+  balanced_accuracy: nullableFinite,
+  f1: finite,
+});
+
+const unifiedPortfolioOutcomeSchema = z.object({
+  variant_id: unifiedVariant,
+  registered_model_id: text,
+  portfolio_id: text,
+  criterion: text,
+  ending_equity: money,
+  total_return: finite,
+  maximum_drawdown: finite,
+  fees_paid: money,
+});
+
+const unifiedBenchmarkOutcomeSchema = z.object({
+  initial_equity: money,
+  ending_equity: money,
+  total_return: finite,
+  maximum_drawdown: finite,
+  volatility: nullableFinite,
+  sharpe_ratio: nullableFinite,
+  number_of_trades: nonNegativeInteger,
+  fees_paid: money,
+});
+
+export const unifiedSummarySchema = z.object({
+  ...unifiedContextShape,
+  holdout_context: z.object({
+    term: unifiedHoldoutTerm,
+    common_count: integer.positive(),
+    target_start: isoDate,
+    target_end: isoDate,
+    previously_exposed_through: z.array(unifiedVariant).max(6),
+  }),
+  reported_outcomes: z.object({
+    validation_selected_model: unifiedPredictionOutcomeSchema,
+    lstm_validation_preferred_model: unifiedPredictionOutcomeSchema,
+    best_shared_holdout_balanced_accuracy: unifiedPredictionOutcomeSchema,
+    best_shared_holdout_f1: unifiedPredictionOutcomeSchema,
+    best_simulated_model_portfolio: unifiedPortfolioOutcomeSchema,
+    lowest_drawdown_model_portfolio: unifiedPortfolioOutcomeSchema,
+    lowest_fee_model_portfolio: unifiedPortfolioOutcomeSchema,
+    cash_only_benchmark: unifiedBenchmarkOutcomeSchema,
+    buy_and_hold_result: unifiedBenchmarkOutcomeSchema,
+    any_model_beat_buy_and_hold: z.object({
+      value: z.boolean(),
+      best_model_variant_id: unifiedVariant,
+      best_model_minus_buy_and_hold: finite,
+      comparison_metric: text,
+    }),
+  }),
+});
+
+const countPair = z.object({
+  "0": nonNegativeInteger,
+  "1": nonNegativeInteger,
+});
+const confusionMatrix = z.tuple([
+  z.tuple([nonNegativeInteger, nonNegativeInteger]),
+  z.tuple([nonNegativeInteger, nonNegativeInteger]),
+]);
+const unifiedPredictionMetricShape = {
+  evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
+  row_count: integer.positive(),
+  support: integer.positive(),
+  accuracy: finite,
+  balanced_accuracy: nullableFinite,
+  precision: finite,
+  recall: finite,
+  f1: finite,
+  matthews_corrcoef: nullableFinite,
+  roc_auc: nullableFinite,
+  brier_score: nullableFinite,
+  log_loss: nullableFinite,
+  expected_calibration_error: nullableFinite,
+  selection_eligible: z.boolean(),
+  metric_warnings: z.array(text).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+  class_counts: countPair,
+  predicted_class_counts: countPair,
+  confusion_matrix: confusionMatrix,
+};
+const unifiedModelPredictionMetricSchema = z.object({
+  competitor_id: unifiedVariant,
+  competitor_type: z.literal("model"),
+  registered_model_id: text,
+  algorithm: text,
+  configuration_family: text,
+  ...unifiedPredictionMetricShape,
+}).superRefine((value, context) => {
+  if (
+    value.support !== value.row_count ||
+    value.class_counts["0"] + value.class_counts["1"] !== value.row_count ||
+    value.predicted_class_counts["0"] + value.predicted_class_counts["1"] !== value.row_count ||
+    value.confusion_matrix.flat().reduce((total, cell) => total + cell, 0) !== value.row_count
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "prediction metric counts must reconcile",
+    });
+  }
+});
+const unifiedReferencePredictionMetricSchema = z.object({
+  competitor_id: unifiedReferenceBaseline,
+  competitor_type: z.literal("reference_baseline"),
+  registered_model_id: z.null(),
+  algorithm: z.null(),
+  configuration_family: z.null(),
+  ...unifiedPredictionMetricShape,
+});
+
+function unifiedMetricsSchema(expectedScope: "validation" | "shared project holdout") {
+  return z.object({
+    ...unifiedContextShape,
+    models: z.array(unifiedModelPredictionMetricSchema).max(6),
+    reference_baselines: z.array(unifiedReferencePredictionMetricSchema).max(2),
+  }).superRefine((value, context) => {
+    requireExactIdentifiers(
+      value.models.map((row) => row.competitor_id),
+      UNIFIED_MODEL_VARIANTS,
+      context,
+      ["models"],
+    );
+    requireExactIdentifiers(
+      value.reference_baselines.map((row) => row.competitor_id),
+      UNIFIED_REFERENCE_BASELINES,
+      context,
+      ["reference_baselines"],
+    );
+    if (
+      [...value.models, ...value.reference_baselines].some(
+        (row) => row.evaluation_scope !== expectedScope,
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `all metric rows must use ${expectedScope}`,
+        path: ["models"],
+      });
+    }
+  });
+}
+
+export const unifiedPredictionMetricsSchema = unifiedMetricsSchema(
+  "shared project holdout",
+);
+export const unifiedValidationMetricsSchema = unifiedMetricsSchema("validation")
+  .and(z.object({ evaluation_scope: z.literal("validation") }));
+
+const unifiedModelPortfolioMetricSchema = z.object({
+  variant_id: unifiedVariant,
+  registered_model_id: text,
+  experiment_id: text,
+  portfolio_id: text,
+  initial_equity: money,
+  ending_equity: money,
+  total_return: finite,
+  maximum_drawdown: finite,
+  volatility: nullableFinite,
+  sharpe_ratio: nullableFinite,
+  number_of_trades: nonNegativeInteger,
+  win_rate: nullableFinite,
+  average_gain: money.nullable(),
+  average_loss: money.nullable(),
+  turnover: finite,
+  fees_paid: money,
+  time_in_market: finite,
+  excess_return_vs_cash_only: finite,
+  excess_return_vs_buy_and_hold: finite,
+});
+const unifiedBenchmarkPortfolioMetricSchema = z.object({
+  benchmark_id: unifiedBenchmark,
+  initial_equity: money,
+  ending_equity: money,
+  total_return: finite,
+  maximum_drawdown: finite,
+  volatility: nullableFinite,
+  sharpe_ratio: nullableFinite,
+  number_of_trades: nonNegativeInteger,
+  win_rate: nullableFinite,
+  average_gain: money.nullable(),
+  average_loss: money.nullable(),
+  turnover: finite,
+  fees_paid: money,
+  time_in_market: finite,
+  ledger_count: z.literal(6),
+});
+export const unifiedPortfolioMetricsSchema = z.object({
+  ...unifiedContextShape,
+  models: z.array(unifiedModelPortfolioMetricSchema).max(6),
+  benchmarks: z.array(unifiedBenchmarkPortfolioMetricSchema).max(2),
+}).superRefine((value, context) => {
+  requireExactIdentifiers(
+    value.models.map((row) => row.variant_id),
+    UNIFIED_MODEL_VARIANTS,
+    context,
+    ["models"],
+  );
+  requireExactIdentifiers(
+    value.benchmarks.map((row) => row.benchmark_id),
+    UNIFIED_BENCHMARKS,
+    context,
+    ["benchmarks"],
+  );
+  if (new Set(value.models.map((row) => row.portfolio_id)).size !== 6) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "model portfolio identifiers must be unique",
+      path: ["models"],
+    });
+  }
+});
+
+const unifiedPredictionRankingRowSchema = z.object({
+  rank: integer.positive(),
+  competitor_id: unifiedVariant,
+  registered_model_id: text,
+  accuracy: finite,
+  balanced_accuracy: nullableFinite,
+  f1: finite,
+});
+export const unifiedPredictionRankingsSchema = z.object({
+  ...unifiedContextShape,
+  validation_model_selection: z.array(unifiedPredictionRankingRowSchema).max(6),
+  lstm_validation_preference: z.array(unifiedPredictionRankingRowSchema).max(2),
+  shared_project_holdout_balanced_accuracy: z.array(unifiedPredictionRankingRowSchema).max(6),
+  shared_project_holdout_f1: z.array(unifiedPredictionRankingRowSchema).max(6),
+}).superRefine((value, context) => {
+  requireRankedIdentifiers(value.validation_model_selection, UNIFIED_MODEL_VARIANTS, context, ["validation_model_selection"]);
+  requireRankedIdentifiers(value.lstm_validation_preference, ["M-005", "M-006"], context, ["lstm_validation_preference"]);
+  requireRankedIdentifiers(value.shared_project_holdout_balanced_accuracy, UNIFIED_MODEL_VARIANTS, context, ["shared_project_holdout_balanced_accuracy"]);
+  requireRankedIdentifiers(value.shared_project_holdout_f1, UNIFIED_MODEL_VARIANTS, context, ["shared_project_holdout_f1"]);
+});
+
+const unifiedPortfolioRankingRowSchema = z.object({
+  rank: integer.positive(),
+  competitor_id: unifiedVariant,
+  registered_model_id: text,
+  total_return: nullableFinite,
+  maximum_drawdown: nullableFinite,
+  sharpe_ratio: nullableFinite,
+  fees_paid: money.nullable(),
+  number_of_trades: nonNegativeInteger.nullable(),
+});
+export const unifiedPortfolioRankingsSchema = z.object({
+  ...unifiedContextShape,
+  simulated_model_portfolio_return: z.array(unifiedPortfolioRankingRowSchema).max(6),
+  simulated_model_portfolio_drawdown: z.array(unifiedPortfolioRankingRowSchema).max(6),
+  simulated_model_portfolio_fees: z.array(unifiedPortfolioRankingRowSchema).max(6),
+}).superRefine((value, context) => {
+  requireRankedIdentifiers(value.simulated_model_portfolio_return, UNIFIED_MODEL_VARIANTS, context, ["simulated_model_portfolio_return"]);
+  requireRankedIdentifiers(value.simulated_model_portfolio_drawdown, UNIFIED_MODEL_VARIANTS, context, ["simulated_model_portfolio_drawdown"]);
+  requireRankedIdentifiers(value.simulated_model_portfolio_fees, UNIFIED_MODEL_VARIANTS, context, ["simulated_model_portfolio_fees"]);
+});
+
+const unifiedCountRecord = z.object(Object.fromEntries(
+  UNIFIED_MODEL_VARIANTS.map((variant) => [variant, nonNegativeInteger]),
+) as Record<(typeof UNIFIED_MODEL_VARIANTS)[number], typeof nonNegativeInteger>);
+const unifiedDroppedDatesRecord = z.object(Object.fromEntries(
+  UNIFIED_MODEL_VARIANTS.map((variant) => [variant, z.array(isoDate).max(MAX_UNPAGINATED_COLLECTION_SIZE)]),
+) as Record<(typeof UNIFIED_MODEL_VARIANTS)[number], z.ZodArray<typeof isoDate>>);
+const unifiedCommonDateKeySchema = z.object({
+  ticker: z.literal("OGDC"),
+  feature_date: isoDate,
+  target_date: isoDate,
+  actual_class: z.union([z.literal(0), z.literal(1)]),
+});
+function unifiedDateScopeSchema(expectedTerm: "validation" | "shared project holdout") {
+  return z.object({
+    terminology: z.literal(expectedTerm),
+    common_count: integer.positive(),
+    feature_start: isoDate,
+    feature_end: isoDate,
+    target_start: isoDate,
+    target_end: isoDate,
+    original_counts: unifiedCountRecord,
+    common_counts: unifiedCountRecord,
+    dropped_target_dates: unifiedDroppedDatesRecord,
+    common_keys: z.array(unifiedCommonDateKeySchema).max(MAX_UNPAGINATED_COLLECTION_SIZE),
+  }).superRefine((value, context) => {
+    if (
+      value.common_keys.length !== value.common_count ||
+      UNIFIED_MODEL_VARIANTS.some(
+        (variant) => value.common_counts[variant] !== value.common_count,
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "common-date counts must reconcile for all six models",
+      });
+    }
+  });
+}
+export const unifiedCommonDateSchema = z.object({
+  ...unifiedContextShape,
+  alignment_key: z.tuple([
+    z.literal("ticker"),
+    z.literal("feature_date"),
+    z.literal("target_date"),
+  ]),
+  validation: unifiedDateScopeSchema("validation"),
+  shared_project_holdout: unifiedDateScopeSchema("shared project holdout").and(
+    z.object({
+      previously_exposed_through: z.array(unifiedVariant).max(6),
+    }),
+  ),
+});
+
+const unifiedModelConfusionRowSchema = z.object({
+  competitor_id: unifiedVariant,
+  competitor_type: z.literal("model"),
+  registered_model_id: text,
+  evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
+  class_labels: z.tuple([z.literal(0), z.literal(1)]),
+  confusion_matrix: confusionMatrix,
+  support: integer.positive(),
+});
+const unifiedReferenceConfusionRowSchema = z.object({
+  competitor_id: unifiedReferenceBaseline,
+  competitor_type: z.literal("reference_baseline"),
+  registered_model_id: z.null(),
+  evaluation_scope: z.union([z.literal("validation"), unifiedHoldoutTerm]),
+  class_labels: z.tuple([z.literal(0), z.literal(1)]),
+  confusion_matrix: confusionMatrix,
+  support: integer.positive(),
+});
+export const unifiedConfusionMatricesSchema = z.object({
+  ...unifiedContextShape,
+  validation_models: z.array(unifiedModelConfusionRowSchema).max(6),
+  validation_reference_baselines: z.array(unifiedReferenceConfusionRowSchema).max(2),
+  shared_project_holdout_models: z.array(unifiedModelConfusionRowSchema).max(6),
+  shared_project_holdout_reference_baselines: z.array(unifiedReferenceConfusionRowSchema).max(2),
+}).superRefine((value, context) => {
+  requireExactIdentifiers(value.validation_models.map((row) => row.competitor_id), UNIFIED_MODEL_VARIANTS, context, ["validation_models"]);
+  requireExactIdentifiers(value.validation_reference_baselines.map((row) => row.competitor_id), UNIFIED_REFERENCE_BASELINES, context, ["validation_reference_baselines"]);
+  requireExactIdentifiers(value.shared_project_holdout_models.map((row) => row.competitor_id), UNIFIED_MODEL_VARIANTS, context, ["shared_project_holdout_models"]);
+  requireExactIdentifiers(value.shared_project_holdout_reference_baselines.map((row) => row.competitor_id), UNIFIED_REFERENCE_BASELINES, context, ["shared_project_holdout_reference_baselines"]);
+  if (
+    value.validation_models.some((row) => row.evaluation_scope !== "validation") ||
+    value.validation_reference_baselines.some((row) => row.evaluation_scope !== "validation") ||
+    value.shared_project_holdout_models.some((row) => row.evaluation_scope !== "shared project holdout") ||
+    value.shared_project_holdout_reference_baselines.some((row) => row.evaluation_scope !== "shared project holdout")
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "confusion matrix scopes are inconsistent",
+    });
+  }
+  for (const row of [
+    ...value.validation_models,
+    ...value.validation_reference_baselines,
+    ...value.shared_project_holdout_models,
+    ...value.shared_project_holdout_reference_baselines,
+  ]) {
+    if (row.confusion_matrix.flat().reduce((total, cell) => total + cell, 0) !== row.support) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "confusion matrix cells must sum to support",
+      });
+      break;
+    }
+  }
+});

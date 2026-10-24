@@ -17,11 +17,13 @@ import { ModelComparisonView } from "./components/ModelComparisonView";
 import { OverviewView } from "./components/OverviewView";
 import { PortfolioComparisonView } from "./components/PortfolioComparisonView";
 import { ProvenanceView } from "./components/ProvenanceView";
+import { UnifiedComparisonView } from "./components/UnifiedComparisonView";
 
 const DEFAULT_DISCLAIMER = "Academic simulation; not financial advice.";
 
 type ViewId =
   | "overview"
+  | "unified"
   | "history"
   | "models"
   | "portfolios"
@@ -30,11 +32,12 @@ type ViewId =
 
 const NAVIGATION: Array<{ id: ViewId; label: string; short: string }> = [
   { id: "overview", label: "Overview", short: "01" },
-  { id: "history", label: "Historical OGDC", short: "02" },
-  { id: "models", label: "Model comparison", short: "03" },
-  { id: "portfolios", label: "Portfolio comparison", short: "04" },
-  { id: "experiment", label: "Experiment detail", short: "05" },
-  { id: "provenance", label: "Data & limitations", short: "06" },
+  { id: "unified", label: "Unified comparison", short: "02" },
+  { id: "history", label: "Historical OGDC", short: "03" },
+  { id: "models", label: "Model comparison", short: "04" },
+  { id: "portfolios", label: "Portfolio comparison", short: "05" },
+  { id: "experiment", label: "Experiment detail", short: "06" },
+  { id: "provenance", label: "Data & limitations", short: "07" },
 ];
 
 interface AppProps {
@@ -181,6 +184,9 @@ export function App({ client = defaultApiClient }: AppProps) {
   );
 
   function renderContent() {
+    if (activeView === "unified") {
+      return <UnifiedComparisonView client={client} />;
+    }
     if (runs.loading) {
       return <LoadingPanel label="Loading completed PAISA runs…" />;
     }
@@ -320,7 +326,7 @@ export function App({ client = defaultApiClient }: AppProps) {
                 className={`nav-item${activeView === item.id ? " active" : ""}`}
                 aria-current={activeView === item.id ? "page" : undefined}
                 onClick={() => setActiveView(item.id)}
-                disabled={!visibleCore}
+                disabled={item.id !== "unified" && !visibleCore}
               >
                 <span>{item.short}</span>
                 {item.label}

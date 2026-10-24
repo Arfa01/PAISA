@@ -15,6 +15,17 @@ import {
   snapshotsSchema,
   sourceSchema,
   tradesSchema,
+  unifiedCommonDateSchema,
+  unifiedComparisonDetailSchema,
+  unifiedComparisonListSchema,
+  unifiedConfusionMatricesSchema,
+  unifiedPortfolioMetricsSchema,
+  unifiedPortfolioRankingsSchema,
+  unifiedPredictionMetricsSchema,
+  unifiedPredictionRankingsSchema,
+  unifiedSourcesSchema,
+  unifiedSummarySchema,
+  unifiedValidationMetricsSchema,
   verticalSliceDetailSchema,
   verticalSliceListSchema,
   verticalSliceSummarySchema,
@@ -26,6 +37,8 @@ import {
   makeCoreRunData,
   makeExperimentDetail,
   makeHistoricalPrices,
+  makeUnifiedComparisonData,
+  makeUnifiedComparisonList,
   makeRunList,
   makeRunListItem,
   makeSnapshotsResponse,
@@ -445,5 +458,91 @@ describe("Zod API response contracts", () => {
     expect(parsedSource.pipeline_evidence?.prices_artifact).toEqual({
       relative_reference: "frozen_input/OGDC_prices.csv",
     });
+  });
+
+  it("parses every valid unified-comparison response contract", () => {
+    const data = makeUnifiedComparisonData();
+
+    expect(unifiedComparisonListSchema.safeParse(makeUnifiedComparisonList()).success).toBe(true);
+    expect(unifiedComparisonDetailSchema.safeParse(data.detail).success).toBe(true);
+    expect(unifiedSourcesSchema.safeParse(data.sources).success).toBe(true);
+    expect(unifiedSummarySchema.safeParse(data.summary).success).toBe(true);
+    expect(unifiedPredictionMetricsSchema.safeParse(data.predictionMetrics).success).toBe(true);
+    expect(unifiedValidationMetricsSchema.safeParse(data.validationMetrics).success).toBe(true);
+    expect(unifiedPortfolioMetricsSchema.safeParse(data.portfolioMetrics).success).toBe(true);
+    expect(unifiedPredictionRankingsSchema.safeParse(data.predictionRankings).success).toBe(true);
+    expect(unifiedPortfolioRankingsSchema.safeParse(data.portfolioRankings).success).toBe(true);
+    expect(unifiedCommonDateSchema.safeParse(data.commonDateContract).success).toBe(true);
+    expect(unifiedConfusionMatricesSchema.safeParse(data.confusionMatrices).success).toBe(true);
+  });
+
+  it("requires M-001 through M-006 exactly once in every six-model collection", () => {
+    const data = makeUnifiedComparisonData();
+    const duplicateMetrics = structuredClone(data.predictionMetrics);
+    duplicateMetrics.models[5] = { ...duplicateMetrics.models[0]! };
+    const missingPortfolio = structuredClone(data.portfolioMetrics);
+    missingPortfolio.models.pop();
+    const duplicateConfusion = structuredClone(data.confusionMatrices);
+    duplicateConfusion.shared_project_holdout_models[5] = {
+      ...duplicateConfusion.shared_project_holdout_models[0]!,
+    };
+
+    expect(unifiedPredictionMetricsSchema.safeParse(duplicateMetrics).success).toBe(false);
+    expect(unifiedPortfolioMetricsSchema.safeParse(missingPortfolio).success).toBe(false);
+    expect(unifiedConfusionMatricesSchema.safeParse(duplicateConfusion).success).toBe(false);
+  });
+
+  it("requires the shared project holdout term and separate-outcome contract", () => {
+    const data = makeUnifiedComparisonData();
+
+    expect(
+      unifiedComparisonDetailSchema.safeParse({
+        ...data.detail,
+        holdout_term: "test set",
+      }).success,
+    ).toBe(false);
+    expect(
+      unifiedSummarySchema.safeParse({
+        ...data.summary,
+        outcomes_are_not_combined: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      unifiedSummarySchema.parse({
+        ...data.summary,
+        universal_winner: "M-006",
+      }),
+    ).not.toHaveProperty("universal_winner");
+  });
+
+  it("accepts declared null metrics and rejects NaN or Infinity", () => {
+    const data = makeUnifiedComparisonData();
+    expect(data.predictionMetrics.models[2]?.balanced_accuracy).toBeNull();
+    expect(unifiedPredictionMetricsSchema.safeParse(data.predictionMetrics).success).toBe(true);
+    expect(unifiedPortfolioMetricsSchema.safeParse(data.portfolioMetrics).success).toBe(true);
+
+    const nanMetrics = structuredClone(data.predictionMetrics);
+    nanMetrics.models[0]!.accuracy = Number.NaN;
+    const infinitePortfolio = structuredClone(data.portfolioMetrics);
+    infinitePortfolio.models[0]!.total_return = Number.POSITIVE_INFINITY;
+    expect(unifiedPredictionMetricsSchema.safeParse(nanMetrics).success).toBe(false);
+    expect(unifiedPortfolioMetricsSchema.safeParse(infinitePortfolio).success).toBe(false);
+  });
+
+  it("strips binary and path-like fields outside the unified API contract", () => {
+    const detail = makeUnifiedComparisonData().detail;
+    const parsed = unifiedComparisonDetailSchema.parse({
+      ...detail,
+      model_binary: "models/private.joblib",
+      local_path: "/Users/private-owner/artifacts",
+      models: detail.models.map((row) => ({
+        ...row,
+        artifact_path: `models/${row.variant_id}.joblib`,
+      })),
+    });
+
+    expect(parsed).not.toHaveProperty("model_binary");
+    expect(parsed).not.toHaveProperty("local_path");
+    expect(parsed.models.every((row) => !("artifact_path" in row))).toBe(true);
   });
 });

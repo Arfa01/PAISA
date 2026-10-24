@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
 from paisa.experiments.artifacts import (
@@ -45,6 +45,74 @@ _SUPPORTS_SECURE_DIR_FD = (
     and os.open in os.supports_dir_fd
 )
 _MODEL_VARIANTS = ("M-001", "M-002", "M-003", "M-004")
+_UNIFIED_MODEL_VARIANTS = (
+    "M-001",
+    "M-002",
+    "M-003",
+    "M-004",
+    "M-005",
+    "M-006",
+)
+_UNIFIED_REFERENCE_BASELINES = (
+    "majority-class-baseline",
+    "previous-direction-baseline",
+)
+_UNIFIED_BENCHMARKS = ("cash-only", "buy-and-hold")
+_UNIFIED_HOLDOUT_TERM = "shared project holdout"
+_UNIFIED_ARTIFACT_TYPE = "paisa_unified_price_model_comparison"
+_UNIFIED_AUTHORED_FILES = {
+    "comparison_contract.json",
+    "date_alignment.json",
+    "derived/reference_baseline_predictions.csv",
+    "final_summary.json",
+    "metrics.json",
+    "rankings.json",
+    "report.md",
+    "source_roots.json",
+}
+_UNIFIED_PORTFOLIO_FILES = (
+    "config.json",
+    "signals.csv",
+    "portfolio_snapshots.csv",
+    "trades.csv",
+    "benchmarks/cash_only_snapshots.csv",
+    "benchmarks/buy_and_hold_snapshots.csv",
+    "benchmarks/buy_and_hold_trades.csv",
+)
+_UNIFIED_EVIDENCE_FILES = {
+    "evidence/market_data/baseline_psx_prices.csv",
+    "evidence/market_data/lstm_ogdc_prices.csv",
+    "evidence/source_manifests/baseline_training_run_manifest.json",
+    "evidence/source_manifests/baseline_vertical_manifest_certificate.json",
+    "evidence/source_manifests/lstm_artifact_manifest.json",
+    "evidence/source_manifests/lstm_run_manifest.json",
+    "evidence/splits/baseline_split_manifest.json",
+    "evidence/splits/lstm_split_manifest.json",
+    *(
+        f"evidence/predictions/{variant}/predictions_all_splits.csv"
+        for variant in _UNIFIED_MODEL_VARIANTS
+    ),
+    *(
+        f"evidence/portfolios/{variant}/{relative}"
+        for variant in _UNIFIED_MODEL_VARIANTS
+        for relative in _UNIFIED_PORTFOLIO_FILES
+    ),
+}
+_UNIFIED_EXPECTED_FILES = _UNIFIED_AUTHORED_FILES | _UNIFIED_EVIDENCE_FILES
+_UNIFIED_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+_EXECUTABLE_MODEL_SUFFIXES = {
+    ".joblib",
+    ".pkl",
+    ".pickle",
+    ".keras",
+    ".h5",
+    ".hdf5",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".safetensors",
+}
 _TRADE_COLUMNS = (
     "schema_version",
     "trade_id",
@@ -115,6 +183,8 @@ class RepositorySettings:
     vertical_slice_root: Path
     model_training_root: Path
     default_vertical_slice_run_id: str | None
+    unified_comparison_root: Path | None = None
+    default_unified_comparison_run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +200,21 @@ class ValidatedRun:
     training_signature: tuple[tuple[Any, ...], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedUnifiedComparison:
+    comparison_id: str
+    directory: Path
+    manifest: dict[str, Any]
+    summary: dict[str, Any]
+    contract: dict[str, Any]
+    sources: dict[str, Any]
+    date_alignment: dict[str, Any]
+    metrics: dict[str, Any]
+    rankings: dict[str, Any]
+    artifact_paths: frozenset[str]
+    signature: tuple[tuple[Any, ...], ...]
+
+
 def _repository_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -139,11 +224,24 @@ def _configured_root(value: str | None, *, default: str, repository_root: Path) 
     return (raw if raw.is_absolute() else repository_root / raw).resolve()
 
 
+def _configured_lexical_root(
+    value: str | None, *, default: str, repository_root: Path
+) -> Path:
+    """Keep path components visible so later validation can reject symlinks."""
+
+    raw = Path(value or default).expanduser()
+    candidate = raw if raw.is_absolute() else repository_root / raw
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
 def settings_from_environment() -> RepositorySettings:
     repository_root = _repository_root()
     default_run = os.getenv("PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID")
     if default_run is not None:
         default_run = default_run.strip() or None
+    default_comparison = os.getenv("PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID")
+    if default_comparison is not None:
+        default_comparison = default_comparison.strip() or None
     return RepositorySettings(
         repository_root=repository_root,
         vertical_slice_root=_configured_root(
@@ -157,6 +255,12 @@ def settings_from_environment() -> RepositorySettings:
             repository_root=repository_root,
         ),
         default_vertical_slice_run_id=default_run,
+        unified_comparison_root=_configured_lexical_root(
+            os.getenv("PAISA_UNIFIED_COMPARISON_ROOT"),
+            default="artifacts/model_comparisons",
+            repository_root=repository_root,
+        ),
+        default_unified_comparison_run_id=default_comparison,
     )
 
 
@@ -175,15 +279,23 @@ def _assert_finite_json(value: Any) -> None:
             _assert_finite_json(nested)
 
 
-def _read_regular_descriptor(descriptor: int, *, label: str) -> bytes:
+def _read_regular_descriptor(
+    descriptor: int, *, label: str, max_bytes: int | None = None
+) -> bytes:
     before = os.fstat(descriptor)
     if not stat.S_ISREG(before.st_mode):
         raise ValueError(f"{label} must be a regular file")
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise ValueError(f"{label} exceeds the allowed size")
     chunks: list[bytes] = []
+    byte_count = 0
     while True:
         chunk = os.read(descriptor, 1024 * 1024)
         if not chunk:
             break
+        byte_count += len(chunk)
+        if max_bytes is not None and byte_count > max_bytes:
+            raise ValueError(f"{label} exceeds the allowed size")
         chunks.append(chunk)
     after = os.fstat(descriptor)
     identity_before = (
@@ -205,7 +317,9 @@ def _read_regular_descriptor(descriptor: int, *, label: str) -> bytes:
     return b"".join(chunks)
 
 
-def _open_regular_bytes(path: Path, *, label: str) -> bytes:
+def _open_regular_bytes(
+    path: Path, *, label: str, max_bytes: int | None = None
+) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -216,12 +330,20 @@ def _open_regular_bytes(path: Path, *, label: str) -> bytes:
     except (FileNotFoundError, OSError) as exc:
         raise ValueError(f"{label} is missing or is not a regular file") from exc
     try:
-        return _read_regular_descriptor(descriptor, label=label)
+        return _read_regular_descriptor(
+            descriptor, label=label, max_bytes=max_bytes
+        )
     finally:
         os.close(descriptor)
 
 
-def _open_regular_bytes_beneath(root: Path, relative: str, *, label: str) -> bytes:
+def _open_regular_bytes_beneath(
+    root: Path,
+    relative: str,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+) -> bytes:
     """Open a regular file without following any path-component symlink."""
 
     safe_relative = _safe_relative_path(relative, field="artifact path")
@@ -236,7 +358,7 @@ def _open_regular_bytes_beneath(root: Path, relative: str, *, label: str) -> byt
             candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
         except (FileNotFoundError, ValueError) as exc:
             raise ValueError(f"{label} escapes its artifact root") from exc
-        return _open_regular_bytes(candidate, label=label)
+        return _open_regular_bytes(candidate, label=label, max_bytes=max_bytes)
 
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_NOFOLLOW
@@ -253,7 +375,9 @@ def _open_regular_bytes_beneath(root: Path, relative: str, *, label: str) -> byt
             descriptors.append(current)
         artifact = os.open(parts[-1], file_flags, dir_fd=current)
         descriptors.append(artifact)
-        return _read_regular_descriptor(artifact, label=label)
+        return _read_regular_descriptor(
+            artifact, label=label, max_bytes=max_bytes
+        )
     except (FileNotFoundError, NotADirectoryError, OSError) as exc:
         raise ValueError(f"{label} is missing or has an unsafe path") from exc
     finally:
@@ -262,8 +386,20 @@ def _open_regular_bytes_beneath(root: Path, relative: str, *, label: str) -> byt
 
 
 def _decode_json(payload: bytes, *, label: str) -> dict[str, Any]:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate JSON key")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(payload, parse_constant=_reject_json_constant)
+        value = json.loads(
+            payload,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"{label} is not valid finite UTF-8 JSON") from exc
     if not isinstance(value, dict):
@@ -301,7 +437,7 @@ def _safe_relative_path(value: Any, *, field: str) -> str:
     if not raw or "\\" in raw:
         raise ValueError(f"{field} must be a non-empty POSIX relative path")
     path = PurePosixPath(raw)
-    if path.is_absolute() or raw != path.as_posix():
+    if path.is_absolute() or PureWindowsPath(raw).drive or raw != path.as_posix():
         raise ValueError(f"{field} must be a normalized relative path")
     if any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"{field} contains an unsafe path component")
@@ -553,12 +689,89 @@ def _paginate(rows: list[dict[str, Any]], *, limit: int, offset: int) -> dict[st
     }
 
 
+def _strict_float(value: Any, *, field: str, nullable: bool = False) -> float | None:
+    """Validate persisted JSON numbers without accepting numeric strings."""
+
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a JSON number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite")
+    return result
+
+
+def _strict_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a JSON integer")
+    return value
+
+
+def _string_array(value: Any, *, field: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    return [_require_string(item, field=f"{field}[{index}]") for index, item in enumerate(value)]
+
+
+def _reject_symlink_path_components(path: Path, *, label: str) -> None:
+    """Reject existing symbolic-link components without resolving them first."""
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if os.path.lexists(current) and current.is_symlink():
+            raise ArtifactIntegrityError(f"{label} contains a symbolic-link component")
+
+
+def _parse_unified_inventory(
+    manifest: Mapping[str, Any],
+) -> tuple[tuple[str, str], ...]:
+    inventory = _require_mapping(manifest.get("inventory"), field="comparison inventory")
+    if set(inventory) != {"algorithm", "root", "excludes", "files"}:
+        raise ValueError("Unified comparison inventory has an unexpected schema")
+    if (
+        inventory.get("algorithm") != "sha256"
+        or inventory.get("root") != "."
+        or inventory.get("excludes") != ["manifest.json"]
+    ):
+        raise ValueError("Unified comparison inventory metadata is invalid")
+    files = inventory.get("files")
+    if not isinstance(files, list):
+        raise ValueError("Unified comparison inventory files must be an array")
+    parsed: list[tuple[str, str]] = []
+    for index, item in enumerate(files):
+        if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
+            raise ValueError(f"Invalid unified comparison inventory entry {index}")
+        relative = _safe_relative_path(
+            item.get("path"), field=f"comparison inventory files[{index}].path"
+        )
+        if relative == "manifest.json":
+            raise ValueError("Unified comparison manifest cannot checksum itself")
+        if Path(relative).suffix.lower() in _EXECUTABLE_MODEL_SUFFIXES:
+            raise ValueError("Executable model artifacts are forbidden in comparison packs")
+        digest = _sha256_string(
+            item.get("sha256"), field=f"comparison inventory {relative} sha256"
+        )
+        assert digest is not None
+        parsed.append((relative, digest))
+    if parsed != sorted(parsed, key=lambda entry: entry[0]):
+        raise ValueError("Unified comparison inventory must be sorted by path")
+    if len({relative for relative, _digest in parsed}) != len(parsed):
+        raise ValueError("Unified comparison inventory contains duplicate paths")
+    if {relative for relative, _digest in parsed} != _UNIFIED_EXPECTED_FILES:
+        raise ValueError("Unified comparison inventory does not match the exact pack contract")
+    return tuple(parsed)
+
+
 class ArtifactRepository:
     """Validate and project immutable result artifacts into API-safe values."""
 
     def __init__(self, settings: RepositorySettings):
         self.settings = settings
         self._cache: dict[str, ValidatedRun] = {}
+        self._comparison_cache: dict[str, ValidatedUnifiedComparison] = {}
         self._lock = threading.RLock()
 
     @property
@@ -569,6 +782,22 @@ class ArtifactRepository:
                 "PAISA_DEFAULT_VERTICAL_SLICE_RUN_ID is not configured"
             )
         return _validate_identifier(value, field="default run ID")
+
+    @property
+    def default_unified_comparison_id(self) -> str:
+        value = self.settings.default_unified_comparison_run_id
+        if value is None:
+            raise DefaultRunNotConfiguredError(
+                "PAISA_DEFAULT_UNIFIED_COMPARISON_RUN_ID is not configured"
+            )
+        return _validate_identifier(value, field="default comparison run ID")
+
+    @property
+    def unified_comparison_root(self) -> Path:
+        configured = self.settings.unified_comparison_root
+        if configured is not None:
+            return configured
+        return self.settings.repository_root / "artifacts" / "model_comparisons"
 
     def _run_directory(self, run_id: str) -> Path:
         safe_id = _validate_identifier(run_id, field="run_id")
@@ -2673,6 +2902,2349 @@ class ArtifactRepository:
             "migration_evidence": migration,
         }
 
+    # Unified price-model comparison packs are already certified by the offline
+    # comparison verifier.  API reads intentionally validate the immutable
+    # manifest/checksum/schema boundary without replaying model metrics or
+    # portfolio accounting during a GET request.
+
+    def _comparison_directory(self, comparison_id: str) -> Path:
+        safe_id = _validate_identifier(comparison_id, field="comparison_id")
+        root = self.unified_comparison_root
+        _reject_symlink_path_components(root, label="Unified comparison root")
+        candidate = root / safe_id
+        if candidate.is_symlink():
+            raise ArtifactIntegrityError(
+                "Unified comparison run directory is a symbolic link"
+            )
+        if not candidate.exists():
+            raise RunNotFoundError(
+                f"Unified comparison run '{safe_id}' was not found"
+            )
+        try:
+            resolved_root = root.resolve(strict=True)
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(resolved_root)
+        except FileNotFoundError as exc:
+            raise RunNotFoundError(
+                f"Unified comparison run '{safe_id}' was not found"
+            ) from exc
+        except ValueError as exc:
+            raise ArtifactIntegrityError(
+                "Unified comparison run escapes its configured root"
+            ) from exc
+        if not resolved.is_dir():
+            raise RunNotFoundError(
+                f"Unified comparison run '{safe_id}' was not found"
+            )
+        return resolved
+
+    def _cached_comparison(
+        self, comparison_id: str, directory: Path
+    ) -> ValidatedUnifiedComparison | None:
+        cached = self._comparison_cache.get(comparison_id)
+        if cached is None:
+            return None
+        try:
+            signature = _tree_signature(directory)
+        except ValueError:
+            return None
+        return cached if signature == cached.signature else None
+
+    @staticmethod
+    def _comparison_json(
+        directory: Path,
+        inventory: Mapping[str, str],
+        relative: str,
+    ) -> dict[str, Any]:
+        expected = inventory.get(relative)
+        if expected is None:
+            raise ValueError(f"Required comparison artifact is not inventoried: {relative}")
+        payload = _open_regular_bytes_beneath(
+            directory,
+            relative,
+            label=f"comparison artifact {relative}",
+            max_bytes=_UNIFIED_MAX_PAYLOAD_BYTES,
+        )
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise ValueError(f"Unified comparison checksum mismatch: {relative}")
+        return _decode_json(payload, label=f"comparison artifact {relative}")
+
+    @staticmethod
+    def _count_map(value: Any, *, field: str) -> dict[str, int]:
+        mapping = _require_mapping(value, field=field)
+        if set(mapping) != {"0", "1"}:
+            raise ValueError(f"{field} must contain exactly classes 0 and 1")
+        result = {
+            label: _strict_integer(count, field=f"{field}.{label}")
+            for label, count in mapping.items()
+        }
+        if any(count < 0 for count in result.values()):
+            raise ValueError(f"{field} counts must be non-negative")
+        return result
+
+    @classmethod
+    def _unified_prediction_metric(
+        cls,
+        value: Any,
+        *,
+        field: str,
+        expected_scope: str,
+        expected_type: str,
+    ) -> dict[str, Any]:
+        row = _require_mapping(value, field=field)
+        competitor_id = _require_string(row.get("competitor_id"), field=f"{field}.competitor_id")
+        competitor_type = _require_string(
+            row.get("competitor_type"), field=f"{field}.competitor_type"
+        )
+        if competitor_type != expected_type:
+            raise ValueError(f"{field}.competitor_type is invalid")
+        scope = _require_string(row.get("evaluation_scope"), field=f"{field}.evaluation_scope")
+        if scope != expected_scope:
+            raise ValueError(f"{field}.evaluation_scope is invalid")
+
+        registered_raw = row.get("registered_model_id")
+        algorithm_raw = row.get("algorithm")
+        label_raw = row.get("label")
+        if expected_type == "model":
+            registered_model_id = _require_string(
+                registered_raw, field=f"{field}.registered_model_id"
+            )
+            algorithm = _require_string(algorithm_raw, field=f"{field}.algorithm")
+            configuration_family = _require_string(label_raw, field=f"{field}.label")
+        else:
+            if registered_raw is not None or algorithm_raw is not None or label_raw is not None:
+                raise ValueError(f"{field} reference baseline identity is invalid")
+            registered_model_id = None
+            algorithm = None
+            configuration_family = None
+
+        row_count = _strict_integer(row.get("row_count"), field=f"{field}.row_count")
+        support = _strict_integer(row.get("support"), field=f"{field}.support")
+        if row_count <= 0 or support != row_count:
+            raise ValueError(f"{field} row count and support must agree and be positive")
+        class_counts = cls._count_map(row.get("class_counts"), field=f"{field}.class_counts")
+        predicted_counts = cls._count_map(
+            row.get("predicted_class_counts"), field=f"{field}.predicted_class_counts"
+        )
+        if sum(class_counts.values()) != row_count or sum(predicted_counts.values()) != row_count:
+            raise ValueError(f"{field} class counts do not reconcile")
+
+        raw_matrix = row.get("confusion_matrix")
+        if (
+            not isinstance(raw_matrix, list)
+            or len(raw_matrix) != 2
+            or any(not isinstance(matrix_row, list) or len(matrix_row) != 2 for matrix_row in raw_matrix)
+        ):
+            raise ValueError(f"{field}.confusion_matrix must be a 2x2 array")
+        confusion_matrix = [
+            [
+                _strict_integer(cell, field=f"{field}.confusion_matrix[{row_index}][{column_index}]")
+                for column_index, cell in enumerate(matrix_row)
+            ]
+            for row_index, matrix_row in enumerate(raw_matrix)
+        ]
+        if any(cell < 0 for matrix_row in confusion_matrix for cell in matrix_row):
+            raise ValueError(f"{field}.confusion_matrix must be non-negative")
+        if sum(cell for matrix_row in confusion_matrix for cell in matrix_row) != row_count:
+            raise ValueError(f"{field}.confusion_matrix does not reconcile")
+        if [sum(matrix_row) for matrix_row in confusion_matrix] != [
+            class_counts["0"],
+            class_counts["1"],
+        ]:
+            raise ValueError(f"{field}.confusion_matrix actual-class counts disagree")
+        if [
+            confusion_matrix[0][column] + confusion_matrix[1][column]
+            for column in range(2)
+        ] != [predicted_counts["0"], predicted_counts["1"]]:
+            raise ValueError(f"{field}.confusion_matrix predicted-class counts disagree")
+
+        warnings = _string_array(row.get("metric_warnings"), field=f"{field}.metric_warnings")
+        selection_eligible = _boolean(
+            row.get("selection_eligible"), field=f"{field}.selection_eligible"
+        )
+        normalized = {
+            "competitor_id": competitor_id,
+            "competitor_type": competitor_type,
+            "registered_model_id": registered_model_id,
+            "algorithm": algorithm,
+            "configuration_family": configuration_family,
+            "evaluation_scope": (
+                _UNIFIED_HOLDOUT_TERM
+                if expected_scope == "shared_project_holdout"
+                else "validation"
+            ),
+            "row_count": row_count,
+            "support": support,
+            "accuracy": _strict_float(row.get("accuracy"), field=f"{field}.accuracy"),
+            "balanced_accuracy": _strict_float(
+                row.get("balanced_accuracy"),
+                field=f"{field}.balanced_accuracy",
+                nullable=True,
+            ),
+            "precision": _strict_float(row.get("precision"), field=f"{field}.precision"),
+            "recall": _strict_float(row.get("recall"), field=f"{field}.recall"),
+            "f1": _strict_float(row.get("f1"), field=f"{field}.f1"),
+            "matthews_corrcoef": _strict_float(
+                row.get("matthews_corrcoef"),
+                field=f"{field}.matthews_corrcoef",
+                nullable=True,
+            ),
+            "roc_auc": _strict_float(
+                row.get("roc_auc"), field=f"{field}.roc_auc", nullable=True
+            ),
+            "brier_score": _strict_float(
+                row.get("brier_score"), field=f"{field}.brier_score", nullable=True
+            ),
+            "log_loss": _strict_float(
+                row.get("log_loss"), field=f"{field}.log_loss", nullable=True
+            ),
+            "expected_calibration_error": _strict_float(
+                row.get("expected_calibration_error"),
+                field=f"{field}.expected_calibration_error",
+                nullable=True,
+            ),
+            "selection_eligible": selection_eligible,
+            "metric_warnings": warnings,
+            "class_counts": class_counts,
+            "predicted_class_counts": predicted_counts,
+            "confusion_matrix": confusion_matrix,
+        }
+        return normalized
+
+    @staticmethod
+    def _unified_model_portfolio(value: Any, *, field: str) -> dict[str, Any]:
+        row = _require_mapping(value, field=field)
+        if row.get("competitor_type") != "model":
+            raise ValueError(f"{field}.competitor_type must equal model")
+        return {
+            "variant_id": _require_string(row.get("competitor_id"), field=f"{field}.competitor_id"),
+            "registered_model_id": _require_string(
+                row.get("registered_model_id"), field=f"{field}.registered_model_id"
+            ),
+            "experiment_id": _require_string(row.get("experiment_id"), field=f"{field}.experiment_id"),
+            "portfolio_id": _require_string(row.get("portfolio_id"), field=f"{field}.portfolio_id"),
+            "initial_equity": _money(row.get("initial_equity"), field=f"{field}.initial_equity"),
+            "ending_equity": _money(row.get("ending_equity"), field=f"{field}.ending_equity"),
+            "total_return": _strict_float(row.get("total_return"), field=f"{field}.total_return"),
+            "maximum_drawdown": _strict_float(
+                row.get("maximum_drawdown"), field=f"{field}.maximum_drawdown"
+            ),
+            "volatility": _strict_float(row.get("volatility"), field=f"{field}.volatility", nullable=True),
+            "sharpe_ratio": _strict_float(
+                row.get("sharpe_ratio"), field=f"{field}.sharpe_ratio", nullable=True
+            ),
+            "number_of_trades": _strict_integer(
+                row.get("number_of_trades"), field=f"{field}.number_of_trades"
+            ),
+            "win_rate": _strict_float(row.get("win_rate"), field=f"{field}.win_rate", nullable=True),
+            "average_gain": _money(row.get("average_gain"), field=f"{field}.average_gain", nullable=True),
+            "average_loss": _money(row.get("average_loss"), field=f"{field}.average_loss", nullable=True),
+            "turnover": _strict_float(row.get("turnover"), field=f"{field}.turnover"),
+            "fees_paid": _money(row.get("fees_paid"), field=f"{field}.fees_paid"),
+            "time_in_market": _strict_float(
+                row.get("time_in_market"), field=f"{field}.time_in_market"
+            ),
+            "excess_return_vs_cash_only": _strict_float(
+                row.get("excess_return_vs_cash_only"),
+                field=f"{field}.excess_return_vs_cash_only",
+            ),
+            "excess_return_vs_buy_and_hold": _strict_float(
+                row.get("excess_return_vs_buy_and_hold"),
+                field=f"{field}.excess_return_vs_buy_and_hold",
+            ),
+        }
+
+    @staticmethod
+    def _unified_benchmark(
+        value: Any,
+        *,
+        field: str,
+        model_ids: Mapping[str, str],
+        experiment_ids: Mapping[str, str],
+    ) -> dict[str, Any]:
+        row = _require_mapping(value, field=field)
+        if row.get("competitor_type") != "portfolio_benchmark":
+            raise ValueError(f"{field}.competitor_type must equal portfolio_benchmark")
+        provenance = row.get("ledger_provenance")
+        if not isinstance(provenance, list) or len(provenance) != len(_UNIFIED_MODEL_VARIANTS):
+            raise ValueError(f"{field}.ledger_provenance must contain six ledgers")
+        variants: list[str] = []
+        for index, entry_raw in enumerate(provenance):
+            entry = _require_mapping(entry_raw, field=f"{field}.ledger_provenance[{index}]")
+            if set(entry) != {
+                "variant_id",
+                "registered_model_id",
+                "experiment_id",
+                "portfolio_id",
+                "config_path",
+                "snapshots_path",
+                "trades_path",
+            }:
+                raise ValueError(
+                    f"{field}.ledger_provenance[{index}] has an unexpected schema"
+                )
+            variant = _require_string(
+                entry.get("variant_id"), field=f"{field}.ledger_provenance[{index}].variant_id"
+            )
+            variants.append(variant)
+            registered_model_id = _require_string(
+                entry.get("registered_model_id"),
+                field=f"{field}.ledger_provenance[{index}].registered_model_id",
+            )
+            if registered_model_id != model_ids.get(variant):
+                raise ValueError(
+                    f"{field}.ledger_provenance registered model identity mismatch"
+                )
+            experiment_id = _require_string(
+                entry.get("experiment_id"),
+                field=f"{field}.ledger_provenance[{index}].experiment_id",
+            )
+            if experiment_id != experiment_ids.get(variant):
+                raise ValueError(
+                    f"{field}.ledger_provenance experiment identity mismatch"
+                )
+            _require_string(
+                entry.get("portfolio_id"),
+                field=f"{field}.ledger_provenance[{index}].portfolio_id",
+            )
+            expected_prefix = f"evidence/portfolios/{variant}"
+            config_path = _safe_relative_path(
+                entry.get("config_path"),
+                field=f"{field}.ledger_provenance[{index}].config_path",
+            )
+            if config_path != f"{expected_prefix}/config.json":
+                raise ValueError(f"{field}.ledger_provenance config path is invalid")
+            expected_snapshot = (
+                "buy_and_hold_snapshots.csv"
+                if row.get("benchmark_id") == "buy-and-hold"
+                else "cash_only_snapshots.csv"
+            )
+            snapshots_path = _safe_relative_path(
+                entry.get("snapshots_path"),
+                field=f"{field}.ledger_provenance[{index}].snapshots_path",
+            )
+            if snapshots_path != f"{expected_prefix}/benchmarks/{expected_snapshot}":
+                raise ValueError(f"{field}.ledger_provenance snapshot path is invalid")
+            trades_path = entry.get("trades_path")
+            if row.get("benchmark_id") == "buy-and-hold":
+                normalized_trades_path = _safe_relative_path(
+                    trades_path,
+                    field=f"{field}.ledger_provenance[{index}].trades_path",
+                )
+                if normalized_trades_path != (
+                    f"{expected_prefix}/benchmarks/buy_and_hold_trades.csv"
+                ):
+                    raise ValueError(f"{field}.ledger_provenance trades path is invalid")
+            elif trades_path is not None:
+                raise ValueError(f"{field}.cash-only ledger must not reference trades")
+        if tuple(variants) != _UNIFIED_MODEL_VARIANTS:
+            raise ValueError(f"{field}.ledger_provenance model order is invalid")
+        return {
+            "benchmark_id": _require_string(row.get("benchmark_id"), field=f"{field}.benchmark_id"),
+            "initial_equity": _money(row.get("initial_equity"), field=f"{field}.initial_equity"),
+            "ending_equity": _money(row.get("ending_equity"), field=f"{field}.ending_equity"),
+            "total_return": _strict_float(row.get("total_return"), field=f"{field}.total_return"),
+            "maximum_drawdown": _strict_float(
+                row.get("maximum_drawdown"), field=f"{field}.maximum_drawdown"
+            ),
+            "volatility": _strict_float(row.get("volatility"), field=f"{field}.volatility", nullable=True),
+            "sharpe_ratio": _strict_float(
+                row.get("sharpe_ratio"), field=f"{field}.sharpe_ratio", nullable=True
+            ),
+            "number_of_trades": _strict_integer(
+                row.get("number_of_trades"), field=f"{field}.number_of_trades"
+            ),
+            "win_rate": _strict_float(row.get("win_rate"), field=f"{field}.win_rate", nullable=True),
+            "average_gain": _money(row.get("average_gain"), field=f"{field}.average_gain", nullable=True),
+            "average_loss": _money(row.get("average_loss"), field=f"{field}.average_loss", nullable=True),
+            "turnover": _strict_float(row.get("turnover"), field=f"{field}.turnover"),
+            "fees_paid": _money(row.get("fees_paid"), field=f"{field}.fees_paid"),
+            "time_in_market": _strict_float(
+                row.get("time_in_market"), field=f"{field}.time_in_market"
+            ),
+            "ledger_count": len(provenance),
+        }
+
+    @staticmethod
+    def _unified_date_scope(
+        value: Any, *, field: str, expected_term: str
+    ) -> dict[str, Any]:
+        scope = _require_mapping(value, field=field)
+        terminology = _require_string(scope.get("terminology"), field=f"{field}.terminology")
+        if terminology != expected_term:
+            raise ValueError(f"{field}.terminology must equal {expected_term}")
+        common_count = _strict_integer(scope.get("common_count"), field=f"{field}.common_count")
+        if common_count <= 0:
+            raise ValueError(f"{field}.common_count must be positive")
+        original_counts = _require_mapping(scope.get("original_counts"), field=f"{field}.original_counts")
+        common_counts = _require_mapping(scope.get("common_counts"), field=f"{field}.common_counts")
+        dropped = _require_mapping(
+            scope.get("dropped_target_dates"), field=f"{field}.dropped_target_dates"
+        )
+        for mapping_name, mapping in (
+            ("original_counts", original_counts),
+            ("common_counts", common_counts),
+            ("dropped_target_dates", dropped),
+        ):
+            if set(mapping) != set(_UNIFIED_MODEL_VARIANTS):
+                raise ValueError(f"{field}.{mapping_name} must identify all six models")
+        normalized_original: dict[str, int] = {}
+        normalized_common: dict[str, int] = {}
+        normalized_dropped: dict[str, list[str]] = {}
+        for variant in _UNIFIED_MODEL_VARIANTS:
+            normalized_original[variant] = _strict_integer(
+                original_counts[variant], field=f"{field}.original_counts.{variant}"
+            )
+            normalized_common[variant] = _strict_integer(
+                common_counts[variant], field=f"{field}.common_counts.{variant}"
+            )
+            normalized_dropped[variant] = [
+                _iso_date(item, field=f"{field}.dropped_target_dates.{variant}")
+                for item in _string_array(
+                    dropped[variant], field=f"{field}.dropped_target_dates.{variant}"
+                )
+            ]
+            if normalized_common[variant] != common_count:
+                raise ValueError(f"{field}.common_counts must equal common_count")
+            if normalized_original[variant] != (
+                normalized_common[variant] + len(normalized_dropped[variant])
+            ):
+                raise ValueError(
+                    f"{field}.original_counts do not reconcile with dropped dates"
+                )
+            if len(set(normalized_dropped[variant])) != len(
+                normalized_dropped[variant]
+            ):
+                raise ValueError(f"{field}.dropped_target_dates contains duplicates")
+
+        keys = scope.get("common_keys")
+        if not isinstance(keys, list) or len(keys) != common_count:
+            raise ValueError(f"{field}.common_keys must contain common_count rows")
+        normalized_keys: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for index, raw_key in enumerate(keys):
+            key = _require_mapping(raw_key, field=f"{field}.common_keys[{index}]")
+            ticker = _require_string(key.get("ticker"), field=f"{field}.common_keys[{index}].ticker")
+            feature_date = _iso_date(
+                key.get("feature_date"), field=f"{field}.common_keys[{index}].feature_date"
+            )
+            target_date = _iso_date(
+                key.get("target_date"), field=f"{field}.common_keys[{index}].target_date"
+            )
+            if target_date <= feature_date:
+                raise ValueError(f"{field}.common_keys target_date must follow feature_date")
+            actual_class = _strict_integer(
+                key.get("actual_class"), field=f"{field}.common_keys[{index}].actual_class"
+            )
+            if actual_class not in {0, 1}:
+                raise ValueError(f"{field}.common_keys actual_class must be 0 or 1")
+            identity = (ticker, feature_date, target_date)
+            if identity in seen:
+                raise ValueError(f"{field}.common_keys contains duplicates")
+            seen.add(identity)
+            normalized_keys.append(
+                {
+                    "ticker": ticker,
+                    "feature_date": feature_date,
+                    "target_date": target_date,
+                    "actual_class": actual_class,
+                }
+            )
+        if normalized_keys != sorted(normalized_keys, key=lambda row: (row["target_date"], row["ticker"])):
+            raise ValueError(f"{field}.common_keys must be chronological")
+
+        feature_start = _iso_date(
+            scope.get("feature_start"), field=f"{field}.feature_start"
+        )
+        feature_end = _iso_date(
+            scope.get("feature_end"), field=f"{field}.feature_end"
+        )
+        target_start = _iso_date(
+            scope.get("target_start"), field=f"{field}.target_start"
+        )
+        target_end = _iso_date(scope.get("target_end"), field=f"{field}.target_end")
+        if (
+            feature_start != min(row["feature_date"] for row in normalized_keys)
+            or feature_end != max(row["feature_date"] for row in normalized_keys)
+            or target_start != min(row["target_date"] for row in normalized_keys)
+            or target_end != max(row["target_date"] for row in normalized_keys)
+        ):
+            raise ValueError(f"{field} date boundaries disagree with common_keys")
+
+        result: dict[str, Any] = {
+            "terminology": terminology,
+            "common_count": common_count,
+            "feature_start": feature_start,
+            "feature_end": feature_end,
+            "target_start": target_start,
+            "target_end": target_end,
+            "original_counts": normalized_original,
+            "common_counts": normalized_common,
+            "dropped_target_dates": normalized_dropped,
+            "common_keys": normalized_keys,
+        }
+        exposed = scope.get("previously_exposed_through")
+        if expected_term == _UNIFIED_HOLDOUT_TERM:
+            exposed_models = _string_array(
+                exposed, field=f"{field}.previously_exposed_through"
+            )
+            if exposed_models != list(_UNIFIED_MODEL_VARIANTS[:4]):
+                raise ValueError(
+                    f"{field}.previously_exposed_through must identify M-001 through M-004"
+                )
+            result["previously_exposed_through"] = exposed_models
+        elif exposed is not None:
+            raise ValueError(f"{field}.previously_exposed_through is unexpected")
+        return result
+
+    @staticmethod
+    def _prediction_ranking_rows(
+        value: Any,
+        *,
+        field: str,
+        expected_competitors: tuple[str, ...],
+        model_ids: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or len(value) != len(expected_competitors):
+            raise ValueError(f"{field} has an invalid competitor count")
+        rows: list[dict[str, Any]] = []
+        for index, raw in enumerate(value):
+            row = _require_mapping(raw, field=f"{field}[{index}]")
+            if set(row) != {
+                "rank",
+                "competitor_id",
+                "registered_model_id",
+                "accuracy",
+                "balanced_accuracy",
+                "f1",
+            }:
+                raise ValueError(f"{field}[{index}] has an unexpected schema")
+            competitor = _require_string(
+                row.get("competitor_id"), field=f"{field}[{index}].competitor_id"
+            )
+            registered = _require_string(
+                row.get("registered_model_id"),
+                field=f"{field}[{index}].registered_model_id",
+            )
+            rank = _strict_integer(row.get("rank"), field=f"{field}[{index}].rank")
+            if registered != model_ids.get(competitor):
+                raise ValueError(f"{field} registered model identity mismatch")
+            rows.append(
+                {
+                    "rank": rank,
+                    "competitor_id": competitor,
+                    "registered_model_id": registered,
+                    "accuracy": _strict_float(row.get("accuracy"), field=f"{field}[{index}].accuracy"),
+                    "balanced_accuracy": _strict_float(
+                        row.get("balanced_accuracy"),
+                        field=f"{field}[{index}].balanced_accuracy",
+                        nullable=True,
+                    ),
+                    "f1": _strict_float(row.get("f1"), field=f"{field}[{index}].f1"),
+                }
+            )
+        if [row["rank"] for row in rows] != list(range(1, len(rows) + 1)):
+            raise ValueError(f"{field} ranks must be consecutive")
+        if set(row["competitor_id"] for row in rows) != set(expected_competitors):
+            raise ValueError(f"{field} competitors are incomplete")
+        return rows
+
+    @staticmethod
+    def _portfolio_ranking_rows(
+        value: Any,
+        *,
+        field: str,
+        model_ids: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or len(value) != len(_UNIFIED_MODEL_VARIANTS):
+            raise ValueError(f"{field} must contain six model rows")
+        rows: list[dict[str, Any]] = []
+        if field.endswith("simulated_model_portfolio_return"):
+            expected_keys = {
+                "rank",
+                "competitor_id",
+                "registered_model_id",
+                "total_return",
+                "sharpe_ratio",
+                "maximum_drawdown",
+            }
+        elif field.endswith("simulated_model_portfolio_drawdown"):
+            expected_keys = {
+                "rank",
+                "competitor_id",
+                "registered_model_id",
+                "maximum_drawdown",
+                "total_return",
+            }
+        elif field.endswith("simulated_model_portfolio_fees"):
+            expected_keys = {
+                "rank",
+                "competitor_id",
+                "registered_model_id",
+                "fees_paid",
+                "number_of_trades",
+            }
+        else:
+            raise ValueError(f"{field} is not a supported portfolio ranking")
+        for index, raw in enumerate(value):
+            row = _require_mapping(raw, field=f"{field}[{index}]")
+            if set(row) != expected_keys:
+                raise ValueError(f"{field}[{index}] has an unexpected schema")
+            competitor = _require_string(
+                row.get("competitor_id"), field=f"{field}[{index}].competitor_id"
+            )
+            registered = _require_string(
+                row.get("registered_model_id"),
+                field=f"{field}[{index}].registered_model_id",
+            )
+            if registered != model_ids.get(competitor):
+                raise ValueError(f"{field} registered model identity mismatch")
+            result: dict[str, Any] = {
+                "rank": _strict_integer(row.get("rank"), field=f"{field}[{index}].rank"),
+                "competitor_id": competitor,
+                "registered_model_id": registered,
+                "total_return": None,
+                "maximum_drawdown": None,
+                "sharpe_ratio": None,
+                "fees_paid": None,
+                "number_of_trades": None,
+            }
+            for metric in ("total_return", "maximum_drawdown", "sharpe_ratio"):
+                if metric in row:
+                    result[metric] = _strict_float(
+                        row.get(metric), field=f"{field}[{index}].{metric}", nullable=True
+                    )
+            if "fees_paid" in row:
+                result["fees_paid"] = _money(
+                    row.get("fees_paid"), field=f"{field}[{index}].fees_paid"
+                )
+            if "number_of_trades" in row:
+                result["number_of_trades"] = _strict_integer(
+                    row.get("number_of_trades"),
+                    field=f"{field}[{index}].number_of_trades",
+                )
+            rows.append(result)
+        if [row["rank"] for row in rows] != list(range(1, len(rows) + 1)):
+            raise ValueError(f"{field} ranks must be consecutive")
+        if set(row["competitor_id"] for row in rows) != set(_UNIFIED_MODEL_VARIANTS):
+            raise ValueError(f"{field} competitors are incomplete")
+        return rows
+
+    @classmethod
+    def _unified_metric_collections(
+        cls, metrics: Mapping[str, Any]
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, str],
+    ]:
+        expected_keys = {
+            "schema_version",
+            "comparison_id",
+            "validation_model_metrics",
+            "validation_reference_baseline_metrics",
+            "shared_project_holdout_prediction_metrics",
+            "model_portfolio_metrics",
+            "benchmark_portfolio_metrics",
+            "reference_baseline_training",
+        }
+        if set(metrics) != expected_keys:
+            raise ValueError("metrics.json has an unexpected schema")
+
+        def metric_rows(
+            key: str,
+            *,
+            scope: str,
+            expected_type: str,
+            expected_count: int,
+        ) -> list[dict[str, Any]]:
+            raw = metrics.get(key)
+            if not isinstance(raw, list) or len(raw) != expected_count:
+                raise ValueError(f"metrics.{key} has an invalid row count")
+            return [
+                cls._unified_prediction_metric(
+                    row,
+                    field=f"metrics.{key}[{index}]",
+                    expected_scope=scope,
+                    expected_type=expected_type,
+                )
+                for index, row in enumerate(raw)
+            ]
+
+        validation_models = metric_rows(
+            "validation_model_metrics",
+            scope="validation",
+            expected_type="model",
+            expected_count=6,
+        )
+        validation_baselines = metric_rows(
+            "validation_reference_baseline_metrics",
+            scope="validation",
+            expected_type="reference_baseline",
+            expected_count=2,
+        )
+        holdout_raw = metrics.get("shared_project_holdout_prediction_metrics")
+        if not isinstance(holdout_raw, list) or len(holdout_raw) != 8:
+            raise ValueError("Shared project holdout metrics must contain eight rows")
+        holdout_models: list[dict[str, Any]] = []
+        holdout_baselines: list[dict[str, Any]] = []
+        for index, row_raw in enumerate(holdout_raw):
+            row = _require_mapping(
+                row_raw, field=f"metrics.shared_project_holdout_prediction_metrics[{index}]"
+            )
+            competitor_type = row.get("competitor_type")
+            if competitor_type == "model":
+                holdout_models.append(
+                    cls._unified_prediction_metric(
+                        row,
+                        field=f"metrics.shared_project_holdout_prediction_metrics[{index}]",
+                        expected_scope="shared_project_holdout",
+                        expected_type="model",
+                    )
+                )
+            elif competitor_type == "reference_baseline":
+                holdout_baselines.append(
+                    cls._unified_prediction_metric(
+                        row,
+                        field=f"metrics.shared_project_holdout_prediction_metrics[{index}]",
+                        expected_scope="shared_project_holdout",
+                        expected_type="reference_baseline",
+                    )
+                )
+            else:
+                raise ValueError("Unknown shared project holdout competitor type")
+
+        expected_models = set(_UNIFIED_MODEL_VARIANTS)
+        for label, rows, expected in (
+            ("validation model", validation_models, _UNIFIED_MODEL_VARIANTS),
+            ("holdout model", holdout_models, _UNIFIED_MODEL_VARIANTS),
+            (
+                "validation baseline",
+                validation_baselines,
+                _UNIFIED_REFERENCE_BASELINES,
+            ),
+            ("holdout baseline", holdout_baselines, _UNIFIED_REFERENCE_BASELINES),
+        ):
+            observed = tuple(row["competitor_id"] for row in rows)
+            if observed != expected:
+                raise ValueError(
+                    f"{label} metrics identities are incomplete, duplicated, or out of order"
+                )
+
+        model_ids = {
+            row["competitor_id"]: str(row["registered_model_id"])
+            for row in validation_models
+        }
+        if len(set(model_ids.values())) != len(_UNIFIED_MODEL_VARIANTS):
+            raise ValueError("Each model variant must have a unique registered model ID")
+        for row in holdout_models:
+            variant = row["competitor_id"]
+            if row["registered_model_id"] != model_ids[variant]:
+                raise ValueError("Validation and holdout registered model IDs disagree")
+            validation_row = next(
+                candidate for candidate in validation_models if candidate["competitor_id"] == variant
+            )
+            if (
+                row["algorithm"] != validation_row["algorithm"]
+                or row["configuration_family"] != validation_row["configuration_family"]
+            ):
+                raise ValueError("Validation and holdout model descriptions disagree")
+
+        raw_portfolios = metrics.get("model_portfolio_metrics")
+        if not isinstance(raw_portfolios, list) or len(raw_portfolios) != 6:
+            raise ValueError("Model portfolio metrics must contain six rows")
+        model_portfolios = [
+            cls._unified_model_portfolio(
+                row, field=f"metrics.model_portfolio_metrics[{index}]"
+            )
+            for index, row in enumerate(raw_portfolios)
+        ]
+        if tuple(row["variant_id"] for row in model_portfolios) != _UNIFIED_MODEL_VARIANTS:
+            raise ValueError(
+                "Model portfolio identities must contain M-001 through M-006 in order"
+            )
+        if len({row["portfolio_id"] for row in model_portfolios}) != 6:
+            raise ValueError("Model portfolio IDs must be unique")
+        for row in model_portfolios:
+            if row["registered_model_id"] != model_ids[row["variant_id"]]:
+                raise ValueError("Portfolio registered model identity mismatch")
+        experiment_ids = {
+            row["variant_id"]: row["experiment_id"] for row in model_portfolios
+        }
+
+        raw_benchmarks = metrics.get("benchmark_portfolio_metrics")
+        if not isinstance(raw_benchmarks, list) or len(raw_benchmarks) != 2:
+            raise ValueError("Benchmark portfolio metrics must contain two rows")
+        benchmarks = [
+            cls._unified_benchmark(
+                row,
+                field=f"metrics.benchmark_portfolio_metrics[{index}]",
+                model_ids=model_ids,
+                experiment_ids=experiment_ids,
+            )
+            for index, row in enumerate(raw_benchmarks)
+        ]
+        if tuple(row["benchmark_id"] for row in benchmarks) != _UNIFIED_BENCHMARKS:
+            raise ValueError("Benchmark rows must be cash-only then buy-and-hold")
+
+        training = _require_mapping(
+            metrics.get("reference_baseline_training"),
+            field="metrics.reference_baseline_training",
+        )
+        if set(training) != {"training_row_count", "class_counts", "majority_class"}:
+            raise ValueError("Reference baseline training evidence is malformed")
+        training_count = _strict_integer(
+            training.get("training_row_count"), field="reference_baseline_training.training_row_count"
+        )
+        training_classes = cls._count_map(
+            training.get("class_counts"), field="reference_baseline_training.class_counts"
+        )
+        majority_class = _strict_integer(
+            training.get("majority_class"), field="reference_baseline_training.majority_class"
+        )
+        if training_count <= 0 or sum(training_classes.values()) != training_count:
+            raise ValueError("Reference baseline training counts do not reconcile")
+        if majority_class not in {0, 1}:
+            raise ValueError("Reference baseline majority class is invalid")
+
+        return (
+            validation_models,
+            validation_baselines,
+            holdout_models,
+            holdout_baselines,
+            model_portfolios,
+            benchmarks,
+            model_ids,
+        )
+
+    def _validate_unified_comparison(
+        self, comparison_id: str
+    ) -> ValidatedUnifiedComparison:
+        safe_id = _validate_identifier(comparison_id, field="comparison_id")
+        directory = self._comparison_directory(safe_id)
+        with self._lock:
+            cached = self._cached_comparison(safe_id, directory)
+            if cached is not None:
+                return cached
+            try:
+                signature_before = _tree_signature(directory)
+                manifest_path = directory / "manifest.json"
+                if not manifest_path.is_file():
+                    raise RunNotCompletedError(
+                        f"Unified comparison run '{safe_id}' has no completed manifest"
+                    )
+                manifest_payload = _open_regular_bytes_beneath(
+                    directory,
+                    "manifest.json",
+                    label="unified comparison manifest",
+                    max_bytes=_UNIFIED_MAX_PAYLOAD_BYTES,
+                )
+                manifest = _decode_json(
+                    manifest_payload, label="unified comparison manifest"
+                )
+                if set(manifest) != {
+                    "schema_version",
+                    "artifact_type",
+                    "comparison_id",
+                    "status",
+                    "inventory",
+                    "source_roots",
+                    "final_summary",
+                    "disclaimer",
+                }:
+                    raise ValueError("Unified comparison manifest has an unexpected schema")
+                if manifest.get("status") != "PASS":
+                    raise RunNotCompletedError(
+                        f"Unified comparison run '{safe_id}' is not a completed PASS run"
+                    )
+                if (
+                    manifest.get("schema_version") != SCHEMA_VERSION
+                    or manifest.get("artifact_type") != _UNIFIED_ARTIFACT_TYPE
+                    or manifest.get("comparison_id") != safe_id
+                    or manifest.get("source_roots") != "source_roots.json"
+                    or manifest.get("final_summary") != "final_summary.json"
+                    or manifest.get("disclaimer") != ACADEMIC_DISCLAIMER
+                ):
+                    raise ValueError("Unified comparison manifest identity is invalid")
+
+                parsed_inventory = _parse_unified_inventory(manifest)
+                inventory = dict(parsed_inventory)
+                actual = _regular_payload_files(directory)
+                if set(actual) != set(inventory):
+                    raise ValueError("Unified comparison artifact set does not match its manifest")
+                payload_bytes = len(manifest_payload)
+                for relative, expected_digest in parsed_inventory:
+                    remaining_bytes = _UNIFIED_MAX_PAYLOAD_BYTES - payload_bytes
+                    if remaining_bytes < 0:
+                        raise ValueError("Unified comparison pack exceeds the size limit")
+                    payload = _open_regular_bytes_beneath(
+                        directory,
+                        relative,
+                        label=f"comparison artifact {relative}",
+                        max_bytes=remaining_bytes,
+                    )
+                    payload_bytes += len(payload)
+                    if payload_bytes > _UNIFIED_MAX_PAYLOAD_BYTES:
+                        raise ValueError("Unified comparison pack exceeds the size limit")
+                    if hashlib.sha256(payload).hexdigest() != expected_digest:
+                        raise ValueError(f"Unified comparison checksum mismatch: {relative}")
+                    try:
+                        payload.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            f"Unified comparison artifact is not UTF-8 text: {relative}"
+                        ) from exc
+
+                summary = self._comparison_json(directory, inventory, "final_summary.json")
+                contract = self._comparison_json(directory, inventory, "comparison_contract.json")
+                sources = self._comparison_json(directory, inventory, "source_roots.json")
+                date_alignment = self._comparison_json(directory, inventory, "date_alignment.json")
+                metrics = self._comparison_json(directory, inventory, "metrics.json")
+                rankings = self._comparison_json(directory, inventory, "rankings.json")
+
+                for name, payload in (
+                    ("final_summary.json", summary),
+                    ("comparison_contract.json", contract),
+                    ("source_roots.json", sources),
+                    ("date_alignment.json", date_alignment),
+                    ("metrics.json", metrics),
+                    ("rankings.json", rankings),
+                ):
+                    if payload.get("schema_version") != SCHEMA_VERSION:
+                        raise ValueError(f"{name} schema_version is unsupported")
+                    if payload.get("comparison_id") != safe_id:
+                        raise ValueError(f"{name} comparison identity mismatch")
+
+                if set(contract) != {
+                    "schema_version",
+                    "comparison_id",
+                    "symbol",
+                    "source_frequency",
+                    "models",
+                    "reference_baselines",
+                    "portfolio_benchmarks",
+                    "target_definition",
+                    "alignment_key",
+                    "evaluation_scopes",
+                    "selection_policy",
+                    "reference_baseline_policy",
+                    "portfolio_assumptions",
+                    "metric_recomputation",
+                    "presentation",
+                    "disclaimer",
+                }:
+                    raise ValueError("comparison_contract.json has an unexpected schema")
+                if contract.get("models") != list(_UNIFIED_MODEL_VARIANTS):
+                    raise ValueError("Comparison contract must identify M-001 through M-006 once")
+                if contract.get("reference_baselines") != list(_UNIFIED_REFERENCE_BASELINES):
+                    raise ValueError("Comparison reference baseline contract is invalid")
+                if contract.get("portfolio_benchmarks") != list(_UNIFIED_BENCHMARKS):
+                    raise ValueError("Comparison portfolio benchmark contract is invalid")
+                if (
+                    contract.get("symbol") != "OGDC"
+                    or contract.get("source_frequency") != "daily"
+                    or contract.get("alignment_key")
+                    != ["ticker", "feature_date", "target_date"]
+                    or contract.get("disclaimer") != ACADEMIC_DISCLAIMER
+                ):
+                    raise ValueError("Comparison contract disclaimer is invalid")
+                target_definition = _require_mapping(
+                    contract.get("target_definition"), field="target_definition"
+                )
+                if target_definition != {
+                    "name": "target_next_day_up",
+                    "positive_class_condition": (
+                        "close[target_date] > close[feature_date]"
+                    ),
+                    "prediction_horizon": {
+                        "value": 1,
+                        "unit": "trading_session",
+                    },
+                }:
+                    raise ValueError("Comparison target definition is invalid")
+                presentation = _require_mapping(contract.get("presentation"), field="presentation")
+                if presentation != {"format": "tabular_report_only", "plots_included": False}:
+                    raise ValueError("Comparison presentation contract is invalid")
+                selection = _require_mapping(contract.get("selection_policy"), field="selection_policy")
+                if selection != {
+                    "primary": "balanced_accuracy",
+                    "tie_breakers": ["f1", "accuracy", "model_id_ascending"],
+                    "test_metrics_used_for_selection": False,
+                }:
+                    raise ValueError("Shared project holdout metrics cannot select a model")
+
+                if set(date_alignment) != {
+                    "schema_version",
+                    "comparison_id",
+                    "alignment_key",
+                    "validation",
+                    "shared_project_holdout",
+                }:
+                    raise ValueError("date_alignment.json has an unexpected schema")
+                if date_alignment.get("alignment_key") != ["ticker", "feature_date", "target_date"]:
+                    raise ValueError("Date alignment key is invalid")
+                validation_scope = self._unified_date_scope(
+                    date_alignment.get("validation"),
+                    field="date_alignment.validation",
+                    expected_term="validation",
+                )
+                holdout_scope = self._unified_date_scope(
+                    date_alignment.get("shared_project_holdout"),
+                    field="date_alignment.shared_project_holdout",
+                    expected_term=_UNIFIED_HOLDOUT_TERM,
+                )
+                validation_target_dates = {
+                    row["target_date"] for row in validation_scope["common_keys"]
+                }
+                holdout_target_dates = {
+                    row["target_date"] for row in holdout_scope["common_keys"]
+                }
+                if (
+                    validation_target_dates & holdout_target_dates
+                    or validation_scope["feature_end"]
+                    >= holdout_scope["feature_start"]
+                    or validation_scope["target_end"]
+                    >= holdout_scope["target_start"]
+                ):
+                    raise ValueError(
+                        "Validation must end before the disjoint shared project holdout"
+                    )
+                if any(
+                    key["ticker"] != contract["symbol"]
+                    for scope in (validation_scope, holdout_scope)
+                    for key in scope["common_keys"]
+                ):
+                    raise ValueError("Date alignment contains an unexpected symbol")
+
+                evaluation_scopes = _require_mapping(
+                    contract.get("evaluation_scopes"), field="evaluation_scopes"
+                )
+                if set(evaluation_scopes) != {
+                    "validation",
+                    "shared_project_holdout",
+                }:
+                    raise ValueError("Comparison evaluation scopes are invalid")
+                validation_contract = _require_mapping(
+                    evaluation_scopes.get("validation"),
+                    field="evaluation_scopes.validation",
+                )
+                holdout_contract = _require_mapping(
+                    evaluation_scopes.get("shared_project_holdout"),
+                    field="evaluation_scopes.shared_project_holdout",
+                )
+                if validation_contract != {
+                    "target_dates": [
+                        row["target_date"] for row in validation_scope["common_keys"]
+                    ]
+                }:
+                    raise ValueError("Validation scope dates disagree with date alignment")
+                if holdout_contract != {
+                    "term": _UNIFIED_HOLDOUT_TERM,
+                    "target_dates": [
+                        row["target_date"] for row in holdout_scope["common_keys"]
+                    ],
+                    "previously_exposed_through": list(
+                        _UNIFIED_MODEL_VARIANTS[:4]
+                    ),
+                }:
+                    raise ValueError(
+                        "Shared project holdout scope disagrees with date alignment"
+                    )
+
+                portfolio_assumptions = _require_mapping(
+                    contract.get("portfolio_assumptions"),
+                    field="portfolio_assumptions",
+                )
+                evaluation_dates = _require_mapping(
+                    portfolio_assumptions.get("evaluation_dates"),
+                    field="portfolio_assumptions.evaluation_dates",
+                )
+                if (
+                    portfolio_assumptions.get("symbol") != contract["symbol"]
+                    or evaluation_dates
+                    != {
+                        "feature_start": holdout_scope["feature_start"],
+                        "feature_end": holdout_scope["feature_end"],
+                        "target_start": holdout_scope["target_start"],
+                        "target_end": holdout_scope["target_end"],
+                    }
+                ):
+                    raise ValueError(
+                        "Portfolio evaluation dates disagree with the shared project holdout"
+                    )
+                metric_recomputation = _require_mapping(
+                    contract.get("metric_recomputation"),
+                    field="metric_recomputation",
+                )
+                if (
+                    metric_recomputation.get("models_retrained") is not False
+                    or metric_recomputation.get("backtests_rerun") is not False
+                ):
+                    raise ValueError(
+                        "Unified comparison API requires persisted, non-retrained results"
+                    )
+
+                (
+                    validation_models,
+                    validation_baselines,
+                    holdout_models,
+                    holdout_baselines,
+                    model_portfolios,
+                    _benchmarks,
+                    model_ids,
+                ) = self._unified_metric_collections(metrics)
+                if metrics.get("comparison_id") != safe_id:
+                    raise ValueError("metrics.json comparison identity mismatch")
+                if any(row["row_count"] != validation_scope["common_count"] for row in validation_models):
+                    raise ValueError("Validation metric counts disagree with date alignment")
+                if any(row["row_count"] != holdout_scope["common_count"] for row in holdout_models):
+                    raise ValueError("Holdout metric counts disagree with date alignment")
+                for scope_name, metric_rows, date_scope in (
+                    (
+                        "validation",
+                        [*validation_models, *validation_baselines],
+                        validation_scope,
+                    ),
+                    (
+                        "shared project holdout",
+                        [*holdout_models, *holdout_baselines],
+                        holdout_scope,
+                    ),
+                ):
+                    actual_counts = {
+                        "0": sum(
+                            row["actual_class"] == 0
+                            for row in date_scope["common_keys"]
+                        ),
+                        "1": sum(
+                            row["actual_class"] == 1
+                            for row in date_scope["common_keys"]
+                        ),
+                    }
+                    if any(
+                        row["row_count"] != date_scope["common_count"]
+                        or row["class_counts"] != actual_counts
+                        for row in metric_rows
+                    ):
+                        raise ValueError(
+                            f"{scope_name} metric class counts disagree with date alignment"
+                        )
+
+                if set(sources) != {
+                    "schema_version",
+                    "comparison_id",
+                    "sources",
+                    "relationships",
+                    "evidence_files",
+                    "source_revalidation",
+                }:
+                    raise ValueError("source_roots.json has an unexpected schema")
+                source_rows = sources.get("sources")
+                if not isinstance(source_rows, list) or len(source_rows) != 3:
+                    raise ValueError("source_roots.json must contain three sources")
+                expected_roles = {"baseline_training", "baseline_vertical_slice", "lstm"}
+                expected_source_types = {
+                    "baseline_training": "model_training_run",
+                    "baseline_vertical_slice": "vertical_slice",
+                    "lstm": "lstm_price_only_experiment",
+                }
+                expected_source_derivations = {
+                    "baseline_training": "byte_copy",
+                    "baseline_vertical_slice": "deterministic_redacted_projection",
+                    "lstm": "byte_copy",
+                }
+                expected_integrity_root_names = {
+                    "baseline_training": "run_manifest.json",
+                    "baseline_vertical_slice": "manifest.json",
+                    "lstm": "run_manifest.json",
+                }
+                expected_integrity_pack_paths = {
+                    "baseline_training": (
+                        "evidence/source_manifests/baseline_training_run_manifest.json"
+                    ),
+                    "baseline_vertical_slice": (
+                        "evidence/source_manifests/"
+                        "baseline_vertical_manifest_certificate.json"
+                    ),
+                    "lstm": "evidence/source_manifests/lstm_run_manifest.json",
+                }
+                observed_roles: list[str] = []
+                sources_by_role: dict[str, dict[str, Any]] = {}
+                copied_manifests: dict[str, dict[str, Any]] = {}
+                for index, raw_source in enumerate(source_rows):
+                    source = _require_mapping(raw_source, field=f"sources[{index}]")
+                    if set(source) != {
+                        "role",
+                        "artifact_type",
+                        "run_id",
+                        "integrity_root_name",
+                        "integrity_root_sha256",
+                        "payload_file_count",
+                        "integrity_root_pack_path",
+                        "integrity_root_pack_sha256",
+                        "integrity_root_derivation",
+                    }:
+                        raise ValueError(f"sources[{index}] has an unexpected schema")
+                    role = _require_string(source.get("role"), field=f"sources[{index}].role")
+                    observed_roles.append(role)
+                    sources_by_role[role] = source
+                    artifact_type = _require_string(
+                        source.get("artifact_type"),
+                        field=f"sources[{index}].artifact_type",
+                    )
+                    if artifact_type != expected_source_types.get(role):
+                        raise ValueError("Source role and artifact type disagree")
+                    _validate_identifier(
+                        _require_string(source.get("run_id"), field=f"sources[{index}].run_id"),
+                        field=f"sources[{index}].run_id",
+                    )
+                    integrity_root_name = _require_string(
+                        source.get("integrity_root_name"),
+                        field=f"sources[{index}].integrity_root_name",
+                    )
+                    if integrity_root_name != expected_integrity_root_names.get(role):
+                        raise ValueError("Source integrity-root name is invalid")
+                    root_digest = _sha256_string(
+                        source.get("integrity_root_sha256"),
+                        field=f"sources[{index}].integrity_root_sha256",
+                    )
+                    packed_path = _safe_relative_path(
+                        source.get("integrity_root_pack_path"),
+                        field=f"sources[{index}].integrity_root_pack_path",
+                    )
+                    if packed_path != expected_integrity_pack_paths.get(role):
+                        raise ValueError("Source integrity-root pack path is invalid")
+                    packed_digest = _sha256_string(
+                        source.get("integrity_root_pack_sha256"),
+                        field=f"sources[{index}].integrity_root_pack_sha256",
+                    )
+                    if inventory.get(packed_path) != packed_digest:
+                        raise ValueError("Source integrity root is not checksum-bound by the pack")
+                    payload_file_count = _strict_integer(
+                        source.get("payload_file_count"),
+                        field=f"sources[{index}].payload_file_count",
+                    )
+                    if payload_file_count <= 0:
+                        raise ValueError("Source payload_file_count must be positive")
+                    derivation = _require_string(
+                        source.get("integrity_root_derivation"),
+                        field=f"sources[{index}].integrity_root_derivation",
+                    )
+                    if derivation != expected_source_derivations.get(role):
+                        raise ValueError("Source integrity-root derivation is invalid")
+                    if derivation == "byte_copy" and root_digest != packed_digest:
+                        raise ValueError(
+                            "Byte-copied source integrity root digest is inconsistent"
+                        )
+                    integrity_evidence: dict[str, Any]
+                    if derivation == "byte_copy":
+                        copied_manifest = self._comparison_json(
+                            directory, inventory, packed_path
+                        )
+                        if (
+                            copied_manifest.get("schema_version") != SCHEMA_VERSION
+                            or copied_manifest.get("run_id") != source.get("run_id")
+                        ):
+                            raise ValueError(
+                                "Byte-copied source manifest identity is inconsistent"
+                            )
+                        copied_manifests[role] = copied_manifest
+                        integrity_evidence = copied_manifest
+                        if role == "baseline_training":
+                            raw_models = copied_manifest.get("models")
+                            if not isinstance(raw_models, list) or len(raw_models) != 4:
+                                raise ValueError(
+                                    "Baseline source manifest model identities are incomplete"
+                                )
+                            source_model_ids = {
+                                _require_string(
+                                    _require_mapping(
+                                        row,
+                                        field="baseline source manifest model",
+                                    ).get("variant_id"),
+                                    field="baseline source manifest model.variant_id",
+                                ): _require_string(
+                                    _require_mapping(
+                                        row,
+                                        field="baseline source manifest model",
+                                    ).get("model_id"),
+                                    field="baseline source manifest model.model_id",
+                                )
+                                for row in raw_models
+                            }
+                            if source_model_ids != {
+                                variant: model_ids[variant]
+                                for variant in _UNIFIED_MODEL_VARIANTS[:4]
+                            }:
+                                raise ValueError(
+                                    "Baseline source manifest model identities disagree"
+                                )
+                        elif role == "lstm":
+                            if copied_manifest.get("model_ids") != {
+                                variant: model_ids[variant]
+                                for variant in _UNIFIED_MODEL_VARIANTS[4:]
+                            }:
+                                raise ValueError(
+                                    "LSTM source manifest model identities disagree"
+                                )
+                    if derivation == "deterministic_redacted_projection":
+                        certificate = self._comparison_json(
+                            directory, inventory, packed_path
+                        )
+                        certificate_source = _require_mapping(
+                            certificate.get("source_manifest"),
+                            field="source integrity certificate.source_manifest",
+                        )
+                        if (
+                            certificate.get("artifact_type")
+                            != "paisa_source_integrity_certificate"
+                            or certificate.get("run_id") != source.get("run_id")
+                            or certificate.get("source_role") != role
+                            or certificate.get("raw_manifest_included") is not False
+                            or certificate_source
+                            != {
+                                "name": integrity_root_name,
+                                "sha256": root_digest,
+                            }
+                        ):
+                            raise ValueError(
+                                "Redacted source integrity certificate is invalid"
+                            )
+                        integrity_evidence = certificate
+                    source_inventory = _require_mapping(
+                        integrity_evidence.get("artifact_inventory"),
+                        field=f"sources[{index}] integrity artifact_inventory",
+                    )
+                    source_inventory_files = source_inventory.get("files")
+                    if (
+                        not isinstance(source_inventory_files, list)
+                        or len(source_inventory_files) != payload_file_count
+                    ):
+                        raise ValueError(
+                            "Source payload_file_count disagrees with integrity evidence"
+                        )
+                if set(observed_roles) != expected_roles or len(set(observed_roles)) != 3:
+                    raise ValueError("Source roles are incomplete or duplicated")
+                lstm_manifest = copied_manifests.get("lstm")
+                if lstm_manifest is None:
+                    raise ValueError("LSTM source manifest evidence is missing")
+                for reference_key, expected_role in (
+                    ("baseline_training_run", "baseline_training"),
+                    ("baseline_vertical_slice", "baseline_vertical_slice"),
+                ):
+                    reference = _require_mapping(
+                        lstm_manifest.get(reference_key),
+                        field=f"LSTM source manifest.{reference_key}",
+                    )
+                    expected_source = sources_by_role[expected_role]
+                    if (
+                        reference.get("run_id") != expected_source.get("run_id")
+                        or reference.get("manifest_sha256")
+                        != expected_source.get("integrity_root_sha256")
+                    ):
+                        raise ValueError(
+                            "LSTM source manifest relationships are inconsistent"
+                        )
+                if sources.get("relationships") != {
+                    "vertical_slice_uses_training_run": True,
+                    "lstm_uses_training_run": True,
+                    "lstm_uses_vertical_slice": True,
+                }:
+                    raise ValueError("Source relationships are invalid")
+                if sources.get("source_revalidation") != {
+                    "validated_before_generation": True,
+                    "revalidated_before_publication": True,
+                }:
+                    raise ValueError("Source revalidation evidence is invalid")
+                evidence_rows = sources.get("evidence_files")
+                if not isinstance(evidence_rows, list):
+                    raise ValueError("Source evidence_files must be an array")
+                expected_bindings = _UNIFIED_EVIDENCE_FILES - {
+                    "evidence/source_manifests/baseline_vertical_manifest_certificate.json"
+                }
+                observed_bindings: list[str] = []
+                for index, raw_evidence in enumerate(evidence_rows):
+                    evidence = _require_mapping(raw_evidence, field=f"evidence_files[{index}]")
+                    if set(evidence) != {
+                        "source_role",
+                        "source_path",
+                        "pack_path",
+                        "sha256",
+                        "purpose",
+                        "derivation",
+                    }:
+                        raise ValueError(
+                            f"evidence_files[{index}] has an unexpected schema"
+                        )
+                    pack_path = _safe_relative_path(
+                        evidence.get("pack_path"), field=f"evidence_files[{index}].pack_path"
+                    )
+                    observed_bindings.append(pack_path)
+                    source_path = _safe_relative_path(
+                        evidence.get("source_path"), field=f"evidence_files[{index}].source_path"
+                    )
+                    if Path(source_path).suffix.lower() in _EXECUTABLE_MODEL_SUFFIXES:
+                        raise ValueError("Executable model source references are forbidden")
+                    digest = _sha256_string(
+                        evidence.get("sha256"), field=f"evidence_files[{index}].sha256"
+                    )
+                    if inventory.get(pack_path) != digest:
+                        raise ValueError("Source evidence checksum disagrees with pack inventory")
+                    if evidence.get("derivation") != "byte_copy":
+                        raise ValueError("Source evidence derivation must be byte_copy")
+                    if evidence.get("source_role") not in expected_roles:
+                        raise ValueError("Source evidence role is invalid")
+                    _require_string(
+                        evidence.get("purpose"),
+                        field=f"evidence_files[{index}].purpose",
+                    )
+                if set(observed_bindings) != expected_bindings or len(observed_bindings) != len(expected_bindings):
+                    raise ValueError("Source evidence bindings are incomplete or duplicated")
+
+                expected_ranking_keys = {
+                    "schema_version",
+                    "comparison_id",
+                    "validation_model_selection",
+                    "lstm_validation_preference",
+                    "shared_project_holdout_balanced_accuracy",
+                    "shared_project_holdout_f1",
+                    "simulated_model_portfolio_return",
+                    "simulated_model_portfolio_drawdown",
+                    "simulated_model_portfolio_fees",
+                }
+                if set(rankings) != expected_ranking_keys:
+                    raise ValueError("rankings.json has an unexpected schema")
+                validation_ranking = self._prediction_ranking_rows(
+                    rankings.get("validation_model_selection"),
+                    field="rankings.validation_model_selection",
+                    expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                    model_ids=model_ids,
+                )
+                lstm_ranking = self._prediction_ranking_rows(
+                    rankings.get("lstm_validation_preference"),
+                    field="rankings.lstm_validation_preference",
+                    expected_competitors=("M-005", "M-006"),
+                    model_ids=model_ids,
+                )
+                holdout_balanced_ranking = self._prediction_ranking_rows(
+                    rankings.get("shared_project_holdout_balanced_accuracy"),
+                    field="rankings.shared_project_holdout_balanced_accuracy",
+                    expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                    model_ids=model_ids,
+                )
+                holdout_f1_ranking = self._prediction_ranking_rows(
+                    rankings.get("shared_project_holdout_f1"),
+                    field="rankings.shared_project_holdout_f1",
+                    expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                    model_ids=model_ids,
+                )
+                portfolio_rankings: dict[str, list[dict[str, Any]]] = {}
+                for ranking_name in (
+                    "simulated_model_portfolio_return",
+                    "simulated_model_portfolio_drawdown",
+                    "simulated_model_portfolio_fees",
+                ):
+                    portfolio_rankings[ranking_name] = self._portfolio_ranking_rows(
+                        rankings.get(ranking_name),
+                        field=f"rankings.{ranking_name}",
+                        model_ids=model_ids,
+                    )
+
+                validation_by_id = {
+                    row["competitor_id"]: row for row in validation_models
+                }
+                holdout_by_id = {row["competitor_id"]: row for row in holdout_models}
+                portfolio_by_id = {
+                    row["variant_id"]: row for row in model_portfolios
+                }
+
+                def validate_prediction_ranking(
+                    ranking_rows: list[dict[str, Any]],
+                    metric_rows: Mapping[str, dict[str, Any]],
+                    *,
+                    primary: str,
+                    field: str,
+                ) -> None:
+                    tie_breakers = (
+                        ("balanced_accuracy", "f1", "accuracy")
+                        if primary == "balanced_accuracy"
+                        else ("f1", "balanced_accuracy", "accuracy")
+                    )
+                    for row in ranking_rows:
+                        metric = metric_rows[row["competitor_id"]]
+                        if any(row[key] != metric[key] for key in tie_breakers):
+                            raise ValueError(
+                                f"{field} values disagree with persisted metrics"
+                            )
+
+                    def key(row: dict[str, Any]) -> tuple[Any, ...]:
+                        metric = metric_rows[row["competitor_id"]]
+                        numeric = tuple(
+                            math.inf if metric[name] is None else -metric[name]
+                            for name in tie_breakers
+                        )
+                        return (*numeric, metric["registered_model_id"])
+
+                    if ranking_rows != sorted(ranking_rows, key=key):
+                        raise ValueError(f"{field} ordering contradicts its metrics")
+
+                validate_prediction_ranking(
+                    validation_ranking,
+                    validation_by_id,
+                    primary="balanced_accuracy",
+                    field="rankings.validation_model_selection",
+                )
+                validate_prediction_ranking(
+                    lstm_ranking,
+                    validation_by_id,
+                    primary="balanced_accuracy",
+                    field="rankings.lstm_validation_preference",
+                )
+                validate_prediction_ranking(
+                    holdout_balanced_ranking,
+                    holdout_by_id,
+                    primary="balanced_accuracy",
+                    field="rankings.shared_project_holdout_balanced_accuracy",
+                )
+                validate_prediction_ranking(
+                    holdout_f1_ranking,
+                    holdout_by_id,
+                    primary="f1",
+                    field="rankings.shared_project_holdout_f1",
+                )
+
+                portfolio_ranking_fields = {
+                    "simulated_model_portfolio_return": (
+                        "total_return",
+                        "sharpe_ratio",
+                        "maximum_drawdown",
+                    ),
+                    "simulated_model_portfolio_drawdown": (
+                        "maximum_drawdown",
+                        "total_return",
+                    ),
+                    "simulated_model_portfolio_fees": (
+                        "fees_paid",
+                        "number_of_trades",
+                    ),
+                }
+                for ranking_name, persisted_fields in portfolio_ranking_fields.items():
+                    ranking_rows = portfolio_rankings[ranking_name]
+                    for row in ranking_rows:
+                        metric = portfolio_by_id[row["competitor_id"]]
+                        if any(
+                            row[field_name] != metric[field_name]
+                            for field_name in persisted_fields
+                        ):
+                            raise ValueError(
+                                f"rankings.{ranking_name} values disagree with persisted metrics"
+                            )
+
+                expected_portfolio_orders = {
+                    "simulated_model_portfolio_return": sorted(
+                        _UNIFIED_MODEL_VARIANTS,
+                        key=lambda variant: (
+                            -portfolio_by_id[variant]["total_return"],
+                            math.inf
+                            if portfolio_by_id[variant]["sharpe_ratio"] is None
+                            else -portfolio_by_id[variant]["sharpe_ratio"],
+                            portfolio_by_id[variant]["maximum_drawdown"],
+                            variant,
+                        ),
+                    ),
+                    "simulated_model_portfolio_drawdown": sorted(
+                        _UNIFIED_MODEL_VARIANTS,
+                        key=lambda variant: (
+                            portfolio_by_id[variant]["maximum_drawdown"],
+                            -portfolio_by_id[variant]["total_return"],
+                            variant,
+                        ),
+                    ),
+                    "simulated_model_portfolio_fees": sorted(
+                        _UNIFIED_MODEL_VARIANTS,
+                        key=lambda variant: (
+                            Decimal(portfolio_by_id[variant]["fees_paid"]),
+                            portfolio_by_id[variant]["number_of_trades"],
+                            variant,
+                        ),
+                    ),
+                }
+                for ranking_name, expected_order in expected_portfolio_orders.items():
+                    if [
+                        row["competitor_id"]
+                        for row in portfolio_rankings[ranking_name]
+                    ] != expected_order:
+                        raise ValueError(
+                            f"rankings.{ranking_name} ordering contradicts its metrics"
+                        )
+
+                if set(summary) != {
+                    "schema_version",
+                    "artifact_type",
+                    "comparison_id",
+                    "status",
+                    "symbol",
+                    "path_base",
+                    "holdout_context",
+                    "outcomes_are_not_combined",
+                    "reported_outcomes",
+                    "artifact_paths",
+                    "limitations",
+                    "disclaimer",
+                }:
+                    raise ValueError("final_summary.json has an unexpected schema")
+                if (
+                    summary.get("artifact_type") != _UNIFIED_ARTIFACT_TYPE
+                    or summary.get("status") != "PASS"
+                    or summary.get("outcomes_are_not_combined") is not True
+                    or summary.get("disclaimer") != ACADEMIC_DISCLAIMER
+                    or summary.get("symbol") != contract.get("symbol")
+                    or summary.get("path_base") != "comparison_root"
+                ):
+                    raise ValueError("Final summary completion or identity contract is invalid")
+                expected_artifact_paths = {
+                    "source_roots": "source_roots.json",
+                    "comparison_contract": "comparison_contract.json",
+                    "date_alignment": "date_alignment.json",
+                    "metrics": "metrics.json",
+                    "rankings": "rankings.json",
+                    "reference_baseline_predictions": (
+                        "derived/reference_baseline_predictions.csv"
+                    ),
+                    "human_report": "report.md",
+                }
+                if summary.get("artifact_paths") != expected_artifact_paths:
+                    raise ValueError("Final summary artifact paths are invalid")
+                holdout_context = _require_mapping(
+                    summary.get("holdout_context"), field="summary.holdout_context"
+                )
+                if (
+                    holdout_context.get("term") != _UNIFIED_HOLDOUT_TERM
+                    or holdout_context.get("common_count") != holdout_scope["common_count"]
+                    or holdout_context.get("target_start") != holdout_scope["target_start"]
+                    or holdout_context.get("target_end") != holdout_scope["target_end"]
+                    or holdout_context.get("previously_exposed_through")
+                    != holdout_scope["previously_exposed_through"]
+                ):
+                    raise ValueError("Summary shared project holdout context is invalid")
+                limitations = _string_array(summary.get("limitations"), field="summary.limitations")
+                if not limitations:
+                    raise ValueError("Summary limitations must not be empty")
+                outcomes = _require_mapping(
+                    summary.get("reported_outcomes"), field="summary.reported_outcomes"
+                )
+                if set(outcomes) != {
+                    "validation_selected_model",
+                    "lstm_validation_preferred_model",
+                    "best_shared_holdout_balanced_accuracy",
+                    "best_shared_holdout_f1",
+                    "best_simulated_model_portfolio",
+                    "lowest_drawdown_model_portfolio",
+                    "lowest_fee_model_portfolio",
+                    "cash_only_benchmark",
+                    "buy_and_hold_result",
+                    "any_model_beat_buy_and_hold",
+                }:
+                    raise ValueError("Summary reported outcomes are incomplete")
+                for outcome_name in (
+                    "validation_selected_model",
+                    "lstm_validation_preferred_model",
+                    "best_shared_holdout_balanced_accuracy",
+                    "best_shared_holdout_f1",
+                    "best_simulated_model_portfolio",
+                    "lowest_drawdown_model_portfolio",
+                    "lowest_fee_model_portfolio",
+                ):
+                    outcome = _require_mapping(outcomes[outcome_name], field=f"outcomes.{outcome_name}")
+                    variant = _require_string(
+                        outcome.get("variant_id"), field=f"outcomes.{outcome_name}.variant_id"
+                    )
+                    if variant not in model_ids or outcome.get("registered_model_id") != model_ids[variant]:
+                        raise ValueError("Summary outcome model identity mismatch")
+                prediction_expectations = {
+                    "validation_selected_model": (
+                        validation_ranking[0]["competitor_id"],
+                        validation_by_id,
+                        "validation balanced accuracy, then F1, accuracy, and model ID",
+                        "all_six_models",
+                    ),
+                    "lstm_validation_preferred_model": (
+                        lstm_ranking[0]["competitor_id"],
+                        validation_by_id,
+                        "validation balanced accuracy, then F1, accuracy, and model ID",
+                        "M-005_and_M-006_only",
+                    ),
+                    "best_shared_holdout_balanced_accuracy": (
+                        holdout_balanced_ranking[0]["competitor_id"],
+                        holdout_by_id,
+                        "highest shared project holdout balanced accuracy",
+                        _UNIFIED_HOLDOUT_TERM,
+                    ),
+                    "best_shared_holdout_f1": (
+                        holdout_f1_ranking[0]["competitor_id"],
+                        holdout_by_id,
+                        "highest shared project holdout F1",
+                        _UNIFIED_HOLDOUT_TERM,
+                    ),
+                }
+                for outcome_name, (
+                    expected_variant,
+                    metric_rows,
+                    expected_criterion,
+                    expected_scope,
+                ) in prediction_expectations.items():
+                    outcome = _require_mapping(
+                        outcomes[outcome_name], field=f"outcomes.{outcome_name}"
+                    )
+                    if set(outcome) != {
+                        "variant_id",
+                        "registered_model_id",
+                        "criterion",
+                        "scope",
+                        "accuracy",
+                        "balanced_accuracy",
+                        "f1",
+                    }:
+                        raise ValueError(
+                            f"Summary prediction outcome {outcome_name} has an unexpected schema"
+                        )
+                    expected_metric = metric_rows[expected_variant]
+                    if (
+                        outcome.get("variant_id") != expected_variant
+                        or outcome.get("registered_model_id")
+                        != expected_metric["registered_model_id"]
+                        or outcome.get("accuracy") != expected_metric["accuracy"]
+                        or outcome.get("balanced_accuracy")
+                        != expected_metric["balanced_accuracy"]
+                        or outcome.get("f1") != expected_metric["f1"]
+                        or outcome.get("criterion") != expected_criterion
+                        or outcome.get("scope") != expected_scope
+                    ):
+                        raise ValueError(
+                            f"Summary prediction outcome {outcome_name} disagrees with persisted rankings or metrics"
+                        )
+                portfolio_expectations = {
+                    "best_simulated_model_portfolio": (
+                        portfolio_rankings["simulated_model_portfolio_return"][0][
+                            "competitor_id"
+                        ],
+                        "highest simulated total return",
+                    ),
+                    "lowest_drawdown_model_portfolio": (
+                        portfolio_rankings[
+                            "simulated_model_portfolio_drawdown"
+                        ][0]["competitor_id"],
+                        "lowest simulated maximum drawdown",
+                    ),
+                    "lowest_fee_model_portfolio": (
+                        portfolio_rankings["simulated_model_portfolio_fees"][0][
+                            "competitor_id"
+                        ],
+                        "lowest simulated fees paid",
+                    ),
+                }
+                for outcome_name, (
+                    expected_variant,
+                    expected_criterion,
+                ) in portfolio_expectations.items():
+                    outcome = _require_mapping(
+                        outcomes[outcome_name], field=f"outcomes.{outcome_name}"
+                    )
+                    if set(outcome) != {
+                        "variant_id",
+                        "registered_model_id",
+                        "portfolio_id",
+                        "criterion",
+                        "ending_equity",
+                        "total_return",
+                        "maximum_drawdown",
+                        "fees_paid",
+                    }:
+                        raise ValueError(
+                            f"Summary portfolio outcome {outcome_name} has an unexpected schema"
+                        )
+                    expected_portfolio = portfolio_by_id[expected_variant]
+                    for key in (
+                        "registered_model_id",
+                        "portfolio_id",
+                        "ending_equity",
+                        "total_return",
+                        "maximum_drawdown",
+                        "fees_paid",
+                    ):
+                        if outcome.get(key) != expected_portfolio[key]:
+                            raise ValueError(
+                                f"Summary portfolio outcome {outcome_name} disagrees with persisted rankings or metrics"
+                            )
+                    if outcome.get("criterion") != expected_criterion:
+                        raise ValueError(
+                            f"Summary portfolio outcome {outcome_name} has an invalid criterion"
+                        )
+
+                benchmark_by_id = {
+                    row["benchmark_id"]: row for row in _benchmarks
+                }
+                for benchmark_name, benchmark_id in (
+                    ("cash_only_benchmark", "cash-only"),
+                    ("buy_and_hold_result", "buy-and-hold"),
+                ):
+                    outcome = _require_mapping(
+                        outcomes[benchmark_name], field=f"outcomes.{benchmark_name}"
+                    )
+                    expected_benchmark = benchmark_by_id[benchmark_id]
+                    expected_keys = {
+                        "initial_equity",
+                        "ending_equity",
+                        "total_return",
+                        "maximum_drawdown",
+                        "volatility",
+                        "sharpe_ratio",
+                        "number_of_trades",
+                        "fees_paid",
+                    }
+                    if set(outcome) != expected_keys or any(
+                        outcome.get(key) != expected_benchmark[key]
+                        for key in expected_keys
+                    ):
+                        raise ValueError(
+                            f"Summary benchmark outcome {benchmark_name} disagrees with persisted metrics"
+                        )
+                beat = _require_mapping(
+                    outcomes["any_model_beat_buy_and_hold"],
+                    field="outcomes.any_model_beat_buy_and_hold",
+                )
+                _boolean(beat.get("value"), field="outcomes.any_model_beat_buy_and_hold.value")
+                best_model_variant = portfolio_rankings[
+                    "simulated_model_portfolio_return"
+                ][0]["competitor_id"]
+                best_model_excess_return = portfolio_by_id[best_model_variant][
+                    "excess_return_vs_buy_and_hold"
+                ]
+                if (
+                    set(beat)
+                    != {
+                        "value",
+                        "comparison_metric",
+                        "best_model_variant_id",
+                        "best_model_minus_buy_and_hold",
+                    }
+                    or beat.get("comparison_metric") != "simulated total return"
+                    or beat.get("best_model_variant_id") != best_model_variant
+                    or not math.isclose(
+                        _strict_float(
+                            beat.get("best_model_minus_buy_and_hold"),
+                            field=(
+                                "outcomes.any_model_beat_buy_and_hold."
+                                "best_model_minus_buy_and_hold"
+                            ),
+                        ),
+                        best_model_excess_return,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or beat.get("value") != (best_model_excess_return > 0.0)
+                ):
+                    raise ValueError("Buy-and-hold comparison metric is invalid")
+
+                prohibited_text = json.dumps(
+                    {
+                        "summary": summary,
+                        "contract": contract,
+                        "sources": sources,
+                        "metrics": metrics,
+                        "rankings": rankings,
+                    },
+                    sort_keys=True,
+                ).lower()
+                if "universal winner" in prohibited_text or "universal_winner" in prohibited_text:
+                    raise ValueError("Unified comparison must not claim a universal winner")
+
+                signature_after = _tree_signature(directory)
+                if signature_before != signature_after:
+                    raise ValueError("Unified comparison run changed during validation")
+                validated = ValidatedUnifiedComparison(
+                    comparison_id=safe_id,
+                    directory=directory,
+                    manifest=manifest,
+                    summary=summary,
+                    contract=contract,
+                    sources=sources,
+                    date_alignment=date_alignment,
+                    metrics=metrics,
+                    rankings=rankings,
+                    artifact_paths=frozenset(inventory),
+                    signature=signature_after,
+                )
+                self._comparison_cache[safe_id] = validated
+                return validated
+            except (RunNotCompletedError, RunNotFoundError):
+                raise
+            except InvalidIdentifierError as exc:
+                raise ArtifactIntegrityError(
+                    f"Unified comparison run '{safe_id}' contains an unsafe artifact identity"
+                ) from exc
+            except ArtifactRepositoryError:
+                raise
+            except Exception as exc:
+                raise ArtifactIntegrityError(
+                    f"Unified comparison run '{safe_id}' failed integrity validation"
+                ) from exc
+
+    def _unified_context(
+        self, comparison: ValidatedUnifiedComparison
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "comparison_id": comparison.comparison_id,
+            "status": "PASS",
+            "symbol": _require_string(
+                comparison.summary.get("symbol"), field="summary.symbol"
+            ),
+            "holdout_term": _UNIFIED_HOLDOUT_TERM,
+            "outcomes_are_not_combined": True,
+            "limitations": _string_array(
+                comparison.summary.get("limitations"), field="summary.limitations"
+            ),
+            "disclaimer": ACADEMIC_DISCLAIMER,
+        }
+
+    def configured_default_unified_comparison_id(self) -> str | None:
+        value = self.settings.default_unified_comparison_run_id
+        if value is None:
+            return None
+        return _validate_identifier(value, field="default comparison run ID")
+
+    def list_completed_unified_comparisons(self) -> list[dict[str, Any]]:
+        root = self.unified_comparison_root
+        if not os.path.lexists(root):
+            return []
+        _reject_symlink_path_components(root, label="Unified comparison root")
+        if not root.is_dir():
+            raise ArtifactIntegrityError(
+                "Configured unified comparison root is not a directory"
+            )
+        default_id = self.configured_default_unified_comparison_id()
+        rows: list[dict[str, Any]] = []
+        for candidate in sorted(root.iterdir(), key=lambda item: item.name):
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            try:
+                comparison = self._validate_unified_comparison(candidate.name)
+                context = self._unified_context(comparison)
+                alignment = self.load_unified_common_date_contract(
+                    comparison.comparison_id
+                )
+            except (ArtifactRepositoryError, TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "comparison_id": comparison.comparison_id,
+                    "status": "PASS",
+                    "symbol": context["symbol"],
+                    "model_count": len(_UNIFIED_MODEL_VARIANTS),
+                    "validation_count": alignment["validation"]["common_count"],
+                    "shared_holdout_count": alignment["shared_project_holdout"]["common_count"],
+                    "shared_holdout_target_start": alignment["shared_project_holdout"]["target_start"],
+                    "shared_holdout_target_end": alignment["shared_project_holdout"]["target_end"],
+                    "holdout_term": _UNIFIED_HOLDOUT_TERM,
+                    "is_default": comparison.comparison_id == default_id,
+                }
+            )
+        return rows
+
+    def load_unified_comparison_detail(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        (
+            validation_models,
+            _validation_baselines,
+            _holdout_models,
+            _holdout_baselines,
+            _portfolios,
+            _benchmarks,
+            _model_ids,
+        ) = self._unified_metric_collections(comparison.metrics)
+        models_by_id = {row["competitor_id"]: row for row in validation_models}
+        date_contract = self.load_unified_common_date_contract(comparison_id)
+        selection = _require_mapping(
+            comparison.contract.get("selection_policy"), field="selection_policy"
+        )
+        presentation = _require_mapping(
+            comparison.contract.get("presentation"), field="presentation"
+        )
+        return {
+            **self._unified_context(comparison),
+            "models": [
+                {
+                    "variant_id": variant,
+                    "registered_model_id": models_by_id[variant]["registered_model_id"],
+                    "algorithm": models_by_id[variant]["algorithm"],
+                    "configuration_family": models_by_id[variant]["configuration_family"],
+                }
+                for variant in _UNIFIED_MODEL_VARIANTS
+            ],
+            "source_frequency": _require_string(
+                comparison.contract.get("source_frequency"), field="source_frequency"
+            ),
+            "validation_count": date_contract["validation"]["common_count"],
+            "shared_holdout_count": date_contract["shared_project_holdout"]["common_count"],
+            "selection_policy": {
+                "primary": _require_string(selection.get("primary"), field="selection_policy.primary"),
+                "tie_breakers": _string_array(
+                    selection.get("tie_breakers"), field="selection_policy.tie_breakers"
+                ),
+                "test_metrics_used_for_selection": _boolean(
+                    selection.get("test_metrics_used_for_selection"),
+                    field="selection_policy.test_metrics_used_for_selection",
+                ),
+            },
+            "presentation": {
+                "format": _require_string(presentation.get("format"), field="presentation.format"),
+                "plots_included": _boolean(
+                    presentation.get("plots_included"), field="presentation.plots_included"
+                ),
+                "data_sources": [
+                    "prediction-metrics",
+                    "validation-metrics",
+                    "portfolio-metrics",
+                    "prediction-rankings",
+                    "portfolio-rankings",
+                    "common-date-contract",
+                    "confusion-matrices",
+                ],
+            },
+        }
+
+    @staticmethod
+    def _normalized_summary_outcomes(
+        comparison: ValidatedUnifiedComparison,
+    ) -> dict[str, Any]:
+        outcomes = _require_mapping(
+            comparison.summary.get("reported_outcomes"), field="reported_outcomes"
+        )
+
+        def prediction(name: str) -> dict[str, Any]:
+            raw = _require_mapping(outcomes.get(name), field=name)
+            return {
+                "variant_id": _require_string(raw.get("variant_id"), field=f"{name}.variant_id"),
+                "registered_model_id": _require_string(
+                    raw.get("registered_model_id"), field=f"{name}.registered_model_id"
+                ),
+                "criterion": _require_string(raw.get("criterion"), field=f"{name}.criterion"),
+                "scope": _require_string(raw.get("scope"), field=f"{name}.scope"),
+                "accuracy": _strict_float(raw.get("accuracy"), field=f"{name}.accuracy"),
+                "balanced_accuracy": _strict_float(
+                    raw.get("balanced_accuracy"),
+                    field=f"{name}.balanced_accuracy",
+                    nullable=True,
+                ),
+                "f1": _strict_float(raw.get("f1"), field=f"{name}.f1"),
+            }
+
+        def portfolio(name: str) -> dict[str, Any]:
+            raw = _require_mapping(outcomes.get(name), field=name)
+            return {
+                "variant_id": _require_string(raw.get("variant_id"), field=f"{name}.variant_id"),
+                "registered_model_id": _require_string(
+                    raw.get("registered_model_id"), field=f"{name}.registered_model_id"
+                ),
+                "portfolio_id": _require_string(raw.get("portfolio_id"), field=f"{name}.portfolio_id"),
+                "criterion": _require_string(raw.get("criterion"), field=f"{name}.criterion"),
+                "ending_equity": _money(raw.get("ending_equity"), field=f"{name}.ending_equity"),
+                "total_return": _strict_float(raw.get("total_return"), field=f"{name}.total_return"),
+                "maximum_drawdown": _strict_float(
+                    raw.get("maximum_drawdown"), field=f"{name}.maximum_drawdown"
+                ),
+                "fees_paid": _money(raw.get("fees_paid"), field=f"{name}.fees_paid"),
+            }
+
+        def benchmark(name: str) -> dict[str, Any]:
+            raw = _require_mapping(outcomes.get(name), field=name)
+            return {
+                "initial_equity": _money(raw.get("initial_equity"), field=f"{name}.initial_equity"),
+                "ending_equity": _money(raw.get("ending_equity"), field=f"{name}.ending_equity"),
+                "total_return": _strict_float(raw.get("total_return"), field=f"{name}.total_return"),
+                "maximum_drawdown": _strict_float(
+                    raw.get("maximum_drawdown"), field=f"{name}.maximum_drawdown"
+                ),
+                "volatility": _strict_float(
+                    raw.get("volatility"), field=f"{name}.volatility", nullable=True
+                ),
+                "sharpe_ratio": _strict_float(
+                    raw.get("sharpe_ratio"), field=f"{name}.sharpe_ratio", nullable=True
+                ),
+                "number_of_trades": _strict_integer(
+                    raw.get("number_of_trades"), field=f"{name}.number_of_trades"
+                ),
+                "fees_paid": _money(raw.get("fees_paid"), field=f"{name}.fees_paid"),
+            }
+
+        beat_raw = _require_mapping(
+            outcomes.get("any_model_beat_buy_and_hold"),
+            field="any_model_beat_buy_and_hold",
+        )
+        beat = {
+            "value": _boolean(beat_raw.get("value"), field="any_model_beat_buy_and_hold.value"),
+            "best_model_variant_id": _require_string(
+                beat_raw.get("best_model_variant_id"),
+                field="any_model_beat_buy_and_hold.best_model_variant_id",
+            ),
+            "best_model_minus_buy_and_hold": _strict_float(
+                beat_raw.get("best_model_minus_buy_and_hold"),
+                field="any_model_beat_buy_and_hold.best_model_minus_buy_and_hold",
+            ),
+            "comparison_metric": _require_string(
+                beat_raw.get("comparison_metric"),
+                field="any_model_beat_buy_and_hold.comparison_metric",
+            ),
+        }
+        return {
+            "validation_selected_model": prediction("validation_selected_model"),
+            "lstm_validation_preferred_model": prediction("lstm_validation_preferred_model"),
+            "best_shared_holdout_balanced_accuracy": prediction(
+                "best_shared_holdout_balanced_accuracy"
+            ),
+            "best_shared_holdout_f1": prediction("best_shared_holdout_f1"),
+            "best_simulated_model_portfolio": portfolio("best_simulated_model_portfolio"),
+            "lowest_drawdown_model_portfolio": portfolio(
+                "lowest_drawdown_model_portfolio"
+            ),
+            "lowest_fee_model_portfolio": portfolio("lowest_fee_model_portfolio"),
+            "cash_only_benchmark": benchmark("cash_only_benchmark"),
+            "buy_and_hold_result": benchmark("buy_and_hold_result"),
+            "any_model_beat_buy_and_hold": beat,
+        }
+
+    def load_unified_summary(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        holdout = _require_mapping(
+            comparison.summary.get("holdout_context"), field="holdout_context"
+        )
+        return {
+            **self._unified_context(comparison),
+            "holdout_context": {
+                "term": _require_string(holdout.get("term"), field="holdout_context.term"),
+                "common_count": _strict_integer(
+                    holdout.get("common_count"), field="holdout_context.common_count"
+                ),
+                "target_start": _iso_date(
+                    holdout.get("target_start"), field="holdout_context.target_start"
+                ),
+                "target_end": _iso_date(
+                    holdout.get("target_end"), field="holdout_context.target_end"
+                ),
+                "previously_exposed_through": _string_array(
+                    holdout.get("previously_exposed_through"),
+                    field="holdout_context.previously_exposed_through",
+                ),
+            },
+            "reported_outcomes": self._normalized_summary_outcomes(comparison),
+        }
+
+    def load_unified_sources(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        raw_sources = comparison.sources.get("sources")
+        assert isinstance(raw_sources, list)
+        sources: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_sources):
+            source = _require_mapping(raw, field=f"sources[{index}]")
+            sources.append(
+                {
+                    "role": _require_string(source.get("role"), field=f"sources[{index}].role"),
+                    "artifact_type": _require_string(
+                        source.get("artifact_type"), field=f"sources[{index}].artifact_type"
+                    ),
+                    "run_id": _require_string(source.get("run_id"), field=f"sources[{index}].run_id"),
+                    "integrity_root_sha256": _sha256_string(
+                        source.get("integrity_root_sha256"),
+                        field=f"sources[{index}].integrity_root_sha256",
+                    ),
+                    "payload_file_count": _strict_integer(
+                        source.get("payload_file_count"),
+                        field=f"sources[{index}].payload_file_count",
+                    ),
+                    "integrity_root_derivation": _require_string(
+                        source.get("integrity_root_derivation"),
+                        field=f"sources[{index}].integrity_root_derivation",
+                    ),
+                }
+            )
+        return {
+            **self._unified_context(comparison),
+            "sources": sources,
+            "relationships": {
+                key: _boolean(value, field=f"relationships.{key}")
+                for key, value in _require_mapping(
+                    comparison.sources.get("relationships"), field="relationships"
+                ).items()
+            },
+        }
+
+    def load_unified_prediction_metrics(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        (
+            _validation_models,
+            _validation_baselines,
+            holdout_models,
+            holdout_baselines,
+            _portfolios,
+            _benchmarks,
+            _model_ids,
+        ) = self._unified_metric_collections(comparison.metrics)
+        return {
+            **self._unified_context(comparison),
+            "models": holdout_models,
+            "reference_baselines": holdout_baselines,
+        }
+
+    def load_unified_validation_metrics(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        (
+            validation_models,
+            validation_baselines,
+            _holdout_models,
+            _holdout_baselines,
+            _portfolios,
+            _benchmarks,
+            _model_ids,
+        ) = self._unified_metric_collections(comparison.metrics)
+        return {
+            **self._unified_context(comparison),
+            "evaluation_scope": "validation",
+            "models": validation_models,
+            "reference_baselines": validation_baselines,
+        }
+
+    def load_unified_portfolio_metrics(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        (
+            _validation_models,
+            _validation_baselines,
+            _holdout_models,
+            _holdout_baselines,
+            portfolios,
+            benchmarks,
+            _model_ids,
+        ) = self._unified_metric_collections(comparison.metrics)
+        return {
+            **self._unified_context(comparison),
+            "models": portfolios,
+            "benchmarks": benchmarks,
+        }
+
+    def _unified_model_ids(self, comparison: ValidatedUnifiedComparison) -> dict[str, str]:
+        return self._unified_metric_collections(comparison.metrics)[-1]
+
+    def load_unified_prediction_rankings(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        model_ids = self._unified_model_ids(comparison)
+        return {
+            **self._unified_context(comparison),
+            "validation_model_selection": self._prediction_ranking_rows(
+                comparison.rankings.get("validation_model_selection"),
+                field="rankings.validation_model_selection",
+                expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                model_ids=model_ids,
+            ),
+            "lstm_validation_preference": self._prediction_ranking_rows(
+                comparison.rankings.get("lstm_validation_preference"),
+                field="rankings.lstm_validation_preference",
+                expected_competitors=("M-005", "M-006"),
+                model_ids=model_ids,
+            ),
+            "shared_project_holdout_balanced_accuracy": self._prediction_ranking_rows(
+                comparison.rankings.get("shared_project_holdout_balanced_accuracy"),
+                field="rankings.shared_project_holdout_balanced_accuracy",
+                expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                model_ids=model_ids,
+            ),
+            "shared_project_holdout_f1": self._prediction_ranking_rows(
+                comparison.rankings.get("shared_project_holdout_f1"),
+                field="rankings.shared_project_holdout_f1",
+                expected_competitors=_UNIFIED_MODEL_VARIANTS,
+                model_ids=model_ids,
+            ),
+        }
+
+    def load_unified_portfolio_rankings(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        model_ids = self._unified_model_ids(comparison)
+        return {
+            **self._unified_context(comparison),
+            "simulated_model_portfolio_return": self._portfolio_ranking_rows(
+                comparison.rankings.get("simulated_model_portfolio_return"),
+                field="rankings.simulated_model_portfolio_return",
+                model_ids=model_ids,
+            ),
+            "simulated_model_portfolio_drawdown": self._portfolio_ranking_rows(
+                comparison.rankings.get("simulated_model_portfolio_drawdown"),
+                field="rankings.simulated_model_portfolio_drawdown",
+                model_ids=model_ids,
+            ),
+            "simulated_model_portfolio_fees": self._portfolio_ranking_rows(
+                comparison.rankings.get("simulated_model_portfolio_fees"),
+                field="rankings.simulated_model_portfolio_fees",
+                model_ids=model_ids,
+            ),
+        }
+
+    def load_unified_common_date_contract(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        validation = self._unified_date_scope(
+            comparison.date_alignment.get("validation"),
+            field="date_alignment.validation",
+            expected_term="validation",
+        )
+        holdout = self._unified_date_scope(
+            comparison.date_alignment.get("shared_project_holdout"),
+            field="date_alignment.shared_project_holdout",
+            expected_term=_UNIFIED_HOLDOUT_TERM,
+        )
+        return {
+            **self._unified_context(comparison),
+            "alignment_key": ["ticker", "feature_date", "target_date"],
+            "validation": validation,
+            "shared_project_holdout": holdout,
+        }
+
+    def load_unified_confusion_matrices(self, comparison_id: str) -> dict[str, Any]:
+        comparison = self._validate_unified_comparison(comparison_id)
+        (
+            validation_models,
+            validation_baselines,
+            holdout_models,
+            holdout_baselines,
+            _portfolios,
+            _benchmarks,
+            _model_ids,
+        ) = self._unified_metric_collections(comparison.metrics)
+
+        def matrices(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "competitor_id": row["competitor_id"],
+                    "competitor_type": row["competitor_type"],
+                    "registered_model_id": row["registered_model_id"],
+                    "evaluation_scope": row["evaluation_scope"],
+                    "class_labels": [0, 1],
+                    "confusion_matrix": row["confusion_matrix"],
+                    "support": row["support"],
+                }
+                for row in rows
+            ]
+
+        return {
+            **self._unified_context(comparison),
+            "validation_models": matrices(validation_models),
+            "validation_reference_baselines": matrices(validation_baselines),
+            "shared_project_holdout_models": matrices(holdout_models),
+            "shared_project_holdout_reference_baselines": matrices(holdout_baselines),
+        }
+
 
 @lru_cache(maxsize=16)
 def _repository_for_settings(
@@ -2680,6 +5252,8 @@ def _repository_for_settings(
     vertical_slice_root: str,
     model_training_root: str,
     default_run_id: str | None,
+    unified_comparison_root: str,
+    default_unified_comparison_run_id: str | None,
 ) -> ArtifactRepository:
     return ArtifactRepository(
         RepositorySettings(
@@ -2687,6 +5261,8 @@ def _repository_for_settings(
             vertical_slice_root=Path(vertical_slice_root),
             model_training_root=Path(model_training_root),
             default_vertical_slice_run_id=default_run_id,
+            unified_comparison_root=Path(unified_comparison_root),
+            default_unified_comparison_run_id=default_unified_comparison_run_id,
         )
     )
 
@@ -2700,6 +5276,8 @@ def get_artifact_repository() -> ArtifactRepository:
         str(settings.vertical_slice_root),
         str(settings.model_training_root),
         settings.default_vertical_slice_run_id,
+        str(settings.unified_comparison_root),
+        settings.default_unified_comparison_run_id,
     )
 
 

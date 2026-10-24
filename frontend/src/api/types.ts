@@ -442,3 +442,324 @@ export interface CoreRunData {
   source: SourceResponse;
   experiments: ExperimentsResponse;
 }
+
+export type UnifiedModelVariant =
+  | "M-001"
+  | "M-002"
+  | "M-003"
+  | "M-004"
+  | "M-005"
+  | "M-006";
+
+export interface UnifiedComparisonContext {
+  schema_version: string;
+  comparison_id: string;
+  status: "PASS";
+  symbol: "OGDC";
+  holdout_term: "shared project holdout";
+  outcomes_are_not_combined: true;
+  limitations: string[];
+  disclaimer: string;
+}
+
+export interface UnifiedComparisonListItem {
+  schema_version: string;
+  comparison_id: string;
+  status: "PASS";
+  symbol: "OGDC";
+  model_count: 6;
+  validation_count: number;
+  shared_holdout_count: number;
+  shared_holdout_target_start: string;
+  shared_holdout_target_end: string;
+  holdout_term: "shared project holdout";
+  is_default: boolean;
+}
+
+export interface UnifiedComparisonListResponse {
+  schema_version: string;
+  total: number;
+  limit: number;
+  offset: number;
+  default_comparison_id: string | null;
+  rows: UnifiedComparisonListItem[];
+  disclaimer: string;
+}
+
+export interface UnifiedModelIdentity {
+  variant_id: UnifiedModelVariant;
+  registered_model_id: string;
+  algorithm: string;
+  configuration_family: string;
+}
+
+export interface UnifiedComparisonDetailResponse
+  extends UnifiedComparisonContext {
+  models: UnifiedModelIdentity[];
+  source_frequency: string;
+  validation_count: number;
+  shared_holdout_count: number;
+  selection_policy: {
+    primary: string;
+    tie_breakers: string[];
+    test_metrics_used_for_selection: false;
+  };
+  presentation: {
+    format: string;
+    plots_included: false;
+    data_sources: string[];
+  };
+}
+
+export interface UnifiedSourcesResponse extends UnifiedComparisonContext {
+  sources: Array<{
+    role: string;
+    artifact_type: string;
+    run_id: string;
+    integrity_root_sha256: string;
+    payload_file_count: number;
+    integrity_root_derivation: string;
+  }>;
+  relationships: {
+    vertical_slice_uses_training_run: boolean;
+    lstm_uses_training_run: boolean;
+    lstm_uses_vertical_slice: boolean;
+  };
+}
+
+export interface UnifiedPredictionOutcome {
+  variant_id: UnifiedModelVariant;
+  registered_model_id: string;
+  criterion: string;
+  scope: string;
+  accuracy: number;
+  balanced_accuracy: number | null;
+  f1: number;
+}
+
+export interface UnifiedPortfolioOutcome {
+  variant_id: UnifiedModelVariant;
+  registered_model_id: string;
+  portfolio_id: string;
+  criterion: string;
+  ending_equity: string;
+  total_return: number;
+  maximum_drawdown: number;
+  fees_paid: string;
+}
+
+export interface UnifiedBenchmarkOutcome {
+  initial_equity: string;
+  ending_equity: string;
+  total_return: number;
+  maximum_drawdown: number;
+  volatility: number | null;
+  sharpe_ratio: number | null;
+  number_of_trades: number;
+  fees_paid: string;
+}
+
+export interface UnifiedComparisonSummaryResponse
+  extends UnifiedComparisonContext {
+  holdout_context: {
+    term: "shared project holdout";
+    common_count: number;
+    target_start: string;
+    target_end: string;
+    previously_exposed_through: UnifiedModelVariant[];
+  };
+  reported_outcomes: {
+    validation_selected_model: UnifiedPredictionOutcome;
+    lstm_validation_preferred_model: UnifiedPredictionOutcome;
+    best_shared_holdout_balanced_accuracy: UnifiedPredictionOutcome;
+    best_shared_holdout_f1: UnifiedPredictionOutcome;
+    best_simulated_model_portfolio: UnifiedPortfolioOutcome;
+    lowest_drawdown_model_portfolio: UnifiedPortfolioOutcome;
+    lowest_fee_model_portfolio: UnifiedPortfolioOutcome;
+    cash_only_benchmark: UnifiedBenchmarkOutcome;
+    buy_and_hold_result: UnifiedBenchmarkOutcome;
+    any_model_beat_buy_and_hold: {
+      value: boolean;
+      best_model_variant_id: UnifiedModelVariant;
+      best_model_minus_buy_and_hold: number;
+      comparison_metric: string;
+    };
+  };
+}
+
+export interface UnifiedPredictionMetricRow {
+  competitor_id: string;
+  competitor_type: "model" | "reference_baseline";
+  registered_model_id: string | null;
+  algorithm: string | null;
+  configuration_family: string | null;
+  evaluation_scope: "validation" | "shared project holdout";
+  row_count: number;
+  support: number;
+  accuracy: number;
+  balanced_accuracy: number | null;
+  precision: number;
+  recall: number;
+  f1: number;
+  matthews_corrcoef: number | null;
+  roc_auc: number | null;
+  brier_score: number | null;
+  log_loss: number | null;
+  expected_calibration_error: number | null;
+  selection_eligible: boolean;
+  metric_warnings: string[];
+  class_counts: Record<string, number>;
+  predicted_class_counts: Record<string, number>;
+  confusion_matrix: [[number, number], [number, number]];
+}
+
+export interface UnifiedPredictionMetricsResponse
+  extends UnifiedComparisonContext {
+  models: UnifiedPredictionMetricRow[];
+  reference_baselines: UnifiedPredictionMetricRow[];
+}
+
+export interface UnifiedValidationMetricsResponse
+  extends UnifiedPredictionMetricsResponse {
+  evaluation_scope: "validation";
+}
+
+export interface UnifiedModelPortfolioMetric {
+  variant_id: UnifiedModelVariant;
+  registered_model_id: string;
+  experiment_id: string;
+  portfolio_id: string;
+  initial_equity: string;
+  ending_equity: string;
+  total_return: number;
+  maximum_drawdown: number;
+  volatility: number | null;
+  sharpe_ratio: number | null;
+  number_of_trades: number;
+  win_rate: number | null;
+  average_gain: string | null;
+  average_loss: string | null;
+  turnover: number;
+  fees_paid: string;
+  time_in_market: number;
+  excess_return_vs_cash_only: number;
+  excess_return_vs_buy_and_hold: number;
+}
+
+export interface UnifiedBenchmarkPortfolioMetric {
+  benchmark_id: "cash-only" | "buy-and-hold";
+  initial_equity: string;
+  ending_equity: string;
+  total_return: number;
+  maximum_drawdown: number;
+  volatility: number | null;
+  sharpe_ratio: number | null;
+  number_of_trades: number;
+  win_rate: number | null;
+  average_gain: string | null;
+  average_loss: string | null;
+  turnover: number;
+  fees_paid: string;
+  time_in_market: number;
+  ledger_count: 6;
+}
+
+export interface UnifiedPortfolioMetricsResponse
+  extends UnifiedComparisonContext {
+  models: UnifiedModelPortfolioMetric[];
+  benchmarks: UnifiedBenchmarkPortfolioMetric[];
+}
+
+export interface UnifiedPredictionRankingRow {
+  rank: number;
+  competitor_id: UnifiedModelVariant;
+  registered_model_id: string;
+  accuracy: number;
+  balanced_accuracy: number | null;
+  f1: number;
+}
+
+export interface UnifiedPredictionRankingsResponse
+  extends UnifiedComparisonContext {
+  validation_model_selection: UnifiedPredictionRankingRow[];
+  lstm_validation_preference: UnifiedPredictionRankingRow[];
+  shared_project_holdout_balanced_accuracy: UnifiedPredictionRankingRow[];
+  shared_project_holdout_f1: UnifiedPredictionRankingRow[];
+}
+
+export interface UnifiedPortfolioRankingRow {
+  rank: number;
+  competitor_id: UnifiedModelVariant;
+  registered_model_id: string;
+  total_return: number | null;
+  maximum_drawdown: number | null;
+  sharpe_ratio: number | null;
+  fees_paid: string | null;
+  number_of_trades: number | null;
+}
+
+export interface UnifiedPortfolioRankingsResponse
+  extends UnifiedComparisonContext {
+  simulated_model_portfolio_return: UnifiedPortfolioRankingRow[];
+  simulated_model_portfolio_drawdown: UnifiedPortfolioRankingRow[];
+  simulated_model_portfolio_fees: UnifiedPortfolioRankingRow[];
+}
+
+export interface UnifiedCommonDateKey {
+  ticker: string;
+  feature_date: string;
+  target_date: string;
+  actual_class: 0 | 1;
+}
+
+export interface UnifiedDateScope {
+  terminology: string;
+  common_count: number;
+  feature_start: string;
+  feature_end: string;
+  target_start: string;
+  target_end: string;
+  original_counts: Record<string, number>;
+  common_counts: Record<string, number>;
+  dropped_target_dates: Record<string, string[]>;
+  common_keys: UnifiedCommonDateKey[];
+}
+
+export interface UnifiedCommonDateResponse extends UnifiedComparisonContext {
+  alignment_key: string[];
+  validation: UnifiedDateScope;
+  shared_project_holdout: UnifiedDateScope & {
+    previously_exposed_through: UnifiedModelVariant[];
+  };
+}
+
+export interface UnifiedConfusionMatrixRow {
+  competitor_id: string;
+  competitor_type: "model" | "reference_baseline";
+  registered_model_id: string | null;
+  evaluation_scope: "validation" | "shared project holdout";
+  class_labels: [0, 1];
+  confusion_matrix: [[number, number], [number, number]];
+  support: number;
+}
+
+export interface UnifiedConfusionMatricesResponse
+  extends UnifiedComparisonContext {
+  validation_models: UnifiedConfusionMatrixRow[];
+  validation_reference_baselines: UnifiedConfusionMatrixRow[];
+  shared_project_holdout_models: UnifiedConfusionMatrixRow[];
+  shared_project_holdout_reference_baselines: UnifiedConfusionMatrixRow[];
+}
+
+export interface UnifiedComparisonData {
+  detail: UnifiedComparisonDetailResponse;
+  sources: UnifiedSourcesResponse;
+  summary: UnifiedComparisonSummaryResponse;
+  predictionMetrics: UnifiedPredictionMetricsResponse;
+  validationMetrics: UnifiedValidationMetricsResponse;
+  portfolioMetrics: UnifiedPortfolioMetricsResponse;
+  predictionRankings: UnifiedPredictionRankingsResponse;
+  portfolioRankings: UnifiedPortfolioRankingsResponse;
+  commonDateContract: UnifiedCommonDateResponse;
+  confusionMatrices: UnifiedConfusionMatricesResponse;
+}

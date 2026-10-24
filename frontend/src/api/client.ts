@@ -13,6 +13,17 @@ import {
   snapshotsSchema,
   sourceSchema,
   tradesSchema,
+  unifiedCommonDateSchema,
+  unifiedComparisonDetailSchema,
+  unifiedComparisonListSchema,
+  unifiedConfusionMatricesSchema,
+  unifiedPortfolioMetricsSchema,
+  unifiedPortfolioRankingsSchema,
+  unifiedPredictionMetricsSchema,
+  unifiedPredictionRankingsSchema,
+  unifiedSourcesSchema,
+  unifiedSummarySchema,
+  unifiedValidationMetricsSchema,
   verticalSliceDetailSchema,
   verticalSliceListSchema,
   verticalSliceSummarySchema,
@@ -34,6 +45,19 @@ import type {
   SnapshotsResponse,
   SourceResponse,
   TradesResponse,
+  UnifiedCommonDateResponse,
+  UnifiedComparisonData,
+  UnifiedComparisonDetailResponse,
+  UnifiedComparisonListItem,
+  UnifiedComparisonListResponse,
+  UnifiedComparisonSummaryResponse,
+  UnifiedConfusionMatricesResponse,
+  UnifiedPortfolioMetricsResponse,
+  UnifiedPortfolioRankingsResponse,
+  UnifiedPredictionMetricsResponse,
+  UnifiedPredictionRankingsResponse,
+  UnifiedSourcesResponse,
+  UnifiedValidationMetricsResponse,
   VerticalSliceDetailResponse,
   VerticalSliceListItem,
   VerticalSliceListResponse,
@@ -110,6 +134,40 @@ function assertExperimentIdentity(actualExperimentId: string, expectedExperiment
       "malformed",
     );
   }
+}
+
+function assertComparisonIdentity(
+  response: { comparison_id: string },
+  expectedComparisonId: string,
+): void {
+  if (response.comparison_id !== expectedComparisonId) {
+    throw new ApiError(
+      "The PAISA API returned inconsistent comparison identity.",
+      "malformed",
+    );
+  }
+}
+
+function unifiedContextFingerprint(response: {
+  schema_version: string;
+  comparison_id: string;
+  status: string;
+  symbol: string;
+  holdout_term: string;
+  outcomes_are_not_combined: boolean;
+  limitations: string[];
+  disclaimer: string;
+}): string {
+  return JSON.stringify({
+    schema_version: response.schema_version,
+    comparison_id: response.comparison_id,
+    status: response.status,
+    symbol: response.symbol,
+    holdout_term: response.holdout_term,
+    outcomes_are_not_combined: response.outcomes_are_not_combined,
+    limitations: response.limitations,
+    disclaimer: response.disclaimer,
+  });
 }
 
 function assertRequestedPage(
@@ -230,6 +288,279 @@ export class PaisaApiClient {
     const response = await this.request(path, schema, signal);
     assertRunIdentity(response, runId);
     return response;
+  }
+
+  private async requestForComparison<T extends { comparison_id: string }>(
+    path: string,
+    schema: ZodType<T>,
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const response = await this.request(path, schema, signal);
+    assertComparisonIdentity(response, comparisonId);
+    return response;
+  }
+
+  async listUnifiedComparisons(
+    signal?: AbortSignal,
+  ): Promise<UnifiedComparisonListResponse> {
+    let firstPage: UnifiedComparisonListResponse | undefined;
+    let listFingerprint: string | undefined;
+    const { rows, total } = await this.collectPages<UnifiedComparisonListItem>(
+      async (limit, offset) => {
+        const page = await this.request(
+          `/api/v1/unified-comparisons?limit=${limit}&offset=${offset}`,
+          unifiedComparisonListSchema,
+          signal,
+        );
+        const fingerprint = JSON.stringify({
+          schema_version: page.schema_version,
+          default_comparison_id: page.default_comparison_id,
+          disclaimer: page.disclaimer,
+        });
+        if (listFingerprint === undefined) {
+          listFingerprint = fingerprint;
+          firstPage = page;
+        } else if (listFingerprint !== fingerprint) {
+          throw new ApiError(
+            "The PAISA API returned inconsistent comparison-list context.",
+            "malformed",
+          );
+        }
+        return page;
+      },
+      (row) => row.comparison_id,
+    );
+    if (!firstPage) {
+      throw new ApiError(
+        "The PAISA API returned an incomplete paginated result.",
+        "malformed",
+      );
+    }
+    return {
+      ...firstPage,
+      total,
+      limit: Math.max(firstPage.limit, rows.length),
+      offset: 0,
+      rows,
+    };
+  }
+
+  getUnifiedComparison(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedComparisonDetailResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}`,
+      unifiedComparisonDetailSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedSources(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedSourcesResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/sources`,
+      unifiedSourcesSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedSummary(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedComparisonSummaryResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/summary`,
+      unifiedSummarySchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedPredictionMetrics(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedPredictionMetricsResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/prediction-metrics`,
+      unifiedPredictionMetricsSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedValidationMetrics(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedValidationMetricsResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/validation-metrics`,
+      unifiedValidationMetricsSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedPortfolioMetrics(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedPortfolioMetricsResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/portfolio-metrics`,
+      unifiedPortfolioMetricsSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedPredictionRankings(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedPredictionRankingsResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/prediction-rankings`,
+      unifiedPredictionRankingsSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedPortfolioRankings(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedPortfolioRankingsResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/portfolio-rankings`,
+      unifiedPortfolioRankingsSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedCommonDateContract(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedCommonDateResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/common-date-contract`,
+      unifiedCommonDateSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  getUnifiedConfusionMatrices(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedConfusionMatricesResponse> {
+    return this.requestForComparison(
+      `/api/v1/unified-comparisons/${encodeURIComponent(comparisonId)}/confusion-matrices`,
+      unifiedConfusionMatricesSchema,
+      comparisonId,
+      signal,
+    );
+  }
+
+  async getUnifiedComparisonData(
+    comparisonId: string,
+    signal?: AbortSignal,
+  ): Promise<UnifiedComparisonData> {
+    const [
+      detail,
+      sources,
+      summary,
+      predictionMetrics,
+      validationMetrics,
+      portfolioMetrics,
+      predictionRankings,
+      portfolioRankings,
+      commonDateContract,
+      confusionMatrices,
+    ] = await Promise.all([
+      this.getUnifiedComparison(comparisonId, signal),
+      this.getUnifiedSources(comparisonId, signal),
+      this.getUnifiedSummary(comparisonId, signal),
+      this.getUnifiedPredictionMetrics(comparisonId, signal),
+      this.getUnifiedValidationMetrics(comparisonId, signal),
+      this.getUnifiedPortfolioMetrics(comparisonId, signal),
+      this.getUnifiedPredictionRankings(comparisonId, signal),
+      this.getUnifiedPortfolioRankings(comparisonId, signal),
+      this.getUnifiedCommonDateContract(comparisonId, signal),
+      this.getUnifiedConfusionMatrices(comparisonId, signal),
+    ]);
+    const responses = [
+      detail,
+      sources,
+      summary,
+      predictionMetrics,
+      validationMetrics,
+      portfolioMetrics,
+      predictionRankings,
+      portfolioRankings,
+      commonDateContract,
+      confusionMatrices,
+    ];
+    const context = unifiedContextFingerprint(detail);
+    if (responses.some((response) => unifiedContextFingerprint(response) !== context)) {
+      throw new ApiError(
+        "The PAISA API returned inconsistent unified-comparison context.",
+        "malformed",
+      );
+    }
+    if (
+      detail.validation_count !== commonDateContract.validation.common_count ||
+      detail.shared_holdout_count !==
+        commonDateContract.shared_project_holdout.common_count ||
+      summary.holdout_context.common_count !== detail.shared_holdout_count ||
+      summary.holdout_context.target_start !==
+        commonDateContract.shared_project_holdout.target_start ||
+      summary.holdout_context.target_end !==
+        commonDateContract.shared_project_holdout.target_end
+    ) {
+      throw new ApiError(
+        "The PAISA API returned inconsistent common-date evidence.",
+        "malformed",
+      );
+    }
+    const registeredModels = new Map<string, string>(
+      detail.models.map((model) => [model.variant_id, model.registered_model_id]),
+    );
+    const identityRows = [
+      ...predictionMetrics.models,
+      ...validationMetrics.models,
+      ...portfolioMetrics.models.map((row) => ({
+        competitor_id: row.variant_id,
+        registered_model_id: row.registered_model_id,
+      })),
+    ];
+    if (
+      identityRows.some(
+        (row) =>
+          row.registered_model_id !== registeredModels.get(row.competitor_id),
+      )
+    ) {
+      throw new ApiError(
+        "The PAISA API returned inconsistent registered-model identity.",
+        "malformed",
+      );
+    }
+    return {
+      detail,
+      sources,
+      summary,
+      predictionMetrics,
+      validationMetrics,
+      portfolioMetrics,
+      predictionRankings,
+      portfolioRankings,
+      commonDateContract,
+      confusionMatrices,
+    };
   }
 
   async listRuns(signal?: AbortSignal): Promise<VerticalSliceListResponse> {

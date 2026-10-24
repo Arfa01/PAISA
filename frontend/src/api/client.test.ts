@@ -7,6 +7,7 @@ import type {
   HistoricalPricesPageResponse,
 } from "./types";
 import {
+  COMPARISON_ID,
   EXPERIMENT_ONE,
   EXPERIMENT_TWO,
   makeCoreRunData,
@@ -14,6 +15,8 @@ import {
   makeHistoricalPrices,
   makeRunList,
   makeRunListItem,
+  makeUnifiedComparisonData,
+  makeUnifiedComparisonList,
   OTHER_RUN_ID,
   RUN_ID,
   runContext,
@@ -462,6 +465,115 @@ describe("PaisaApiClient response validation", () => {
       kind: "http",
       status: 500,
       message: "The PAISA API returned HTTP 500.",
+    });
+  });
+
+  it("lists completed unified comparisons with the declared default", async () => {
+    const response = makeUnifiedComparisonList();
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(response));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(client.listUnifiedComparisons()).resolves.toMatchObject({
+      default_comparison_id: COMPARISON_ID,
+      rows: [{ comparison_id: COMPARISON_ID, is_default: true }],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8000/api/v1/unified-comparisons?limit=1000&offset=0`,
+      expect.objectContaining({ headers: { Accept: "application/json" } }),
+    );
+  });
+
+  it("loads and validates every unified comparison endpoint without using /default", async () => {
+    const data = makeUnifiedComparisonData();
+    const responses = new Map<string, unknown>([
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}`, data.detail],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/sources`, data.sources],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/summary`, data.summary],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/prediction-metrics`, data.predictionMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/validation-metrics`, data.validationMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/portfolio-metrics`, data.portfolioMetrics],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/prediction-rankings`, data.predictionRankings],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/portfolio-rankings`, data.portfolioRankings],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/common-date-contract`, data.commonDateContract],
+      [`/api/v1/unified-comparisons/${COMPARISON_ID}/confusion-matrices`, data.confusionMatrices],
+    ]);
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      const payload = responses.get(path);
+      if (!payload) throw new Error(`Unexpected test request: ${path}`);
+      return Promise.resolve(jsonResponse(payload));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    const result = await client.getUnifiedComparisonData(COMPARISON_ID);
+    expect(result.detail.models).toHaveLength(6);
+    expect(result.predictionMetrics.models).toHaveLength(6);
+    expect(result.portfolioMetrics.benchmarks).toHaveLength(2);
+    expect(result.commonDateContract.shared_project_holdout.common_count).toBe(184);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(fetchMock.mock.calls.map(([url]) => String(url)).join("\n")).not.toContain(
+      "/default",
+    );
+  });
+
+  it("rejects cross-endpoint unified comparison context drift", async () => {
+    const data = makeUnifiedComparisonData();
+    const changedSources = {
+      ...data.sources,
+      limitations: ["A different limitation set."],
+    };
+    const payloads = [
+      data.detail,
+      changedSources,
+      data.summary,
+      data.predictionMetrics,
+      data.validationMetrics,
+      data.portfolioMetrics,
+      data.predictionRankings,
+      data.portfolioRankings,
+      data.commonDateContract,
+      data.confusionMatrices,
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() =>
+        Promise.resolve(jsonResponse(payloads.shift())),
+      ),
+    );
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    await expect(
+      client.getUnifiedComparisonData(COMPARISON_ID),
+    ).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API returned inconsistent unified-comparison context.",
+    });
+  });
+
+  it("strips unknown joblib fields and rejects absolute paths in unified responses", async () => {
+    const data = makeUnifiedComparisonData();
+    const withUnknownBinary = {
+      ...data.detail,
+      model_binary: "models/private.joblib",
+    };
+    const withAbsolutePath = {
+      ...data.detail,
+      internal_path: "/srv/paisa/artifacts/model.joblib",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(withUnknownBinary))
+      .mockResolvedValueOnce(jsonResponse(withAbsolutePath));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new PaisaApiClient("http://127.0.0.1:8000", 1_000);
+
+    const parsed = await client.getUnifiedComparison(COMPARISON_ID);
+    expect(parsed).not.toHaveProperty("model_binary");
+    await expect(client.getUnifiedComparison(COMPARISON_ID)).rejects.toMatchObject({
+      kind: "malformed",
+      message: "The PAISA API response contained prohibited local-path data.",
     });
   });
 });

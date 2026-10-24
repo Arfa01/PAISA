@@ -130,6 +130,47 @@ describe("PAISA dashboard shell", () => {
     expect(client.getCoreRunData).not.toHaveBeenCalled();
   });
 
+  it("opens unified comparison when no vertical-slice runs are available", async () => {
+    const user = userEvent.setup();
+    const client = makeMockClient({ runList: makeRunList([]) });
+    render(<App client={client} />);
+
+    await screen.findByRole("heading", {
+      name: "No immutable vertical-slice results are available.",
+    });
+    const unifiedButton = screen.getByRole("button", {
+      name: /Unified comparison/,
+    });
+    expect(unifiedButton).toBeEnabled();
+    await user.click(unifiedButton);
+
+    expect(
+      await screen.findByRole("heading", { name: "Unified Six-Model Comparison" }),
+    ).toBeInTheDocument();
+    expect(client.listUnifiedComparisons).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+    );
+    expect(client.getCoreRunData).not.toHaveBeenCalled();
+  });
+
+  it("opens unified comparison after the vertical-run inventory fails", async () => {
+    const user = userEvent.setup();
+    const client = makeMockClient();
+    vi.mocked(client.listRuns).mockRejectedValue(
+      new ApiError("Vertical results are unavailable.", "network"),
+    );
+    render(<App client={client} />);
+
+    await screen.findByRole("alert");
+    await user.click(
+      screen.getByRole("button", { name: /Unified comparison/ }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Unified Six-Model Comparison" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Vertical results are unavailable.")).not.toBeInTheDocument();
+  });
+
   it("loads the newly selected run and returns to its overview", async () => {
     const user = userEvent.setup();
     const runList = makeRunList([

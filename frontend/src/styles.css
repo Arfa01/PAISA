@@ -1040,6 +1040,35 @@ tbody tr:hover { background: #fbfcf8; }
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.unified-result-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.unified-matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.unified-matrix-grid .comparison-card {
+  min-width: 0;
+  padding: 16px;
+}
+
+.unified-matrix-grid table {
+  min-width: 0;
+  font-size: 0.75rem;
+}
+
+.unified-matrix-grid th,
+.unified-matrix-grid td {
+  padding: 8px;
+}
+
+.unified-comparison-view .identifier {
+  overflow-wrap: anywhere;
+}
+
 .comparison-card {
   display: grid;
   gap: 6px;
@@ -1305,6 +1334,8 @@ tbody tr:hover { background: #fbfcf8; }
   .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metadata-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .unified-result-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .unified-matrix-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 900px) {
@@ -1335,6 +1366,7 @@ tbody tr:hover { background: #fbfcf8; }
   .selection-summary, .comparison-grid, .notice-grid, .experiment-detail-grid {
     grid-template-columns: 1fr;
   }
+  .unified-result-grid, .unified-matrix-grid { grid-template-columns: 1fr; }
   .result-card--wide { grid-column: auto; }
   .field-control { min-width: 100%; }
   .compact-definition-list > div, .definition-item {

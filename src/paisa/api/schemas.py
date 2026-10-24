@@ -514,3 +514,311 @@ class SourceResponse(RunContextResponse):
     source: SourceDetails
     pipeline_evidence: PipelineEvidence | None
     migration_evidence: MigrationEvidence | None
+
+
+class UnifiedComparisonContext(BaseModel):
+    schema_version: str
+    comparison_id: str
+    status: str
+    symbol: str
+    holdout_term: str
+    outcomes_are_not_combined: bool
+    limitations: list[str]
+    disclaimer: str
+
+
+class UnifiedComparisonListItem(BaseModel):
+    schema_version: str
+    comparison_id: str
+    status: str
+    symbol: str
+    model_count: int
+    validation_count: int
+    shared_holdout_count: int
+    shared_holdout_target_start: str
+    shared_holdout_target_end: str
+    holdout_term: str
+    is_default: bool
+
+
+class UnifiedComparisonListResponse(BaseModel):
+    schema_version: str
+    total: int
+    limit: int
+    offset: int
+    default_comparison_id: str | None
+    rows: list[UnifiedComparisonListItem]
+    disclaimer: str
+
+
+class UnifiedModelIdentity(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    algorithm: str
+    configuration_family: str
+
+
+class UnifiedSelectionPolicy(BaseModel):
+    primary: str
+    tie_breakers: list[str]
+    test_metrics_used_for_selection: bool
+
+
+class UnifiedPresentation(BaseModel):
+    format: str
+    plots_included: bool
+    data_sources: list[str]
+
+
+class UnifiedComparisonDetailResponse(UnifiedComparisonContext):
+    models: list[UnifiedModelIdentity]
+    source_frequency: str
+    validation_count: int
+    shared_holdout_count: int
+    selection_policy: UnifiedSelectionPolicy
+    presentation: UnifiedPresentation
+
+
+class UnifiedSourceReference(BaseModel):
+    role: str
+    artifact_type: str
+    run_id: str
+    integrity_root_sha256: str
+    payload_file_count: int
+    integrity_root_derivation: str
+
+
+class UnifiedSourceRelationships(BaseModel):
+    vertical_slice_uses_training_run: bool
+    lstm_uses_training_run: bool
+    lstm_uses_vertical_slice: bool
+
+
+class UnifiedSourcesResponse(UnifiedComparisonContext):
+    sources: list[UnifiedSourceReference]
+    relationships: UnifiedSourceRelationships
+
+
+class UnifiedHoldoutContext(BaseModel):
+    term: str
+    common_count: int
+    target_start: str
+    target_end: str
+    previously_exposed_through: list[str]
+
+
+class UnifiedPredictionOutcome(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    criterion: str
+    scope: str
+    accuracy: float
+    balanced_accuracy: float | None
+    f1: float
+
+
+class UnifiedPortfolioOutcome(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    portfolio_id: str
+    criterion: str
+    ending_equity: str
+    total_return: float
+    maximum_drawdown: float
+    fees_paid: str
+
+
+class UnifiedBenchmarkOutcome(BaseModel):
+    initial_equity: str
+    ending_equity: str
+    total_return: float
+    maximum_drawdown: float
+    volatility: float | None
+    sharpe_ratio: float | None
+    number_of_trades: int
+    fees_paid: str
+
+
+class UnifiedBeatBuyAndHoldOutcome(BaseModel):
+    value: bool
+    best_model_variant_id: str
+    best_model_minus_buy_and_hold: float
+    comparison_metric: str
+
+
+class UnifiedReportedOutcomes(BaseModel):
+    validation_selected_model: UnifiedPredictionOutcome
+    lstm_validation_preferred_model: UnifiedPredictionOutcome
+    best_shared_holdout_balanced_accuracy: UnifiedPredictionOutcome
+    best_shared_holdout_f1: UnifiedPredictionOutcome
+    best_simulated_model_portfolio: UnifiedPortfolioOutcome
+    lowest_drawdown_model_portfolio: UnifiedPortfolioOutcome
+    lowest_fee_model_portfolio: UnifiedPortfolioOutcome
+    cash_only_benchmark: UnifiedBenchmarkOutcome
+    buy_and_hold_result: UnifiedBenchmarkOutcome
+    any_model_beat_buy_and_hold: UnifiedBeatBuyAndHoldOutcome
+
+
+class UnifiedSummaryResponse(UnifiedComparisonContext):
+    holdout_context: UnifiedHoldoutContext
+    reported_outcomes: UnifiedReportedOutcomes
+
+
+class UnifiedPredictionMetricRow(BaseModel):
+    competitor_id: str
+    competitor_type: str
+    registered_model_id: str | None
+    algorithm: str | None
+    configuration_family: str | None
+    evaluation_scope: str
+    row_count: int
+    support: int
+    accuracy: float
+    balanced_accuracy: float | None
+    precision: float
+    recall: float
+    f1: float
+    matthews_corrcoef: float | None
+    roc_auc: float | None
+    brier_score: float | None
+    log_loss: float | None
+    expected_calibration_error: float | None
+    selection_eligible: bool
+    metric_warnings: list[str]
+    class_counts: dict[str, int]
+    predicted_class_counts: dict[str, int]
+    confusion_matrix: list[list[int]]
+
+
+class UnifiedPredictionMetricsResponse(UnifiedComparisonContext):
+    models: list[UnifiedPredictionMetricRow]
+    reference_baselines: list[UnifiedPredictionMetricRow]
+
+
+class UnifiedValidationMetricsResponse(UnifiedPredictionMetricsResponse):
+    evaluation_scope: str
+
+
+class UnifiedModelPortfolioMetric(BaseModel):
+    variant_id: str
+    registered_model_id: str
+    experiment_id: str
+    portfolio_id: str
+    initial_equity: str
+    ending_equity: str
+    total_return: float
+    maximum_drawdown: float
+    volatility: float | None
+    sharpe_ratio: float | None
+    number_of_trades: int
+    win_rate: float | None
+    average_gain: str | None
+    average_loss: str | None
+    turnover: float
+    fees_paid: str
+    time_in_market: float
+    excess_return_vs_cash_only: float
+    excess_return_vs_buy_and_hold: float
+
+
+class UnifiedBenchmarkPortfolioMetric(BaseModel):
+    benchmark_id: str
+    initial_equity: str
+    ending_equity: str
+    total_return: float
+    maximum_drawdown: float
+    volatility: float | None
+    sharpe_ratio: float | None
+    number_of_trades: int
+    win_rate: float | None
+    average_gain: str | None
+    average_loss: str | None
+    turnover: float
+    fees_paid: str
+    time_in_market: float
+    ledger_count: int
+
+
+class UnifiedPortfolioMetricsResponse(UnifiedComparisonContext):
+    models: list[UnifiedModelPortfolioMetric]
+    benchmarks: list[UnifiedBenchmarkPortfolioMetric]
+
+
+class UnifiedPredictionRankingRow(BaseModel):
+    rank: int
+    competitor_id: str
+    registered_model_id: str
+    accuracy: float
+    balanced_accuracy: float | None
+    f1: float
+
+
+class UnifiedPredictionRankingsResponse(UnifiedComparisonContext):
+    validation_model_selection: list[UnifiedPredictionRankingRow]
+    lstm_validation_preference: list[UnifiedPredictionRankingRow]
+    shared_project_holdout_balanced_accuracy: list[UnifiedPredictionRankingRow]
+    shared_project_holdout_f1: list[UnifiedPredictionRankingRow]
+
+
+class UnifiedPortfolioRankingRow(BaseModel):
+    rank: int
+    competitor_id: str
+    registered_model_id: str
+    total_return: float | None
+    maximum_drawdown: float | None
+    sharpe_ratio: float | None
+    fees_paid: str | None
+    number_of_trades: int | None
+
+
+class UnifiedPortfolioRankingsResponse(UnifiedComparisonContext):
+    simulated_model_portfolio_return: list[UnifiedPortfolioRankingRow]
+    simulated_model_portfolio_drawdown: list[UnifiedPortfolioRankingRow]
+    simulated_model_portfolio_fees: list[UnifiedPortfolioRankingRow]
+
+
+class UnifiedCommonDateKey(BaseModel):
+    ticker: str
+    feature_date: str
+    target_date: str
+    actual_class: int
+
+
+class UnifiedDateScope(BaseModel):
+    terminology: str
+    common_count: int
+    feature_start: str
+    feature_end: str
+    target_start: str
+    target_end: str
+    original_counts: dict[str, int]
+    common_counts: dict[str, int]
+    dropped_target_dates: dict[str, list[str]]
+    common_keys: list[UnifiedCommonDateKey]
+
+
+class UnifiedHoldoutDateScope(UnifiedDateScope):
+    previously_exposed_through: list[str]
+
+
+class UnifiedCommonDateResponse(UnifiedComparisonContext):
+    alignment_key: list[str]
+    validation: UnifiedDateScope
+    shared_project_holdout: UnifiedHoldoutDateScope
+
+
+class UnifiedConfusionMatrixRow(BaseModel):
+    competitor_id: str
+    competitor_type: str
+    registered_model_id: str | None
+    evaluation_scope: str
+    class_labels: list[int]
+    confusion_matrix: list[list[int]]
+    support: int
+
+
+class UnifiedConfusionMatricesResponse(UnifiedComparisonContext):
+    validation_models: list[UnifiedConfusionMatrixRow]
+    validation_reference_baselines: list[UnifiedConfusionMatrixRow]
+    shared_project_holdout_models: list[UnifiedConfusionMatrixRow]
+    shared_project_holdout_reference_baselines: list[UnifiedConfusionMatrixRow]

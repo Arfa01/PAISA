@@ -19,6 +19,12 @@ import type {
   SourceResponse,
   TradeRow,
   TradesResponse,
+  UnifiedCommonDateKey,
+  UnifiedComparisonContext,
+  UnifiedComparisonData,
+  UnifiedComparisonListResponse,
+  UnifiedModelVariant,
+  UnifiedPredictionMetricRow,
   VerticalSliceListItem,
   VerticalSliceListResponse,
 } from "../api/types";
@@ -28,6 +34,16 @@ export const OTHER_RUN_ID = "VSL-TEST-OGDC-02";
 export const EXPERIMENT_ONE = `${RUN_ID}-m-001`;
 export const EXPERIMENT_TWO = `${RUN_ID}-m-002`;
 export const DISCLAIMER = "Academic simulation; not financial advice.";
+export const COMPARISON_ID = "CMP-TEST-OGDC-price-only-01";
+export const OTHER_COMPARISON_ID = "CMP-TEST-OGDC-price-only-02";
+export const UNIFIED_MODELS: UnifiedModelVariant[] = [
+  "M-001",
+  "M-002",
+  "M-003",
+  "M-004",
+  "M-005",
+  "M-006",
+];
 
 export function runContext(runId = RUN_ID): RunContext {
   return {
@@ -682,6 +698,509 @@ export function makeHistoricalPrices(runId = RUN_ID): HistoricalPricesResponse {
   };
 }
 
+function unifiedContext(
+  comparisonId = COMPARISON_ID,
+): UnifiedComparisonContext {
+  return {
+    schema_version: "1.0",
+    comparison_id: comparisonId,
+    status: "PASS",
+    symbol: "OGDC",
+    holdout_term: "shared project holdout",
+    outcomes_are_not_combined: true,
+    limitations: [
+      "One stock and one historical period do not establish general superiority.",
+      "The shared project holdout was exposed previously.",
+    ],
+    disclaimer: DISCLAIMER,
+  };
+}
+
+const configurationFamilies: Record<UnifiedModelVariant, string> = {
+  "M-001": "PAISA v0 baseline",
+  "M-002": "conservative",
+  "M-003": "flexible",
+  "M-004": "CPU histogram",
+  "M-005": "20-session baseline recurrent",
+  "M-006": "20-session regularized recurrent",
+};
+
+function algorithmFor(model: UnifiedModelVariant): string {
+  if (model === "M-004") return "xgboost";
+  if (model === "M-005" || model === "M-006") return "lstm";
+  return "random_forest";
+}
+
+function registeredModelId(model: UnifiedModelVariant): string {
+  return `registered-${model.toLowerCase()}`;
+}
+
+function predictionMetric(
+  model: UnifiedModelVariant,
+  scope: "validation" | "shared project holdout",
+  index: number,
+): UnifiedPredictionMetricRow {
+  const rowCount = scope === "validation" ? 182 : 184;
+  const classZero = scope === "validation" ? 93 : 93;
+  const classOne = rowCount - classZero;
+  const trueNegative = 50;
+  const falsePositive = classZero - trueNegative;
+  const falseNegative = 40;
+  const truePositive = classOne - falseNegative;
+  return {
+    competitor_id: model,
+    competitor_type: "model",
+    registered_model_id: registeredModelId(model),
+    algorithm: algorithmFor(model),
+    configuration_family: configurationFamilies[model],
+    evaluation_scope: scope,
+    row_count: rowCount,
+    support: rowCount,
+    accuracy: 0.49 + index * 0.01,
+    balanced_accuracy: model === "M-003" ? null : 0.48 + index * 0.01,
+    precision: 0.45 + index * 0.01,
+    recall: 0.44 + index * 0.01,
+    f1: 0.43 + index * 0.02,
+    matthews_corrcoef: model === "M-003" ? null : 0.02 + index * 0.01,
+    roc_auc: model === "M-003" ? null : 0.5 + index * 0.01,
+    brier_score: 0.25,
+    log_loss: 0.7,
+    expected_calibration_error: 0.05,
+    selection_eligible: true,
+    metric_warnings: [],
+    class_counts: { "0": classZero, "1": classOne },
+    predicted_class_counts: {
+      "0": trueNegative + falseNegative,
+      "1": falsePositive + truePositive,
+    },
+    confusion_matrix: [
+      [trueNegative, falsePositive],
+      [falseNegative, truePositive],
+    ],
+  };
+}
+
+function referenceMetric(
+  competitorId: "majority-class-baseline" | "previous-direction-baseline",
+  scope: "validation" | "shared project holdout",
+): UnifiedPredictionMetricRow {
+  const base = predictionMetric("M-001", scope, 0);
+  return {
+    ...base,
+    competitor_id: competitorId,
+    competitor_type: "reference_baseline",
+    registered_model_id: null,
+    algorithm: null,
+    configuration_family: null,
+    selection_eligible: false,
+  };
+}
+
+function commonDateKeys(count: number, start: string): UnifiedCommonDateKey[] {
+  const base = new Date(`${start}T00:00:00.000Z`);
+  return Array.from({ length: count }, (_, index) => {
+    const target = new Date(base);
+    target.setUTCDate(target.getUTCDate() + index);
+    const feature = new Date(target);
+    feature.setUTCDate(feature.getUTCDate() - 1);
+    return {
+      ticker: "OGDC",
+      feature_date: feature.toISOString().slice(0, 10),
+      target_date: target.toISOString().slice(0, 10),
+      actual_class: index % 2 === 0 ? 0 : 1,
+    };
+  });
+}
+
+export function makeUnifiedComparisonList(
+  rows = [
+    {
+      schema_version: "1.0",
+      comparison_id: COMPARISON_ID,
+      status: "PASS" as const,
+      symbol: "OGDC" as const,
+      model_count: 6 as const,
+      validation_count: 182,
+      shared_holdout_count: 184,
+      shared_holdout_target_start: "2025-12-16",
+      shared_holdout_target_end: "2026-09-15",
+      holdout_term: "shared project holdout" as const,
+      is_default: true,
+    },
+  ],
+  defaultComparisonId: string | null = rows[0]?.comparison_id ?? null,
+): UnifiedComparisonListResponse {
+  return {
+    schema_version: "1.0",
+    total: rows.length,
+    limit: 1000,
+    offset: 0,
+    default_comparison_id: defaultComparisonId,
+    rows: rows.map((row) => ({
+      ...row,
+      is_default: row.comparison_id === defaultComparisonId,
+    })),
+    disclaimer: DISCLAIMER,
+  };
+}
+
+export function makeUnifiedComparisonData(
+  comparisonId = COMPARISON_ID,
+): UnifiedComparisonData {
+  const context = unifiedContext(comparisonId);
+  const validationModels = UNIFIED_MODELS.map((model, index) =>
+    predictionMetric(model, "validation", index),
+  );
+  const predictionModels = UNIFIED_MODELS.map((model, index) =>
+    predictionMetric(model, "shared project holdout", index),
+  );
+  const validationBaselines = [
+    referenceMetric("majority-class-baseline", "validation"),
+    referenceMetric("previous-direction-baseline", "validation"),
+  ];
+  const predictionBaselines = [
+    referenceMetric("majority-class-baseline", "shared project holdout"),
+    referenceMetric("previous-direction-baseline", "shared project holdout"),
+  ];
+  const modelPortfolios = UNIFIED_MODELS.map((model, index) => ({
+    variant_id: model,
+    registered_model_id: registeredModelId(model),
+    experiment_id: `experiment-${model.toLowerCase()}`,
+    portfolio_id: `portfolio-${model.toLowerCase()}`,
+    initial_equity: "100000.00",
+    ending_equity: [
+      "99298.24",
+      "105987.04",
+      "99166.07",
+      "100190.05",
+      "96359.29",
+      "96110.91",
+    ][index]!,
+    total_return: [-0.0070176, 0.0598704, -0.0083393, 0.0019005, -0.0364071, -0.0388909][index]!,
+    maximum_drawdown: [0.0219965, 0.0566995, 0.0118467, 0.0712783, 0.1465748, 0.1546586][index]!,
+    volatility: index === 2 ? null : 0.03 + index * 0.01,
+    sharpe_ratio: index === 2 ? null : -0.3 + index * 0.2,
+    number_of_trades: [2, 3, 2, 34, 3, 3][index]!,
+    win_rate: index === 2 ? null : 0.5,
+    average_gain: index === 2 ? null : "100.00",
+    average_loss: index === 2 ? null : "-50.00",
+    turnover: 1 + index * 0.1,
+    fees_paid: ["99.06", "160.95", "98.93", "1751.06", "146.08", "146.72"][index]!,
+    time_in_market: 0.1 + index * 0.1,
+    excess_return_vs_cash_only: [-0.0070176, 0.0598704, -0.0083393, 0.0019005, -0.0364071, -0.0388909][index]!,
+    excess_return_vs_buy_and_hold: [-0.0694965, -0.0026085, -0.0708182, -0.0605784, -0.098886, -0.1013698][index]!,
+  }));
+  const benchmarks = [
+    {
+      benchmark_id: "cash-only" as const,
+      initial_equity: "100000.00",
+      ending_equity: "100000.00",
+      total_return: 0,
+      maximum_drawdown: 0,
+      volatility: 0,
+      sharpe_ratio: null,
+      number_of_trades: 0,
+      win_rate: null,
+      average_gain: null,
+      average_loss: null,
+      turnover: 0,
+      fees_paid: "0.00",
+      time_in_market: 0,
+      ledger_count: 6 as const,
+    },
+    {
+      benchmark_id: "buy-and-hold" as const,
+      initial_equity: "100000.00",
+      ending_equity: "106247.89",
+      total_return: 0.0624789,
+      maximum_drawdown: 0.1279045,
+      volatility: 0.1786761,
+      sharpe_ratio: 0.553179,
+      number_of_trades: 1,
+      win_rate: null,
+      average_gain: null,
+      average_loss: null,
+      turnover: 0.473,
+      fees_paid: "49.75",
+      time_in_market: 1,
+      ledger_count: 6 as const,
+    },
+  ];
+  const predictionRanking = UNIFIED_MODELS.map((model, index) => ({
+    rank: index + 1,
+    competitor_id: model,
+    registered_model_id: registeredModelId(model),
+    accuracy: predictionModels[index]!.accuracy,
+    balanced_accuracy: predictionModels[index]!.balanced_accuracy,
+    f1: predictionModels[index]!.f1,
+  }));
+  const portfolioRanking = UNIFIED_MODELS.map((model, index) => ({
+    rank: index + 1,
+    competitor_id: model,
+    registered_model_id: registeredModelId(model),
+    total_return: modelPortfolios[index]!.total_return,
+    maximum_drawdown: modelPortfolios[index]!.maximum_drawdown,
+    sharpe_ratio: modelPortfolios[index]!.sharpe_ratio,
+    fees_paid: modelPortfolios[index]!.fees_paid,
+    number_of_trades: modelPortfolios[index]!.number_of_trades,
+  }));
+  const counts = Object.fromEntries(UNIFIED_MODELS.map((model) => [model, 182]));
+  const holdoutCounts = Object.fromEntries(UNIFIED_MODELS.map((model) => [model, 184]));
+  const dropped = Object.fromEntries(UNIFIED_MODELS.map((model) => [model, []]));
+  const predictionOutcome = (
+    variant_id: UnifiedModelVariant,
+    criterion: string,
+    balanced_accuracy: number,
+    f1: number,
+  ) => ({
+    variant_id,
+    registered_model_id: registeredModelId(variant_id),
+    criterion,
+    scope: "all_six_models",
+    accuracy: 0.53,
+    balanced_accuracy,
+    f1,
+  });
+  const portfolioOutcome = (
+    variant_id: UnifiedModelVariant,
+    criterion: string,
+  ) => {
+    const row = modelPortfolios[UNIFIED_MODELS.indexOf(variant_id)]!;
+    return {
+      variant_id,
+      registered_model_id: registeredModelId(variant_id),
+      portfolio_id: row.portfolio_id,
+      criterion,
+      ending_equity: row.ending_equity,
+      total_return: row.total_return,
+      maximum_drawdown: row.maximum_drawdown,
+      fees_paid: row.fees_paid,
+    };
+  };
+
+  return {
+    detail: {
+      ...context,
+      models: UNIFIED_MODELS.map((variant_id) => ({
+        variant_id,
+        registered_model_id: registeredModelId(variant_id),
+        algorithm: algorithmFor(variant_id),
+        configuration_family: configurationFamilies[variant_id],
+      })),
+      source_frequency: "daily",
+      validation_count: 182,
+      shared_holdout_count: 184,
+      selection_policy: {
+        primary: "balanced_accuracy",
+        tie_breakers: ["f1", "accuracy", "model_id_ascending"],
+        test_metrics_used_for_selection: false,
+      },
+      presentation: {
+        format: "tabular_report_only",
+        plots_included: false,
+        data_sources: [
+          "prediction-metrics",
+          "validation-metrics",
+          "portfolio-metrics",
+          "prediction-rankings",
+          "portfolio-rankings",
+          "common-date-contract",
+          "confusion-matrices",
+        ],
+      },
+    },
+    sources: {
+      ...context,
+      sources: [
+        {
+          role: "baseline_training",
+          artifact_type: "model_training_run",
+          run_id: "TRN-TEST-01",
+          integrity_root_sha256: "a".repeat(64),
+          payload_file_count: 46,
+          integrity_root_derivation: "byte_copy",
+        },
+        {
+          role: "baseline_vertical_slice",
+          artifact_type: "vertical_slice",
+          run_id: "VSL-TEST-01",
+          integrity_root_sha256: "b".repeat(64),
+          payload_file_count: 65,
+          integrity_root_derivation: "deterministic_redacted_projection",
+        },
+        {
+          role: "lstm",
+          artifact_type: "lstm_price_only_experiment",
+          run_id: "LSTM-TEST-01",
+          integrity_root_sha256: "c".repeat(64),
+          payload_file_count: 147,
+          integrity_root_derivation: "byte_copy",
+        },
+      ],
+      relationships: {
+        vertical_slice_uses_training_run: true,
+        lstm_uses_training_run: true,
+        lstm_uses_vertical_slice: true,
+      },
+    },
+    summary: {
+      ...context,
+      holdout_context: {
+        term: "shared project holdout",
+        common_count: 184,
+        target_start: "2025-12-16",
+        target_end: "2026-09-15",
+        previously_exposed_through: ["M-001", "M-002", "M-003", "M-004"],
+      },
+      reported_outcomes: {
+        validation_selected_model: predictionOutcome(
+          "M-001",
+          "validation balanced accuracy, then F1, accuracy, and model ID",
+          0.530204,
+          0.458599,
+        ),
+        lstm_validation_preferred_model: predictionOutcome(
+          "M-005",
+          "validation balanced accuracy, then F1, accuracy, and model ID",
+          0.47928,
+          0.59322,
+        ),
+        best_shared_holdout_balanced_accuracy: predictionOutcome(
+          "M-006",
+          "highest shared project holdout balanced accuracy",
+          0.544251,
+          0.571429,
+        ),
+        best_shared_holdout_f1: predictionOutcome(
+          "M-005",
+          "highest shared project holdout F1",
+          0.520087,
+          0.639676,
+        ),
+        best_simulated_model_portfolio: portfolioOutcome(
+          "M-002",
+          "highest simulated total return",
+        ),
+        lowest_drawdown_model_portfolio: portfolioOutcome(
+          "M-003",
+          "lowest simulated maximum drawdown",
+        ),
+        lowest_fee_model_portfolio: portfolioOutcome(
+          "M-003",
+          "lowest simulated fees paid",
+        ),
+        cash_only_benchmark: { ...benchmarks[0]! },
+        buy_and_hold_result: { ...benchmarks[1]! },
+        any_model_beat_buy_and_hold: {
+          value: false,
+          best_model_variant_id: "M-002",
+          best_model_minus_buy_and_hold: -0.0026085,
+          comparison_metric: "simulated total return",
+        },
+      },
+    },
+    predictionMetrics: {
+      ...context,
+      models: predictionModels,
+      reference_baselines: predictionBaselines,
+    },
+    validationMetrics: {
+      ...context,
+      evaluation_scope: "validation",
+      models: validationModels,
+      reference_baselines: validationBaselines,
+    },
+    portfolioMetrics: {
+      ...context,
+      models: modelPortfolios,
+      benchmarks,
+    },
+    predictionRankings: {
+      ...context,
+      validation_model_selection: predictionRanking,
+      lstm_validation_preference: predictionRanking.filter((row) =>
+        row.competitor_id === "M-005" || row.competitor_id === "M-006",
+      ).map((row, index) => ({ ...row, rank: index + 1 })),
+      shared_project_holdout_balanced_accuracy: predictionRanking,
+      shared_project_holdout_f1: predictionRanking,
+    },
+    portfolioRankings: {
+      ...context,
+      simulated_model_portfolio_return: portfolioRanking,
+      simulated_model_portfolio_drawdown: portfolioRanking,
+      simulated_model_portfolio_fees: portfolioRanking,
+    },
+    commonDateContract: {
+      ...context,
+      alignment_key: ["ticker", "feature_date", "target_date"],
+      validation: {
+        terminology: "validation",
+        common_count: 182,
+        feature_start: "2025-03-21",
+        feature_end: "2025-12-12",
+        target_start: "2025-03-24",
+        target_end: "2025-12-15",
+        original_counts: counts,
+        common_counts: counts,
+        dropped_target_dates: dropped,
+        common_keys: commonDateKeys(182, "2025-03-24"),
+      },
+      shared_project_holdout: {
+        terminology: "shared project holdout",
+        common_count: 184,
+        feature_start: "2025-12-15",
+        feature_end: "2026-09-14",
+        target_start: "2025-12-16",
+        target_end: "2026-09-15",
+        original_counts: holdoutCounts,
+        common_counts: holdoutCounts,
+        dropped_target_dates: dropped,
+        common_keys: commonDateKeys(184, "2025-12-16"),
+        previously_exposed_through: ["M-001", "M-002", "M-003", "M-004"],
+      },
+    },
+    confusionMatrices: {
+      ...context,
+      validation_models: validationModels.map((row) => ({
+        competitor_id: row.competitor_id,
+        competitor_type: row.competitor_type,
+        registered_model_id: row.registered_model_id,
+        evaluation_scope: row.evaluation_scope,
+        class_labels: [0, 1],
+        confusion_matrix: row.confusion_matrix,
+        support: row.support,
+      })),
+      validation_reference_baselines: validationBaselines.map((row) => ({
+        competitor_id: row.competitor_id,
+        competitor_type: row.competitor_type,
+        registered_model_id: row.registered_model_id,
+        evaluation_scope: row.evaluation_scope,
+        class_labels: [0, 1],
+        confusion_matrix: row.confusion_matrix,
+        support: row.support,
+      })),
+      shared_project_holdout_models: predictionModels.map((row) => ({
+        competitor_id: row.competitor_id,
+        competitor_type: row.competitor_type,
+        registered_model_id: row.registered_model_id,
+        evaluation_scope: row.evaluation_scope,
+        class_labels: [0, 1],
+        confusion_matrix: row.confusion_matrix,
+        support: row.support,
+      })),
+      shared_project_holdout_reference_baselines: predictionBaselines.map((row) => ({
+        competitor_id: row.competitor_id,
+        competitor_type: row.competitor_type,
+        registered_model_id: row.registered_model_id,
+        evaluation_scope: row.evaluation_scope,
+        class_labels: [0, 1],
+        confusion_matrix: row.confusion_matrix,
+        support: row.support,
+      })),
+    },
+  };
+}
+
 export function makeMockClient(
   options: {
     core?: CoreRunData;
@@ -698,6 +1217,10 @@ export function makeMockClient(
     getAllDrawdowns: vi.fn().mockResolvedValue(drawdownRows),
     getHistoricalPrices: vi.fn(
       async (runId: string) => makeHistoricalPrices(runId),
+    ),
+    listUnifiedComparisons: vi.fn().mockResolvedValue(makeUnifiedComparisonList()),
+    getUnifiedComparisonData: vi.fn(
+      async (comparisonId: string) => makeUnifiedComparisonData(comparisonId),
     ),
     getExperiment: vi.fn(
       async (runId: string, experimentId: string) =>

@@ -2,9 +2,12 @@ import { z } from "zod";
 
 const finite = z.number().finite();
 const nullableFinite = finite.nullable();
+const probability = finite.min(0).max(1);
 const integer = z.number().int();
 const nonNegativeInteger = integer.nonnegative();
 const text = z.string();
+const MAX_TABLE_PAGE_SIZE = 1_000;
+const MAX_PRICE_PAGE_SIZE = 5_000;
 const money = z.string().regex(/^-?\d+\.\d{2}$/);
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
@@ -72,7 +75,7 @@ export const runContextSchema = z.object(runContextShape);
 export const verticalSliceListSchema = z.object({
   schema_version: text,
   total: nonNegativeInteger,
-  limit: integer.positive(),
+  limit: integer.positive().max(MAX_TABLE_PAGE_SIZE),
   offset: nonNegativeInteger,
   rows: z.array(
     z.object({
@@ -87,7 +90,7 @@ export const verticalSliceListSchema = z.object({
       model_count: nonNegativeInteger,
       experiment_count: nonNegativeInteger,
     }),
-  ),
+  ).max(MAX_TABLE_PAGE_SIZE),
   disclaimer: academicDisclaimer,
 }).superRefine((value, context) => {
   if (value.rows.length > value.limit) {
@@ -107,12 +110,12 @@ export const verticalSliceDetailSchema = z.object({
   evaluation_dates: evaluationDateRangeSchema,
   model_training_run_id: text,
   model_variants: z.array(text),
-  registered_model_ids: z.record(text),
+  registered_model_ids: z.record(z.string(), text),
   experiment_ids: z.array(text),
   shared_experiment_assumptions: z.object({
     initial_cash_pkr: money,
-    buy_probability_up_gte: finite,
-    sell_probability_up_lte: finite,
+    buy_probability_up_gte: probability,
+    sell_probability_up_lte: probability,
     maximum_allocation: finite,
     long_only: z.boolean(),
     whole_shares: z.boolean(),
@@ -272,9 +275,9 @@ function pageSchema<T extends z.ZodTypeAny>(rowSchema: T) {
   return z.object({
     ...runContextShape,
     total: nonNegativeInteger,
-    limit: integer.positive(),
+    limit: integer.positive().max(MAX_TABLE_PAGE_SIZE),
     offset: nonNegativeInteger,
-    rows: z.array(rowSchema),
+    rows: z.array(rowSchema).max(MAX_TABLE_PAGE_SIZE),
   });
 }
 
@@ -324,8 +327,8 @@ const experimentConfigurationSchema = z.object({
   symbol: text,
   initial_cash: money,
   thresholds: z.object({
-    buy_probability_up_gte: finite,
-    sell_probability_up_lte: finite,
+    buy_probability_up_gte: probability,
+    sell_probability_up_lte: probability,
   }),
   maximum_allocation: finite,
   transaction_cost: z.object({ type: text, value: finite }),
@@ -451,9 +454,9 @@ const benchmarkSnapshotSeriesSchema = z.object({
   ending_equity: money,
   total_return: finite,
   total: nonNegativeInteger,
-  limit: integer.positive(),
+  limit: integer.positive().max(MAX_TABLE_PAGE_SIZE),
   offset: nonNegativeInteger,
-  rows: z.array(snapshotRowSchema),
+  rows: z.array(snapshotRowSchema).max(MAX_TABLE_PAGE_SIZE),
 }).superRefine((value, context) => {
   if (value.rows.length > value.limit) {
     context.addIssue({
@@ -472,9 +475,9 @@ export const benchmarksSchema = z.object({
   buy_and_hold_trades: z.object({
     portfolio_id: text,
     total: nonNegativeInteger,
-    limit: integer.positive(),
+    limit: integer.positive().max(MAX_TABLE_PAGE_SIZE),
     offset: nonNegativeInteger,
-    rows: z.array(tradeRowSchema),
+    rows: z.array(tradeRowSchema).max(MAX_TABLE_PAGE_SIZE),
   }).superRefine((value, context) => {
     if (value.rows.length > value.limit) {
       context.addIssue({
@@ -507,18 +510,18 @@ export const sourceSchema = z.object({
   pipeline_evidence: z
     .object({
       schema_version: text.nullable(),
-      producer: z.union([z.record(z.unknown()), text]).nullable(),
+      producer: z.union([z.record(z.string(), z.unknown()), text]).nullable(),
       generated_at: text.nullable(),
       provider: text.nullable(),
       symbols_requested: z.array(text),
-      prices_artifact: z.record(z.unknown()).nullable(),
+      prices_artifact: z.record(z.string(), z.unknown()).nullable(),
     })
     .nullable(),
   migration_evidence: z
     .object({
       schema_version: text.nullable(),
       status: text.nullable(),
-      producer: z.union([z.record(z.unknown()), text]).nullable(),
+      producer: z.union([z.record(z.string(), z.unknown()), text]).nullable(),
       migration_strategy: text.nullable(),
       provenance_strength: text.nullable(),
       limitations: z.array(text),
@@ -533,7 +536,7 @@ export const historicalPricesSchema = z.object({
   source_mode: text,
   data_date_range: z.object({ start: isoDate, end: isoDate }),
   total: nonNegativeInteger.safe(),
-  limit: integer.positive().max(5_000),
+  limit: integer.positive().max(MAX_PRICE_PAGE_SIZE),
   offset: nonNegativeInteger.safe(),
   rows: z.array(
     z.object({
@@ -545,7 +548,7 @@ export const historicalPricesSchema = z.object({
       volume: nonNegativeInteger.safe(),
       source: priceSource,
     }),
-  ),
+  ).max(MAX_PRICE_PAGE_SIZE),
   warnings: z.array(text),
   disclaimer: academicDisclaimer,
 }).superRefine((value, context) => {

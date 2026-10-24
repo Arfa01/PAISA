@@ -223,7 +223,7 @@ model identities, dates, features, portability, and wording without loading a
 model:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID"
 ```
@@ -231,7 +231,7 @@ python scripts/verify_explainability_run.py \
 After transferring the ZIP and sidecar together, verification remains offline:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
@@ -262,22 +262,60 @@ Interpret all of these fields under
 
 ## Real execution status
 
-**Pending.** The implementation and isolated compatibility smoke evidence are
-documented, but this section intentionally does not claim an official retained
-184-row explanation pack yet. After the producing command and both verifiers
-pass, replace this pending note with evidence read from the generated
-`final_summary.json`, `additivity_report.json`, `quality_report.json`, and ZIP
-sidecar:
+Official retained run `XAI-20261024-140320-OGDC-tree-v1` completed with status
+`PASS` and quality status `PASS`. It was produced from clean code commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. The deterministic ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Directory and ZIP verification passed without loading an executable model.
 
-- run ID: `PENDING_REAL_RUN`;
-- ZIP SHA-256: `PENDING_REAL_RUN`;
-- maximum/mean additivity errors: `PENDING_REAL_RUN`;
-- top features and cross-model rank agreements/disagreements:
-  `PENDING_REAL_RUN`; and
-- quality status and validation counts: `PENDING_REAL_RUN`.
+Every model was explained in positive-class probability space over exactly 184
+shared project holdout rows and 19 ordered technical features. Each model used
+the same deterministic 100-row chronological training background. All `184`
+rows for each model passed its declared additivity tolerance, with zero failing
+rows:
 
-Do not infer these results from stored impurity-based feature importance or from
-the compatibility smoke test.
+| Model | Algorithm | Maximum absolute error | Mean absolute error | Tolerance | Passing rows |
+|---|---|---:|---:|---:|---:|
+| `M-001` | Random Forest | `5.78484978308591e-06` | `5.781760213738571e-06` | `5e-5` | `184/184` |
+| `M-002` | Random Forest | `4.302598055616613e-09` | `7.864803434113863e-10` | `5e-5` | `184/184` |
+| `M-003` | Random Forest | `2.7466758000471714e-05` | `2.7464541568790406e-05` | `5e-5` | `184/184` |
+| `M-004` | XGBoost | `1.5920226559273942e-07` | `3.5509845686483396e-08` | `1e-6` | `184/184` |
+
+The official global mean-absolute-attribution rankings begin with:
+
+| Model | Top five features, in rank order |
+|---|---|
+| `M-001` | `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20` |
+| `M-002` | `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14` |
+| `M-003` | `close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5` |
+| `M-004` | `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open` |
+
+The summary classifies the three Random-Forest pairings as rank agreements:
+
+| Pair | Spearman rank correlation | Top-five overlap |
+|---|---:|---:|
+| `M-001` / `M-002` | `0.8228070175438595` | `4/5` |
+| `M-001` / `M-003` | `0.8210526315789475` | `5/5` |
+| `M-002` / `M-003` | `0.7543859649122807` | `4/5` |
+
+The three comparisons involving XGBoost are the recorded rank disagreements:
+
+| Pair | Spearman rank correlation | Top-five overlap |
+|---|---:|---:|
+| `M-001` / `M-004` | `0.5964912280701754` | `4/5` |
+| `M-003` / `M-004` | `0.6175438596491227` | `4/5` |
+| `M-002` / `M-004` | `0.7` | `4/5` |
+
+All seven deterministic audit categories are available for every model:
+highest-confidence class 1, highest-confidence class 0, correct positive,
+correct negative, false positive, false negative, and largest absolute
+additivity error.
+
+The recorded runtime is Python `3.13.7`, SHAP `0.54.1`, NumPy `2.3.5`, pandas
+`2.3.3`, scikit-learn `1.9.1`, XGBoost `3.4.1`, joblib `1.6.0`, and Matplotlib
+`3.11.2`. Final validation completed with `1339 passed, 2 skipped, 6 warnings`
+in the backend and `132 passed` across 10 frontend test files, plus passing
+frontend lint and build.
 
 ## Limitations
 

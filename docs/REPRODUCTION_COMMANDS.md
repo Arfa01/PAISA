@@ -588,7 +588,8 @@ The producer stages and verifies all files before collision-refusing atomic
 publication. Record the returned run ID, then verify the directory:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+# Accepted retained pack; replace when verifying a newly emitted run ID.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID"
 ```
@@ -596,7 +597,8 @@ python scripts/verify_explainability_run.py \
 Verify a transferred deterministic ZIP with its sidecar:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+# Accepted retained pack; replace when verifying a newly emitted run ID.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
@@ -611,14 +613,38 @@ metadata, and prohibited causal/advice wording. It rejects missing and added
 files, tampering, absolute paths, symlinks, executable model payloads, unsafe
 ZIP members, and any false `PASS`.
 
-An official retained real pack is pending. Do not fill a run ID, ZIP checksum,
-top-feature list, cross-model agreement, or real additivity result from the
-dependency smoke or from impurity-based feature importance. Generated
-explanation directories and ZIPs stay out of Git. See
+The accepted local real pack is
+`artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
+ZIP and sidecar. Its clean code version/source fingerprint is
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`, its ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`, and
+its exact 24-file inventory reports `PASS`. Directory-plus-checksum,
+ZIP-plus-sidecar, and extracted offline verification all passed. The recorded
+runtime is Python 3.13.7, NumPy 2.3.5, pandas 2.3.3, scikit-learn 1.9.1,
+XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP 0.54.1.
+
+All M-001--M-004 results contain 184 rows and 19 transformed features in
+positive-class probability space. Maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06`,
+`4.302598055616613e-09` / `7.864803434113863e-10`,
+`2.7466758000471714e-05` / `2.7464541568790406e-05`, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08`, respectively. Every one
+of the 184 rows per model passed its `5e-5` Random Forest or `1e-6` XGBoost
+tolerance, and all seven audit categories were available for each model.
+
+The strongest rank agreements were M-001/M-002 (`0.8228070175438595`, four
+top-five overlaps), M-001/M-003 (`0.8210526315789475`, five), and M-002/M-003
+(`0.7543859649122807`, four). The reported disagreements were M-001/M-004
+(`0.5964912280701754`, four), M-003/M-004 (`0.6175438596491227`, four), and
+M-002/M-004 (`0.7`, four). Generated explanation directories and ZIPs stay
+out of Git. See
 [`TREE_MODEL_SHAP_EXPLAINABILITY.md`](TREE_MODEL_SHAP_EXPLAINABILITY.md),
 [`EXPLAINABILITY_DATA_CONTRACT.md`](EXPLAINABILITY_DATA_CONTRACT.md), and
 [`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md). Explanations
-describe fitted-model behavior, not economic causality or financial advice.
+describe fitted-model behavior on a previously exposed shared project holdout,
+not economic causality, profitability, or future results. Evidence covers one
+stock, one period, one feature family, and four tree configurations. Academic
+simulation; not financial advice.
 
 ## Final handoff checks
 

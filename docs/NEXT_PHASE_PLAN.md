@@ -256,7 +256,7 @@ bit-identical.
 
 ### 7. SHAP explanations
 
-**Artifact/verifier implementation present; official real execution pending.**
+**Artifact/verifier implementation and official real execution complete.**
 The additive tree-SHAP workflow is fixed to retained M-001 through M-004 and
 does not retrain, tune, recalibrate, or explain M-005/M-006. It binds the exact
 training, unified-comparison, and vertical-slice integrity roots; verifies model
@@ -271,20 +271,42 @@ importance, cross-model ranks, deterministic
 audit examples, manifests, plots, and a portable ZIP are checksum-bound. The
 offline verifier recomputes derived tables without loading a model.
 
-The pin passed an isolated deterministic Random Forest/XGBoost smoke test with
-the authoritative Python 3.13.7, NumPy 2.3.5, scikit-learn 1.9.1, and XGBoost
-3.4.1 versions. Because SHAP 0.54.1 requires Python 3.12+ and NumPy 2+, the
-stage has a separate explainability environment rather than changing the
-default Python 3.10+ support claim.
+The accepted local run is `XAI-20261024-140320-OGDC-tree-v1`, produced from
+clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its 24-file quality
+report is `PASS`; the ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
+all passed. The recorded runtime is Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
+scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP
+0.54.1. The separate environment preserves the default Python 3.10+ support
+claim.
 
-Acceptance gate: publish a new immutable real directory and ZIP for all four
-models, obtain `PASS` from directory and ZIP verification, and report results
-only from the generated final summary and additivity report. That real run is
-pending; no run ID, top feature, or checksum is claimed in this plan. A
-read-only API schema and dashboard presentation remain a separate additive
-task. Explanations must follow
+Every one of 184 rows passed: M-001 max/mean absolute error
+`5.78484978308591e-06` / `5.781760213738571e-06`, M-002
+`4.302598055616613e-09` / `7.864803434113863e-10`, M-003
+`2.7466758000471714e-05` / `2.7464541568790406e-05`, and M-004
+`1.5920226559273942e-07` / `3.5509845686483396e-08`. The respective tolerances
+were `5e-5`, `5e-5`, `5e-5`, and `1e-6`; all failing counts were zero. All
+seven deterministic audit categories were available for all four models.
+
+The ordered top five features are M-001 (`close_lag_1`,
+`return_volatility_5`, `close`, `close_lag_5`, `ma_20`), M-002
+(`return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`), M-003
+(`close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5`), and
+M-004 (`ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`). The
+reported agreement correlations/top-five overlaps are M-001/M-002
+`0.8228070175438595`/4, M-001/M-003 `0.8210526315789475`/5, and M-002/M-003
+`0.7543859649122807`/4. The disagreement pairs are M-001/M-004
+`0.5964912280701754`/4, M-003/M-004 `0.6175438596491227`/4, and M-002/M-004
+`0.7`/4.
+
+The next acceptance gate is the separate additive read-only API schema and
+dashboard presentation. Explanations must follow
 [`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md) and describe
-model behavior, not causality or financial advice.
+model behavior, not causality, profitability, or future results. The evidence
+reuses a previously exposed holdout and covers one stock, one period, one
+feature family, and four tree configurations. Academic simulation; not
+financial advice.
 
 ### 8. Additional stocks
 

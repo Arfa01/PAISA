@@ -107,7 +107,8 @@ guarantee that removing the feature would reduce performance by that share.
 
 Impurity-based Random Forest importance and SHAP importance are different
 quantities. Do not use the pre-existing `feature_importance.csv` as a substitute
-for the pending SHAP pack or claim the two should have identical ranks.
+for verified pack `XAI-20261024-140320-OGDC-tree-v1` or claim the two should
+have identical ranks.
 
 ## Cross-model comparison
 
@@ -193,9 +194,41 @@ Any result summary must disclose:
 - no causal or future-performance claim; and
 - the exact academic disclaimer: “Academic simulation; not financial advice.”
 
-Until an official pack has been generated and verified, documentation must say
-that real SHAP results are pending. Do not fill top-feature, agreement, error,
-run-ID, or ZIP-checksum fields from the tiny dependency smoke test.
+## Accepted evidence reference
+
+The accepted local schema-1.0 pack is
+`XAI-20261024-140320-OGDC-tree-v1`, produced from clean commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its exact 24-file inventory and
+quality report are `PASS`; the ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
+all passed. Cite results from that verified pack, not from the dependency smoke
+test or impurity-based importance.
+
+For M-001 through M-004 respectively, the maximum/mean absolute additivity
+errors were `5.78484978308591e-06` / `5.781760213738571e-06`,
+`4.302598055616613e-09` / `7.864803434113863e-10`,
+`2.7466758000471714e-05` / `2.7464541568790406e-05`, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08`. Every one of 184 rows per
+model passed the applicable `5e-5` Random Forest or `1e-6` XGBoost tolerance,
+and all seven audit categories were available for every model.
+
+The ordered top five features are:
+
+- M-001: `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20`;
+- M-002: `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`;
+- M-003: `close`, `ma_20`, `close_lag_1`, `close_lag_5`,
+  `return_volatility_5`; and
+- M-004: `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`.
+
+The reported Spearman/top-five-overlap agreement pairs are M-001/M-002
+`0.8228070175438595`/4, M-001/M-003 `0.8210526315789475`/5, and M-002/M-003
+`0.7543859649122807`/4. The disagreement pairs are M-001/M-004
+`0.5964912280701754`/4, M-003/M-004 `0.6175438596491227`/4, and M-002/M-004
+`0.7`/4. Interpret these only as rank-pattern evidence for one stock, one
+period, one feature family, and four fitted tree configurations on a previously
+exposed shared holdout. They do not establish causality, profitability, or
+future results. Academic simulation; not financial advice.
 
 ## Review checklist
 

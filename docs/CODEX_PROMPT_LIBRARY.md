@@ -89,6 +89,16 @@ artifacts/explainability as output. Use a fresh immutable XAI ID. Verify both
 the published directory and its ZIP/sidecar with
 scripts/verify_explainability_run.py. Do not commit the generated pack.
 
+The current accepted reference pack is
+XAI-20261024-140320-OGDC-tree-v1, produced from clean commit
+2cd4145e5e01459d13d186a6f3b697e979821a9d. Its exact inventory is 24 files,
+quality is PASS, and ZIP SHA-256 is
+7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1.
+Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
+passed. Verify that pack directly when the task is review or reproduction; a
+new execution must still use a new collision-free ID and must not alter this
+reference.
+
 Report the observed run ID, package versions, registered model IDs, output
 space, row/feature counts, maximum and mean additivity errors, top features,
 rank agreements/disagreements, audit categories, quality status, relative
@@ -96,6 +106,10 @@ artifact name, and ZIP SHA-256 directly from the verified pack. If execution
 fails, preserve the source artifacts, report the exact failing gate, and do not
 publish or describe a false PASS. Use model-behavior language only; do not make
 causal, profitability, future-performance, or financial-advice claims.
+For the accepted reference, the expected scope is all M-001--M-004, 184 shared
+holdout rows, 19 transformed features, positive-class probability output, and
+all seven audit categories available for every model. Treat any divergence as
+a verification failure, not as a documentation update.
 ```
 
 ## Read-only review

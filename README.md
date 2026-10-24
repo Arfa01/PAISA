@@ -30,7 +30,7 @@ proposal and early-v0 context.
 | [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
 | [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Authoritative `CMP-20261024-OGDC-price-only-02` M-001–M-006 pack, full offline semantic replay, portable ZIP/checksum, and separate tabular outcomes. |
 | [Shared project holdout policy](docs/SHARED_HOLDOUT_POLICY.md) | Normative terminology, selection boundary, and separate-outcome rules for presenting the M-001–M-006 comparison. |
-| [Tree-model SHAP explainability](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md) | M-001–M-004 SHAP producer, trusted-model boundary, isolated runtime, immutable pack, offline verification, and pending-real-run status. |
+| [Tree-model SHAP explainability](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md) | M-001–M-004 SHAP producer, trusted-model boundary, isolated runtime, immutable pack, offline verification, and authoritative `XAI-20261024-140320-OGDC-tree-v1` results. |
 | [Explainability data contract](docs/EXPLAINABILITY_DATA_CONTRACT.md) | Normative feature-matrix, local/global attribution, additivity, audit-sample, manifest, and portable-verifier schemas. |
 | [SHAP interpretation policy](docs/SHAP_INTERPRETATION_POLICY.md) | Permitted model-behavior language, output-space rules, cross-model limits, and prohibited causal or advice claims. |
 | [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
@@ -79,8 +79,8 @@ proposal and early-v0 context.
   leakage-safe availability filtering.
 - Immutable tree-SHAP explanation packs for M-001 through M-004, with trusted
   model loading, exact 184-date alignment, probability-space additivity,
-  deterministic audit samples, and model-free offline verification. An
-  official retained real pack is still pending.
+  deterministic audit samples, and model-free offline verification. Official
+  retained run `XAI-20261024-140320-OGDC-tree-v1` has quality status `PASS`.
 
 ## Recommended first run
 
@@ -675,10 +675,28 @@ python scripts/run_tree_shap_explainability.py \
 The output is a collision-refusing directory plus deterministic ZIP and
 SHA-256 sidecar. Its portable verifier recomputes derived explanation tables
 from the long-form local rows and does not load joblib or XGBoost binaries.
-Generated packs remain ignored by Git. The producer and compatibility smoke
-are implemented, but no official retained 184-row run ID, top-feature result,
-or ZIP checksum is claimed here until a real pack passes both directory and ZIP
-verification.
+Generated packs remain ignored by Git. The official retained pack is
+`XAI-20261024-140320-OGDC-tree-v1`, produced from clean commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`; its ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1` and
+its quality status is `PASS`. All four models explain the same `184 × 19`
+matrix in positive-class probability space, and all seven deterministic audit
+categories are available for every model.
+
+| Model | Top five global features, in rank order | Maximum / mean absolute additivity error |
+|---|---|---:|
+| `M-001` | `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20` | `5.78484978308591e-06` / `5.781760213738571e-06` |
+| `M-002` | `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14` | `4.302598055616613e-09` / `7.864803434113863e-10` |
+| `M-003` | `close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5` | `2.7466758000471714e-05` / `2.7464541568790406e-05` |
+| `M-004` | `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open` | `1.5920226559273942e-07` / `3.5509845686483396e-08` |
+
+Every one of the 184 rows per model passes its declared tolerance. The
+strongest rank agreement is `M-001`/`M-002` at `0.8228070175438595`; the
+official summary also identifies the three comparisons involving `M-004` as
+the rank-disagreement group (`0.5964912280701754` to `0.7`). Validation at the
+official revision completed with `1339 passed, 2 skipped, 6 warnings` in the
+backend and `132 passed` across 10 frontend test files, plus passing frontend
+lint and build.
 
 See the [runbook](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
 contract](docs/EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
@@ -1119,9 +1137,10 @@ price-period overlap, and
 the permitted archive cannot retroactively prove historical cutoff
 availability. A licensed overlapping corpus with defensible timing remains the
 gate before daily aggregation or controlled price-plus-sentiment experiments.
-The tree-model SHAP producer and portable verifier are implemented, while the
-official retained explanation run and any read-only API/dashboard explanation
-view remain pending. Relationship graphs also remain future work. See
+The tree-model SHAP producer, portable verifier, and official retained
+`XAI-20261024-140320-OGDC-tree-v1` evidence pack are complete, while any
+read-only API/dashboard explanation view remains pending. Relationship graphs
+also remain future work. See
 [`docs/REMAINING_ROADMAP.md`](docs/REMAINING_ROADMAP.md) for the current
 dependency order; [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) is
 retained as the earlier detailed research plan.

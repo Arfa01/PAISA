@@ -208,20 +208,42 @@ financial advice, and are not evidence of future performance.
 
 ## Tree-model SHAP interpretation status
 
-The M-001 through M-004 explainability producer and offline verifier are
-implemented, but an official retained 184-row `XAI-...` pack is still pending.
-Accordingly, this document does not claim a top SHAP feature, cross-model rank
-agreement, additivity result, run ID, or ZIP checksum. Stored Random Forest
-impurity importance and the tiny dependency smoke test are not substitutes for
-that missing real evidence.
-
-When the real pack passes directory and ZIP verification, interpret it as a
-decomposition of each fitted model's class-1 probability relative to 100
+Official retained pack `XAI-20261024-140320-OGDC-tree-v1` was produced from
+clean commit `2cd4145e5e01459d13d186a6f3b697e979821a9d`, passed directory and
+ZIP verification, and records quality status `PASS`. Its ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+It explains each fitted model's class-1 probability over the exact `184 × 19`
+shared project holdout matrix relative to 100
 deterministically selected chronological training rows. A positive SHAP value
 increases the reconstructed `probability_up` relative to the expected value; a
 negative value decreases it. Every direct probability must equal the expected
 value plus its feature contributions within the declared estimator-family
 tolerance (`5e-5` for Random Forest, `1e-6` for XGBoost).
+
+| Model | Top five global features, in rank order | Maximum / mean absolute additivity error |
+|---|---|---:|
+| `M-001` | `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20` | `5.78484978308591e-06` / `5.781760213738571e-06` |
+| `M-002` | `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14` | `4.302598055616613e-09` / `7.864803434113863e-10` |
+| `M-003` | `close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5` | `2.7466758000471714e-05` / `2.7464541568790406e-05` |
+| `M-004` | `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open` | `1.5920226559273942e-07` / `3.5509845686483396e-08` |
+
+All 184 rows pass tolerance for every model, and all seven audit categories are
+available: both highest-confidence classes, correct positive, correct negative,
+false positive, false negative, and largest absolute additivity error.
+
+The Random-Forest pairings are the recorded rank agreements:
+`M-001`/`M-002` has Spearman correlation `0.8228070175438595` and `4/5`
+top-feature overlap; `M-001`/`M-003` has `0.8210526315789475` and `5/5`; and
+`M-002`/`M-003` has `0.7543859649122807` and `4/5`. The `M-004` comparisons
+are the recorded disagreements: `M-001`/`M-004` is `0.5964912280701754`,
+`M-003`/`M-004` is `0.6175438596491227`, and `M-002`/`M-004` is `0.7`; each
+shares four of the top five features.
+
+The recorded environment is Python `3.13.7`, SHAP `0.54.1`, NumPy `2.3.5`,
+pandas `2.3.3`, scikit-learn `1.9.1`, XGBoost `3.4.1`, joblib `1.6.0`, and
+Matplotlib `3.11.2`. Final validation completed with
+`1339 passed, 2 skipped, 6 warnings` in the backend and `132 passed` across 10
+frontend test files, plus passing frontend lint and build.
 
 That numerical reconstruction does not establish model accuracy, calibration,
 economic causality, profitability, or future performance. `actual_class` is an
@@ -241,4 +263,5 @@ period, one technical-feature family, and four fitted tree configurations. See
 [the explainability runbook](TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
 contract](EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
 policy](SHAP_INTERPRETATION_POLICY.md). All explanation output is an academic
-simulation and model-behavior analysis, not financial advice.
+simulation and model-behavior analysis, not financial advice or evidence of
+future performance.

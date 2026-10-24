@@ -9,8 +9,9 @@ and coverage artifacts. Commands below that name a `NEWS-...`, `COVERAGE-...`,
 `SENT-...`, `TRN-...`, `VSL-...`, `CMP-...`, or `XAI-...` identity are therefore marked
 **artifact-present**: obtain a checksum-verified custodian export as documented
 in [`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs.
-The repository does not publish a download URL or a fixed checksum for those
-local archives.
+The repository does not publish a download URL for those local archives. When
+this guide records an accepted pack checksum, treat it as descriptive evidence;
+verify the sidecar transferred with the archive rather than trusting prose.
 
 ## 1. Clone the repo
 
@@ -898,7 +899,8 @@ Record the newly printed `XAI-...` run ID. Existing directory, ZIP, or sidecar
 targets are never overwritten. Verify the published directory:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+# Accepted retained pack; replace when verifying a newly emitted run ID.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID"
 ```
@@ -906,7 +908,8 @@ python scripts/verify_explainability_run.py \
 The ZIP/sidecar pair can be moved together and verified without source models:
 
 ```bash
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+# Accepted retained pack; replace when verifying a newly emitted run ID.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
   --checksum \
@@ -918,13 +921,39 @@ project holdout, model and feature identities, additivity, global metrics,
 cross-model ranks, deterministic audit sample, portable paths, and prohibited
 causal language. It does not deserialize joblib or load XGBoost binaries.
 
-An official retained real explanation run has not yet been recorded in the
-repository documentation. Do not substitute smoke-test errors or the old
-impurity-based `feature_importance.csv` for real SHAP results. See the
+The accepted local pack is
+`artifacts/explainability/XAI-20261024-140320-OGDC-tree-v1/` with its sibling
+ZIP and sidecar. It was produced from clean implementation commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`; the ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+The 24-file pack reports `PASS`, and directory-plus-checksum, ZIP-plus-sidecar,
+and extracted offline verification all passed.
+
+All four models explain 184 rows and 19 transformed features in positive-class
+probability space. The observed maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06` for M-001,
+`4.302598055616613e-09` / `7.864803434113863e-10` for M-002,
+`2.7466758000471714e-05` / `2.7464541568790406e-05` for M-003, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08` for M-004. All 184 rows
+per model passed the declared `5e-5` Random Forest or `1e-6` XGBoost gate, and
+all seven audit categories were available for every model.
+
+The ordered top five features were:
+
+- M-001: `close_lag_1`, `return_volatility_5`, `close`, `close_lag_5`, `ma_20`;
+- M-002: `return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`;
+- M-003: `close`, `ma_20`, `close_lag_1`, `close_lag_5`,
+  `return_volatility_5`; and
+- M-004: `ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`.
+
+These are verified SHAP results, not the old impurity-based
+`feature_importance.csv`. See the
 [explainability runbook](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
 contract](docs/EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
 policy](docs/SHAP_INTERPRETATION_POLICY.md). These explanations describe fitted
-model behavior, not economic causality or financial advice.
+model behavior on a previously exposed shared holdout, not economic causality,
+profitability, or future performance. Academic simulation; not financial
+advice.
 
 ## Run a versioned OGDC backtest
 

@@ -24,6 +24,7 @@ causality.
 | class order | exactly `[0, 1]` |
 | output space | `probability` |
 | SHAP version | exactly `0.54.1` |
+| prediction replay tolerance | absolute `1e-6`, zero relative tolerance |
 | numerical tolerance | `5e-5` for `random_forest`; `1e-6` for `xgboost` |
 | disclaimer | `Academic simulation; not financial advice.` |
 
@@ -42,9 +43,10 @@ The training source fingerprint is
 the ordered 184 holdout-key records is
 `730755ddb7993d829ddd4d7f5afaec4d5ca5617311d642f4a33722d251a5a85a`.
 `source_run_references.json` also binds each registered model ID, algorithm,
-model binary digest, model-manifest digest, and copied comparison-prediction
-digest. Paths in this file are logical relative names; absolute host paths are
-forbidden.
+model binary digest, model-manifest digest, and authoritative
+comparison-prediction source digest. The digest is recorded in the evidence;
+the source prediction payload need not be copied into the portable pack. Paths
+in this file are logical relative names; absolute host paths are forbidden.
 
 ## Model identities
 
@@ -58,6 +60,11 @@ forbidden.
 A stable ID, registered ID, algorithm, estimator class, binary digest, or
 manifest digest mismatch is fatal. Model IDs are data, not aliases that a
 caller may remap.
+
+After trusted loading, the producer replays both class probabilities from each
+fitted pipeline and requires them to match the checksum-bound comparison
+predictions within absolute `1e-6` and zero relative tolerance. This inference
+replay gate is separate from the estimator-family SHAP additivity tolerances.
 
 ## Feature-matrix contract
 
@@ -241,8 +248,10 @@ the model output rather than causality.
 
 PNG files are presentation derivatives. Global plots display the leading mean
 absolute values for one model in class-1 probability space. The cross-model
-plot displays ranks. The CSV/JSON evidence, not pixels, is the semantic source
-of record.
+plot displays ranks. Every PNG visibly carries the exact academic-simulation
+and not-financial-advice disclaimer so it remains qualified when viewed apart
+from the pack. The CSV/JSON evidence, not pixels, is the semantic source of
+record.
 
 ## Run, quality, and artifact manifests
 
@@ -282,6 +291,33 @@ Any mismatch fails verification. The verifier cannot attest that model
 inference originally ran correctly on an untrusted host; it attests that the
 portable pack is internally consistent with this sealed contract and its fixed
 source identities.
+
+## Accepted schema-1.0 instance
+
+The accepted local pack is `XAI-20261024-140320-OGDC-tree-v1`, produced from
+clean code version/source fingerprint
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its exact inventory contains 24
+files, its quality status is `PASS`, and its ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Directory-plus-checksum, ZIP-plus-sidecar, and extracted offline verification
+all passed. The manifest records Python 3.13.7, NumPy 2.3.5, pandas 2.3.3,
+scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib 3.11.2, and SHAP
+0.54.1.
+
+All four model records contain 184 rows and 19 transformed features in
+positive-class probability space. M-001 through M-004 respectively report
+maximum/mean absolute additivity errors of
+`5.78484978308591e-06` / `5.781760213738571e-06`,
+`4.302598055616613e-09` / `7.864803434113863e-10`,
+`2.7466758000471714e-05` / `2.7464541568790406e-05`, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08`. Their tolerances are
+`5e-5`, `5e-5`, `5e-5`, and `1e-6`; all 184 rows per model passed, with zero
+failures. All seven audit categories were available for every model.
+
+This is evidence about one stock, one period, one feature family, and four
+fitted tree configurations on a previously exposed shared project holdout. It
+does not establish causality, profitability, or future results. Academic
+simulation; not financial advice.
 
 ## Immutability and permissions
 

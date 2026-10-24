@@ -144,11 +144,46 @@ evidence. Contemporaneous source packs use
 `artifacts/contemporaneous_evidence/<run_id>/`, while four-profile audits use
 `artifacts/evidence_coverage/<run_id>/`. Tree-model explanations use
 `artifacts/explainability/<run_id>/`, `<run_id>.zip`, and
-`<run_id>.zip.sha256`. The implementation and isolated compatibility smoke are
-present, but no official retained real `XAI-...` run is accepted yet. Never
-overwrite an existing model, experiment, portfolio, or run ID.
+`<run_id>.zip.sha256`. The accepted local pack is
+`XAI-20261024-140320-OGDC-tree-v1`; its ZIP SHA-256 is
+`7876ed3dba620c3c6fcb6213302001ac4a42518cf0ef3d8c951b2c2fc2af13a1`.
+Never overwrite an existing model, experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
+
+The accepted explanation pack was produced from clean implementation commit
+`2cd4145e5e01459d13d186a6f3b697e979821a9d`. Its 24-file inventory and quality
+report are `PASS`; directory-plus-checksum, ZIP-plus-sidecar, and extracted
+offline verification passed. The manifest records Python 3.13.7, NumPy 2.3.5,
+pandas 2.3.3, scikit-learn 1.9.1, XGBoost 3.4.1, joblib 1.6.0, Matplotlib
+3.11.2, and SHAP 0.54.1. All M-001--M-004 results cover the exact 184-row
+shared project holdout and 19 transformed features in positive-class
+probability space. Every row passed its family tolerance; all seven audit
+categories were available for every model.
+
+The model-wise maximum/mean absolute additivity errors were
+`5.78484978308591e-06` / `5.781760213738571e-06` for M-001,
+`4.302598055616613e-09` / `7.864803434113863e-10` for M-002,
+`2.7466758000471714e-05` / `2.7464541568790406e-05` for M-003, and
+`1.5920226559273942e-07` / `3.5509845686483396e-08` for M-004. The code-stage
+validation recorded 1,339 backend tests passed with two skipped and six
+warnings, 111 focused tests passed, 132 frontend tests passed, and passing
+doctor, dependency, bytecode-compilation, frontend lint, frontend build, and
+diff checks.
+
+The ordered top five features are M-001 (`close_lag_1`,
+`return_volatility_5`, `close`, `close_lag_5`, `ma_20`), M-002
+(`return_volatility_5`, `close_lag_5`, `close`, `ma_20`, `rsi_14`), M-003
+(`close`, `ma_20`, `close_lag_1`, `close_lag_5`, `return_volatility_5`), and
+M-004 (`ma_20`, `close`, `close_lag_5`, `return_volatility_5`, `open`). The
+Spearman/top-five-overlap agreement pairs are M-001/M-002
+`0.8228070175438595`/4, M-001/M-003 `0.8210526315789475`/5, and M-002/M-003
+`0.7543859649122807`/4; the disagreement pairs are M-001/M-004
+`0.5964912280701754`/4, M-003/M-004 `0.6175438596491227`/4, and M-002/M-004
+`0.7`/4. These attributions describe fitted-model behavior on a previously
+exposed shared holdout. They cover one stock, one period, one feature family,
+and four tree configurations; they do not establish causality, profitability,
+or future results. Academic simulation; not financial advice.
 
 The accepted local LSTM run is `LSTM-20261024-OGDC-price-only-02`. It was
 executed on CPU from clean source commit
@@ -1006,10 +1041,10 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    post-freeze test balanced accuracy. After the sentiment coverage gate passes,
    train paired price-only and price-plus-sentiment experiments without using
    test results for selection.
-4. Add SHAP result views only after a real `XAI-...` directory and ZIP verify
-   and Waqas exposes the validated read-only API schema. Consume persisted
-   evidence without recalculating SHAP in React; explain model behavior, not
-   causality.
+4. Use verified pack `XAI-20261024-140320-OGDC-tree-v1` when adding SHAP result
+   views after Waqas exposes the validated read-only API schema. Consume
+   persisted evidence without recalculating SHAP in React; explain model
+   behavior, not causality.
 5. Extend dashboard components and client schemas without recalculating backend
    metrics in React.
 6. Lead additional-stock data quality, evaluation, screenshots, and supervisor
@@ -1162,8 +1197,9 @@ python scripts/run_tree_shap_explainability.py \
   artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
   --output-dir artifacts/explainability
 
-# Replace this value only after the producer prints the new published ID.
-PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+# Verify the accepted immutable local evidence pack. Replace only when
+# verifying the fresh run ID emitted by the producer above.
+PAISA_XAI_RUN_ID="XAI-20261024-140320-OGDC-tree-v1"
 python scripts/verify_explainability_run.py \
   "artifacts/explainability/$PAISA_XAI_RUN_ID"
 python scripts/verify_explainability_run.py \

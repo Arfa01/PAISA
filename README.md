@@ -30,6 +30,9 @@ proposal and early-v0 context.
 | [Price-only LSTM experiments](docs/LSTM_PRICE_ONLY_EXPERIMENTS.md) | Reproducible M-005/M-006 execution, comparison, artifact, and reporting runbook. |
 | [Unified price-only model comparison](docs/UNIFIED_PRICE_MODEL_COMPARISON.md) | Authoritative `CMP-20261024-OGDC-price-only-02` M-001–M-006 pack, full offline semantic replay, portable ZIP/checksum, and separate tabular outcomes. |
 | [Shared project holdout policy](docs/SHARED_HOLDOUT_POLICY.md) | Normative terminology, selection boundary, and separate-outcome rules for presenting the M-001–M-006 comparison. |
+| [Tree-model SHAP explainability](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md) | M-001–M-004 SHAP producer, trusted-model boundary, isolated runtime, immutable pack, offline verification, and pending-real-run status. |
+| [Explainability data contract](docs/EXPLAINABILITY_DATA_CONTRACT.md) | Normative feature-matrix, local/global attribution, additivity, audit-sample, manifest, and portable-verifier schemas. |
+| [SHAP interpretation policy](docs/SHAP_INTERPRETATION_POLICY.md) | Permitted model-behavior language, output-space rules, cross-model limits, and prohibited causal or advice claims. |
 | [LSTM sequence contract](docs/LSTM_SEQUENCE_CONTRACT.md) | Normative 20-session target alignment, split-boundary, and train-only preprocessing rules. |
 | [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md) | End-to-end component, data-flow, timing, and trust-boundary overview. |
 | [Known limitations](docs/KNOWN_LIMITATIONS.md) | Data, methodology, operational, and research limitations. |
@@ -74,6 +77,10 @@ proposal and early-v0 context.
 - Reproducible article-level FinBERT inference with immutable model/tokenizer
   revisions, explicit class mapping, bounded batching, SQLite persistence, and
   leakage-safe availability filtering.
+- Immutable tree-SHAP explanation packs for M-001 through M-004, with trusted
+  model loading, exact 184-date alignment, probability-space additivity,
+  deterministic audit samples, and model-free offline verification. An
+  official retained real pack is still pending.
 
 ## Recommended first run
 
@@ -633,6 +640,51 @@ bytecode-compilation, and diff checks. See the
 contract](docs/LSTM_SEQUENCE_CONTRACT.md), and [training-stage
 documentation](docs/model_training_stage.md).
 
+## Tree-model SHAP explainability
+
+The additive explainability stage covers only the retained M-001 through M-004
+tree classifiers. It consumes the authoritative training, unified-comparison,
+and vertical-slice evidence without retraining or changing a model. Each model
+is explained for class `1` in probability space over the exact 184-date shared
+project holdout, using `shap==0.54.1`, interventional Tree SHAP, 100
+deterministically selected training-background rows, and the original fitted
+median imputer. Additivity must pass the strict estimator-family tolerance for
+every row: `5e-5` for Random Forest and `1e-6` for XGBoost.
+
+SHAP 0.54.1 requires Python 3.12+ and NumPy 2+, so use a separate environment;
+Python 3.13 matches the authoritative serialization runtime most closely:
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+```
+
+The output is a collision-refusing directory plus deterministic ZIP and
+SHA-256 sidecar. Its portable verifier recomputes derived explanation tables
+from the long-form local rows and does not load joblib or XGBoost binaries.
+Generated packs remain ignored by Git. The producer and compatibility smoke
+are implemented, but no official retained 184-row run ID, top-feature result,
+or ZIP checksum is claimed here until a real pack passes both directory and ZIP
+verification.
+
+See the [runbook](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
+contract](docs/EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
+policy](docs/SHAP_INTERPRETATION_POLICY.md). Attribution describes fitted-model
+behavior, not economic causality or financial advice.
+
 ## Versioned OGDC backtesting
 
 The backtesting engine consumes a standardized prediction CSV, daily OGDC
@@ -1025,9 +1077,11 @@ PAISA/
 ├── docs/
 ├── frontend/         # React + TypeScript read-only results dashboard
 ├── models/           # generated model artifacts
+├── artifacts/explainability/ # generated immutable tree-SHAP packs
 ├── scripts/
 ├── src/paisa/
 │   ├── api/
+│   ├── explainability/ # tree-SHAP producer and portable verifier
 │   ├── models/
 │   ├── news/         # isolated news providers, contracts, storage, and pipeline
 │   ├── providers/
@@ -1065,7 +1119,9 @@ price-period overlap, and
 the permitted archive cannot retroactively prove historical cutoff
 availability. A licensed overlapping corpus with defensible timing remains the
 gate before daily aggregation or controlled price-plus-sentiment experiments.
-SHAP and relationship graphs also remain future work. See
+The tree-model SHAP producer and portable verifier are implemented, while the
+official retained explanation run and any read-only API/dashboard explanation
+view remain pending. Relationship graphs also remain future work. See
 [`docs/REMAINING_ROADMAP.md`](docs/REMAINING_ROADMAP.md) for the current
 dependency order; [`docs/NEXT_PHASE_PLAN.md`](docs/NEXT_PHASE_PLAN.md) is
 retained as the earlier detailed research plan.

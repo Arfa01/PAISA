@@ -6,7 +6,7 @@ dashboard from a fresh clone.
 Source installation, offline tests, and newly generated runs work from a fresh
 clone. Git intentionally excludes retained model, news, database, sentiment,
 and coverage artifacts. Commands below that name a `NEWS-...`, `COVERAGE-...`,
-`SENT-...`, `TRN-...`, or `VSL-...` identity are therefore marked
+`SENT-...`, `TRN-...`, `VSL-...`, `CMP-...`, or `XAI-...` identity are therefore marked
 **artifact-present**: obtain a checksum-verified custodian export as documented
 in [`docs/TEAM_HANDOFF.md`](docs/TEAM_HANDOFF.md), or regenerate with new IDs.
 The repository does not publish a download URL or a fixed checksum for those
@@ -53,6 +53,22 @@ sentiment stage:
 
 ```bash
 python -m pip install -r requirements-sentiment.txt
+```
+
+Tree-model SHAP generation is another optional, isolated runtime. The pinned
+`shap==0.54.1` requires Python 3.12+ and NumPy 2+, while the default PAISA
+package continues to support Python 3.10+. Use Python 3.13 to match the retained
+model serialization environment most closely:
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
 ```
 
 ## 4. Generate PSX data, features, dataset, and baseline model
@@ -849,6 +865,66 @@ summary as a substitute artifact. See the [LSTM experiment runbook](docs/LSTM_PR
 [`docs/model_training_stage.md`](docs/model_training_stage.md) for the full
 contract and artifact layout. All outputs are an academic simulation and not
 financial advice.
+
+## Run tree-model SHAP explanations
+
+This is an **artifact-present** workflow. Restore all three fixed source roots
+before running it:
+
+```text
+artifacts/model_training/TRN-20261020-191815-624662-nogit/
+artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02/
+artifacts/vertical_slice/VSL-20261020-OGDC-main-02/
+```
+
+The generator explains M-001 through M-004 only. It does not retrain a model,
+explain either LSTM, or change a source artifact. Models are loaded only from
+the trusted training root after manifest and binary checksums pass. The
+portable result contains no executable model.
+
+```bash
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+```
+
+Record the newly printed `XAI-...` run ID. Existing directory, ZIP, or sidecar
+targets are never overwritten. Verify the published directory:
+
+```bash
+PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+```
+
+The ZIP/sidecar pair can be moved together and verified without source models:
+
+```bash
+PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+```
+
+The verifier checks the exact inventory and checksums, exact 184-date shared
+project holdout, model and feature identities, additivity, global metrics,
+cross-model ranks, deterministic audit sample, portable paths, and prohibited
+causal language. It does not deserialize joblib or load XGBoost binaries.
+
+An official retained real explanation run has not yet been recorded in the
+repository documentation. Do not substitute smoke-test errors or the old
+impurity-based `feature_importance.csv` for real SHAP results. See the
+[explainability runbook](docs/TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
+contract](docs/EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
+policy](docs/SHAP_INTERPRETATION_POLICY.md). These explanations describe fitted
+model behavior, not economic causality or financial advice.
 
 ## Run a versioned OGDC backtest
 

@@ -69,6 +69,21 @@ this configuration to non-commercial academic use:
 python -m pip install -r requirements-sentiment.txt
 ```
 
+Run tree-model explanations only in a separate Python 3.12+ / NumPy 2+
+environment. Python 3.13 matches the retained model runtime; the default PAISA
+environment continues to support Python 3.10+.
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
+```
+
 ## Current component entry points
 
 | Component | Primary entry points |
@@ -77,6 +92,7 @@ python -m pip install -r requirements-sentiment.txt
 | Experiment data and targets | `src/paisa/experiments/training_features.py`, `src/paisa/experiments/training_targets.py`, `src/paisa/splits.py` |
 | Model training and evaluation | `src/paisa/experiments/trainer.py`, `src/paisa/experiments/evaluation.py`, `src/paisa/experiments/artifacts.py`, `src/paisa/experiments/registry.py`, `scripts/train_ogdc_models.py` |
 | Price-only LSTM experiments | `src/paisa/experiments/lstm.py`, `src/paisa/experiments/lstm_runner.py`, `scripts/run_lstm_price_only_experiments.py`, `notebooks/PAISA_OGDC_LSTM_Experiments.ipynb`, `docs/LSTM_PRICE_ONLY_EXPERIMENTS.md`, `docs/LSTM_SEQUENCE_CONTRACT.md` |
+| Tree-model SHAP evidence | `src/paisa/explainability/tree_shap.py`, `scripts/run_tree_shap_explainability.py`, `scripts/verify_explainability_run.py`, `docs/TREE_MODEL_SHAP_EXPLAINABILITY.md`, `docs/EXPLAINABILITY_DATA_CONTRACT.md`, `docs/SHAP_INTERPRETATION_POLICY.md` |
 | Decision policy and portfolio | `src/paisa/trading/policy.py`, `src/paisa/trading/execution.py`, `src/paisa/trading/portfolio.py`, `src/paisa/trading/models.py` |
 | Backtesting and benchmarks | `src/paisa/backtesting/engine.py`, `src/paisa/backtesting/metrics.py`, `src/paisa/backtesting/benchmarks.py`, `src/paisa/backtesting/reports.py`, `scripts/run_backtest.py` |
 | End-to-end orchestration | `src/paisa/vertical_slice.py`, `scripts/run_ogdc_vertical_slice.py` |
@@ -126,8 +142,11 @@ news evidence, `artifacts/news_coverage/<run_id>/` for immutable price-overlap
 audits, and `artifacts/sentiment_inference/<run_id>/` for article-level sentiment
 evidence. Contemporaneous source packs use
 `artifacts/contemporaneous_evidence/<run_id>/`, while four-profile audits use
-`artifacts/evidence_coverage/<run_id>/`. Never overwrite an existing model,
-experiment, portfolio, or run ID.
+`artifacts/evidence_coverage/<run_id>/`. Tree-model explanations use
+`artifacts/explainability/<run_id>/`, `<run_id>.zip`, and
+`<run_id>.zip.sha256`. The implementation and isolated compatibility smoke are
+present, but no official retained real `XAI-...` run is accepted yet. Never
+overwrite an existing model, experiment, portfolio, or run ID.
 Do not commit datasets, downloaded transformer weights, model binaries, run
 artifacts, `frontend/dist/`, local environments, or secrets.
 
@@ -987,8 +1006,10 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    post-freeze test balanced accuracy. After the sentiment coverage gate passes,
    train paired price-only and price-plus-sentiment experiments without using
    test results for selection.
-4. Add SHAP result views only after Waqas exposes a validated artifact/API
-   schema; explain model behavior, not causality.
+4. Add SHAP result views only after a real `XAI-...` directory and ZIP verify
+   and Waqas exposes the validated read-only API schema. Consume persisted
+   evidence without recalculating SHAP in React; explain model behavior, not
+   causality.
 5. Extend dashboard components and client schemas without recalculating backend
    metrics in React.
 6. Lead additional-stock data quality, evaluation, screenshots, and supervisor
@@ -1012,7 +1033,9 @@ stock price/feature/dataset routes, `/models/baseline/metrics`, and
    relationship/knowledge-graph component only after its contract is written.
 5. Extend `src/paisa/api/schemas.py`, `src/paisa/api/artifact_repository.py`,
    and `src/paisa/api/router_v1.py` additively for news, sentiment,
-   explanations, and relationships; keep GET requests read-only.
+   explanations, and relationships; keep GET requests read-only. For SHAP,
+   validate a small portable fixture with the offline verifier and never load a
+   model in a GET request.
 6. Provide contract fixtures and API tests for each new result before dashboard
    integration.
 
@@ -1125,6 +1148,29 @@ python scripts/run_lstm_price_only_experiments.py \
   --run-id "$PAISA_NEW_LSTM_RUN_ID" \
   --baseline-training-run artifacts/model_training/TRN-20261020-191815-624662-nogit \
   --baseline-vertical-slice artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+
+# Optional isolated tree-SHAP evidence for retained M-001 through M-004.
+# SHAP 0.54.1 requires Python 3.12+ and NumPy 2+; use the dedicated
+# explainability environment and never replace an existing XAI run.
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+
+# Replace this value only after the producer prints the new published ID.
+PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+deactivate
 
 # Full OGDC vertical slice with a new immutable ID. The command still attempts
 # live PSX-DPS first, then validates this complete checksum-bound cache bundle.

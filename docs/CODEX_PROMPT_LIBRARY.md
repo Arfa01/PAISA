@@ -63,6 +63,41 @@ the result unsafe. Otherwise proceed, keep the diff focused, validate it, commit
 push, and open a PR. Do not merge it.
 ```
 
+## Tree-SHAP artifact execution
+
+```text
+<paste the common context block>
+
+Operate the existing tree-model SHAP workflow; do not redesign it or retrain a
+model. Read docs/TREE_MODEL_SHAP_EXPLAINABILITY.md,
+docs/EXPLAINABILITY_DATA_CONTRACT.md, and
+docs/SHAP_INTERPRETATION_POLICY.md first.
+
+Use only these restored, checksum-valid source roots:
+- artifacts/model_training/TRN-20261020-191815-624662-nogit
+- artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02
+- artifacts/vertical_slice/VSL-20261020-OGDC-main-02
+
+Create a separate Python 3.12+ / NumPy 2+ environment and install the exact
+requirements-explainability.txt pin. Confirm `shap==0.54.1` and run `pip check`.
+Explain only M-001 through M-004 over the exact 184-date shared project
+holdout. Do not explain M-005/M-006, refit preprocessing, weaken additivity,
+load an unverified model path, or modify a source artifact.
+
+Run scripts/run_tree_shap_explainability.py with the three fixed inputs and
+artifacts/explainability as output. Use a fresh immutable XAI ID. Verify both
+the published directory and its ZIP/sidecar with
+scripts/verify_explainability_run.py. Do not commit the generated pack.
+
+Report the observed run ID, package versions, registered model IDs, output
+space, row/feature counts, maximum and mean additivity errors, top features,
+rank agreements/disagreements, audit categories, quality status, relative
+artifact name, and ZIP SHA-256 directly from the verified pack. If execution
+fails, preserve the source artifacts, report the exact failing gate, and do not
+publish or describe a false PASS. Use model-behavior language only; do not make
+causal, profitability, future-performance, or financial-advice claims.
+```
+
 ## Read-only review
 
 ```text

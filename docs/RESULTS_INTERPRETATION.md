@@ -205,3 +205,40 @@ the authoritative source bindings, complete schemas, verification commands,
 rankings, limitations, and portable checksum workflow. All predictions,
 trades, returns, and portfolio values are academic simulations, are not
 financial advice, and are not evidence of future performance.
+
+## Tree-model SHAP interpretation status
+
+The M-001 through M-004 explainability producer and offline verifier are
+implemented, but an official retained 184-row `XAI-...` pack is still pending.
+Accordingly, this document does not claim a top SHAP feature, cross-model rank
+agreement, additivity result, run ID, or ZIP checksum. Stored Random Forest
+impurity importance and the tiny dependency smoke test are not substitutes for
+that missing real evidence.
+
+When the real pack passes directory and ZIP verification, interpret it as a
+decomposition of each fitted model's class-1 probability relative to 100
+deterministically selected chronological training rows. A positive SHAP value
+increases the reconstructed `probability_up` relative to the expected value; a
+negative value decreases it. Every direct probability must equal the expected
+value plus its feature contributions within the declared estimator-family
+tolerance (`5e-5` for Random Forest, `1e-6` for XGBoost).
+
+That numerical reconstruction does not establish model accuracy, calibration,
+economic causality, profitability, or future performance. `actual_class` is an
+evaluation-only field and never enters the explainer matrix. Global mean
+absolute attribution measures model-specific magnitude over these 184 rows; it
+is not variance explained or economic importance. Correlated lags, moving
+averages, returns, volatility, RSI, and MACD terms may share attribution.
+
+All four models use probability space, but raw magnitudes remain separated by
+model and are not averaged into a universal importance score. Cross-model rank
+agreement describes similarity of feature ordering only. It does not show that
+models learned the same function or that one is more accurate or profitable.
+
+The explanation population is the already exposed shared project holdout, not
+a fresh independent evaluation. Explanations cover one stock, one historical
+period, one technical-feature family, and four fitted tree configurations. See
+[the explainability runbook](TREE_MODEL_SHAP_EXPLAINABILITY.md), [data
+contract](EXPLAINABILITY_DATA_CONTRACT.md), and [interpretation
+policy](SHAP_INTERPRETATION_POLICY.md). All explanation output is an academic
+simulation and model-behavior analysis, not financial advice.

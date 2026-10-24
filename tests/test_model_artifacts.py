@@ -136,6 +136,68 @@ def test_model_artifact_round_trip_and_collision_are_immutable(tmp_path):
     assert not list(root.glob(".M-001-fixture.*.tmp"))
 
 
+def test_model_loader_accepts_matching_manifest_and_artifact_trust_anchors(tmp_path):
+    model_dir = write_model_artifact(
+        tmp_path / "models",
+        "M-001-anchored",
+        {"estimator": "fixture", "classes": [0, 1]},
+        _complete_manifest("M-001-anchored"),
+    )
+    manifest_sha256 = sha256_file(model_dir / "manifest.json")
+    artifact_sha256 = sha256_file(model_dir / "model.joblib")
+
+    loaded, manifest = load_model_artifact(
+        model_dir,
+        expected_manifest_sha256=manifest_sha256,
+        expected_artifact_sha256=artifact_sha256,
+    )
+
+    assert loaded == {"estimator": "fixture", "classes": [0, 1]}
+    assert manifest["artifact_sha256"] == artifact_sha256
+
+
+def test_model_loader_rejects_wrong_manifest_anchor_before_deserialization(
+    tmp_path, monkeypatch
+):
+    model_dir = write_model_artifact(
+        tmp_path / "models",
+        "M-002-manifest-anchor",
+        {"estimator": "fixture"},
+        _complete_manifest("M-002-manifest-anchor"),
+    )
+    monkeypatch.setattr(
+        "paisa.experiments.artifacts.joblib.load",
+        lambda handle: pytest.fail("untrusted model bytes must not be deserialized"),
+    )
+
+    with pytest.raises(ValueError, match="manifest checksum.*trust anchor"):
+        load_model_artifact(
+            model_dir,
+            expected_manifest_sha256="0" * 64,
+            expected_artifact_sha256=sha256_file(model_dir / "model.joblib"),
+        )
+
+
+def test_model_loader_rejects_wrong_artifact_trust_anchor(tmp_path, monkeypatch):
+    model_dir = write_model_artifact(
+        tmp_path / "models",
+        "M-003-artifact-anchor",
+        {"estimator": "fixture"},
+        _complete_manifest("M-003-artifact-anchor"),
+    )
+    monkeypatch.setattr(
+        "paisa.experiments.artifacts.joblib.load",
+        lambda handle: pytest.fail("untrusted model bytes must not be deserialized"),
+    )
+
+    with pytest.raises(ValueError, match="artifact checksum.*trust anchor"):
+        load_model_artifact(
+            model_dir,
+            expected_manifest_sha256=sha256_file(model_dir / "manifest.json"),
+            expected_artifact_sha256="0" * 64,
+        )
+
+
 def test_model_loader_rejects_checksum_and_unsafe_artifact_path(tmp_path):
     root = tmp_path / "models"
     model_dir = write_model_artifact(

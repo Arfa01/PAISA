@@ -256,14 +256,35 @@ bit-identical.
 
 ### 7. SHAP explanations
 
-Add model-appropriate SHAP analysis for retained model artifacts. Record the
-background/reference data, explainer configuration, class/output explained, and
-library versions. Explanations must describe model behavior, not causality or
-financial advice.
+**Artifact/verifier implementation present; official real execution pending.**
+The additive tree-SHAP workflow is fixed to retained M-001 through M-004 and
+does not retrain, tune, recalibrate, or explain M-005/M-006. It binds the exact
+training, unified-comparison, and vertical-slice integrity roots; verifies model
+identities and binaries before trusted loading; reconstructs the exact 184-date
+shared project holdout; and applies only each pipeline's fitted median imputer.
 
-Acceptance gate: local and aggregate explanations reconcile with the selected
-model and ordered features, remain stable on fixtures, and are served through an
-additive API schema before being displayed by the dashboard.
+Every model uses `shap==0.54.1`, interventional Tree SHAP, class `1`,
+probability output, and 100 evenly spaced rows from the chronological training
+split as background. Every prediction must reconstruct within `5e-5` for
+Random Forest or `1e-6` for XGBoost. Local long-form rows, per-model global
+importance, cross-model ranks, deterministic
+audit examples, manifests, plots, and a portable ZIP are checksum-bound. The
+offline verifier recomputes derived tables without loading a model.
+
+The pin passed an isolated deterministic Random Forest/XGBoost smoke test with
+the authoritative Python 3.13.7, NumPy 2.3.5, scikit-learn 1.9.1, and XGBoost
+3.4.1 versions. Because SHAP 0.54.1 requires Python 3.12+ and NumPy 2+, the
+stage has a separate explainability environment rather than changing the
+default Python 3.10+ support claim.
+
+Acceptance gate: publish a new immutable real directory and ZIP for all four
+models, obtain `PASS` from directory and ZIP verification, and report results
+only from the generated final summary and additivity report. That real run is
+pending; no run ID, top feature, or checksum is claimed in this plan. A
+read-only API schema and dashboard presentation remain a separate additive
+task. Explanations must follow
+[`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md) and describe
+model behavior, not causality or financial advice.
 
 ### 8. Additional stocks
 

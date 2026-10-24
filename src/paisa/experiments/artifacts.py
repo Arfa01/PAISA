@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 from importlib import metadata
+import io
 import json
 import os
 import platform
@@ -29,6 +30,8 @@ MANIFEST_FILENAME = "manifest.json"
 DEFAULT_ARTIFACT_FILENAME = "model.joblib"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_REGISTERED_MANIFEST_BYTES = 1024 * 1024
+_MAX_REGISTERED_MODEL_BYTES = 256 * 1024 * 1024
 _REQUIRED_MANIFEST_FIELDS = {
     "schema_version",
     "model_id",
@@ -1347,6 +1350,7 @@ def _read_registered_manifest(
     model_dir: str | Path,
     *,
     trusted_root: str | Path | None = None,
+    expected_manifest_sha256: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     directory = _registered_model_directory(model_dir, trusted_root=trusted_root)
     manifest_path = directory / MANIFEST_FILENAME
@@ -1362,7 +1366,28 @@ def _read_registered_manifest(
         manifest_path,
         field_name="Registered model manifest",
     ) as manifest_handle:
-        raw = json.load(manifest_handle)
+        if (
+            os.fstat(manifest_handle.fileno()).st_size
+            > _MAX_REGISTERED_MANIFEST_BYTES
+        ):
+            raise ValueError("Registered model manifest exceeds its size limit")
+        payload = manifest_handle.read(_MAX_REGISTERED_MANIFEST_BYTES + 1)
+    if len(payload) > _MAX_REGISTERED_MANIFEST_BYTES:
+        raise ValueError("Registered model manifest exceeds its size limit")
+    if expected_manifest_sha256 is not None:
+        expected_manifest = str(expected_manifest_sha256).lower()
+        if not _SHA256.fullmatch(expected_manifest):
+            raise ValueError(
+                "expected_manifest_sha256 must be a lowercase SHA-256 digest"
+            )
+        if hashlib.sha256(payload).hexdigest() != expected_manifest:
+            raise ValueError(
+                "Registered model manifest checksum does not match its trust anchor"
+            )
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Registered model manifest must contain valid UTF-8 JSON") from exc
     if not isinstance(raw, dict):
         raise ValueError("Model manifest must be a JSON object")
     raw = validate_model_manifest(raw)
@@ -1386,10 +1411,21 @@ def load_model_artifact(
     model_dir: str | Path,
     *,
     trusted_root: str | Path | None = None,
+    expected_manifest_sha256: str | None = None,
+    expected_artifact_sha256: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Checksum and load trusted model bytes without reopening their path."""
+    """Checksum and load trusted model bytes without reopening their path.
 
-    directory, raw = _read_registered_manifest(model_dir, trusted_root=trusted_root)
+    Optional trust-anchor digests are checked against the same manifest bytes
+    and artifact handle used before deserialization, closing a swap window for
+    callers that pin an immutable external inventory.
+    """
+
+    directory, raw = _read_registered_manifest(
+        model_dir,
+        trusted_root=trusted_root,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
 
     relative = _safe_relative_path(raw.get("artifact_path", ""), field_name="artifact_path")
     model_root = directory.parent
@@ -1413,21 +1449,34 @@ def load_model_artifact(
     expected = str(raw.get("artifact_sha256", "")).lower()
     if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
         raise ValueError("artifact_sha256 must be a lowercase SHA-256 digest")
+    if expected_artifact_sha256 is not None:
+        trust_anchor = str(expected_artifact_sha256).lower()
+        if not _SHA256.fullmatch(trust_anchor):
+            raise ValueError("expected_artifact_sha256 must be a lowercase SHA-256 digest")
+        if expected != trust_anchor:
+            raise ValueError("Model artifact checksum does not match its trust anchor")
     with _open_regular_file(
         artifact_path,
         field_name="Registered model artifact",
     ) as artifact_handle:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: artifact_handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-        actual = digest.hexdigest()
-        if actual != expected:
-            raise ValueError(
-                f"Model artifact checksum mismatch for {directory.name}: "
-                f"expected {expected}, got {actual}"
-            )
-        artifact_handle.seek(0)
-        artifact = joblib.load(artifact_handle)
+        if (
+            os.fstat(artifact_handle.fileno()).st_size
+            > _MAX_REGISTERED_MODEL_BYTES
+        ):
+            raise ValueError("Registered model artifact exceeds its size limit")
+        payload = artifact_handle.read(_MAX_REGISTERED_MODEL_BYTES + 1)
+    if len(payload) > _MAX_REGISTERED_MODEL_BYTES:
+        raise ValueError("Registered model artifact exceeds its size limit")
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise ValueError(
+            f"Model artifact checksum mismatch for {directory.name}: "
+            f"expected {expected}, got {actual}"
+        )
+    # Deserialize the immutable bytes that were checksum-validated. Loading
+    # from the live descriptor would allow an in-place mutation between the
+    # digest pass and executable deserialization.
+    artifact = joblib.load(io.BytesIO(payload))
     return artifact, raw
 
 

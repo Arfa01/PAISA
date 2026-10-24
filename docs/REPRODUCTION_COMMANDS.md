@@ -19,7 +19,8 @@ There are two distinct profiles:
 
 The Python package supports Python 3.10 or newer. The certified LSTM run used
 Python 3.13.7, and TensorFlow 2.21 is supported here only on CPython 3.10 through
-3.13. The frontend supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
+3.13. The optional `shap==0.54.1` explainability runtime requires Python 3.12+
+and NumPy 2+; its compatibility smoke used Python 3.13.7 and NumPy 2.3.5. The frontend supports Node `^22.12.0`, `^24.0.0`, or `>=26.0.0`; Node
 22.20.0 is the version recorded in the current dashboard runbook.
 
 All generated run destinations are immutable. Every producer below requires a
@@ -60,13 +61,29 @@ python -m pip install -r requirements-sentiment.txt
 # Only in a CPython 3.10--3.13 LSTM environment or Colab runtime.
 python -m pip install -r requirements-lstm.txt
 
+# Only in a separate CPython 3.12+ / NumPy 2+ explainability environment.
+python -m pip install -r requirements-explainability.txt
+
 # Optional full-OHLCV provider; not required for the official psx-dps path.
 python -m pip install -r requirements-provider-pypsx.txt
 python -c "import pypsx_toolkit"
 ```
 
-For the cleanest separation, create `.venv-lstm` or a Colab runtime instead of
-adding TensorFlow to the default development environment.
+For the cleanest separation, create `.venv-lstm` or a Colab runtime for
+TensorFlow and `.venv-explainability` for SHAP instead of adding either optional
+stack to the default development environment. A matching explainability setup
+is:
+
+```bash
+python3.13 -m venv .venv-explainability
+source .venv-explainability/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-explainability.txt
+python -m pip install --no-deps -e .
+python -m pip check
+deactivate
+```
 
 ## Offline validation and CI-equivalent checks
 
@@ -529,6 +546,79 @@ git diff --check
 git diff --check origin/main...HEAD
 git status --short
 ```
+
+## Tree-model SHAP explainability
+
+The optional explainability producer consumes only the authoritative
+M-001--M-004 training run, the authoritative unified comparison, and its bound
+vertical slice. It does not retrain, tune, recalibrate, explain M-005/M-006,
+modify a source, or create a portfolio. The exact 184 rows are the reused
+**shared project holdout**, not a fresh independent evaluation.
+
+Official runs require `shap==0.54.1` in the separate Python 3.12+ / NumPy 2+
+environment documented above. The pin passed a deterministic isolated smoke
+against Python 3.13.7, NumPy 2.3.5, scikit-learn 1.9.1, and XGBoost 3.4.1. The
+Random Forest smoke returned an explicit class dimension; XGBoost returned a
+two-dimensional class-1 matrix. Both reconstructed probability output within
+`1e-6`.
+
+Restore the three generated, Git-ignored source roots before running:
+
+```bash
+source .venv-explainability/bin/activate
+python scripts/run_tree_shap_explainability.py \
+  --model-training-run \
+  artifacts/model_training/TRN-20261020-191815-624662-nogit \
+  --comparison-run \
+  artifacts/model_comparisons/CMP-20261024-OGDC-price-only-02 \
+  --vertical-slice-run \
+  artifacts/vertical_slice/VSL-20261020-OGDC-main-02 \
+  --output-dir artifacts/explainability
+```
+
+The command validates fixed source integrity roots, trusted model paths,
+manifest/model checksums, registered IDs, estimator classes, class order,
+ordered features, dates, labels, and fitted preprocessing before explanation.
+It uses interventional Tree SHAP in class-1 probability space with 100
+deterministic training-background rows. Every one of the 184 rows per model
+must satisfy its estimator-family additivity tolerance: `5e-5` for Random
+Forest and `1e-6` for XGBoost.
+
+The producer stages and verifies all files before collision-refusing atomic
+publication. Record the returned run ID, then verify the directory:
+
+```bash
+PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID"
+```
+
+Verify a transferred deterministic ZIP with its sidecar:
+
+```bash
+PAISA_XAI_RUN_ID="XAI-REPLACE-WITH-THE-PUBLISHED-RUN-ID"
+python scripts/verify_explainability_run.py \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip" \
+  --checksum \
+  "artifacts/explainability/$PAISA_XAI_RUN_ID.zip.sha256"
+```
+
+The verifier is offline and model-free. It validates the exact inventory and
+SHA-256 values, source/model/feature/date contracts, all local rows,
+probability-space reconstruction, global importance, cross-model ranks,
+deterministic audit selection, summaries, plots, portable paths, canonical ZIP
+metadata, and prohibited causal/advice wording. It rejects missing and added
+files, tampering, absolute paths, symlinks, executable model payloads, unsafe
+ZIP members, and any false `PASS`.
+
+An official retained real pack is pending. Do not fill a run ID, ZIP checksum,
+top-feature list, cross-model agreement, or real additivity result from the
+dependency smoke or from impurity-based feature importance. Generated
+explanation directories and ZIPs stay out of Git. See
+[`TREE_MODEL_SHAP_EXPLAINABILITY.md`](TREE_MODEL_SHAP_EXPLAINABILITY.md),
+[`EXPLAINABILITY_DATA_CONTRACT.md`](EXPLAINABILITY_DATA_CONTRACT.md), and
+[`SHAP_INTERPRETATION_POLICY.md`](SHAP_INTERPRETATION_POLICY.md). Explanations
+describe fitted-model behavior, not economic causality or financial advice.
 
 ## Final handoff checks
 
